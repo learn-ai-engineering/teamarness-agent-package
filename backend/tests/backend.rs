@@ -33,6 +33,7 @@ fn agent_row(principal_id: &str, identity: &str, name: &str) -> Value {
 #[derive(Clone, Default)]
 struct FakeBindings {
     bound: Arc<Mutex<Option<Value>>>,
+    current_failures: Arc<std::sync::atomic::AtomicUsize>,
     /// Agents the Installation stewards: `(principalId, identity, name)`.
     stewarded: Arc<Mutex<Vec<(String, String, String)>>>,
 }
@@ -41,7 +42,20 @@ impl FakeBindings {
     fn capability(&self) -> ScriptedCapability {
         let state = self.clone();
         ScriptedCapability::new().calls(move |method, payload| match method {
-            "current" => Ok(json!({"agent": state.bound.lock().unwrap().clone()})),
+            "current" => {
+                if state
+                    .current_failures
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Err(BackendError::new("overloaded", true, empty()));
+                }
+                Ok(json!({"agent": state.bound.lock().unwrap().clone()}))
+            }
             "candidates" => {
                 let bound = state.bound.lock().unwrap().clone();
                 let bound_id = bound
@@ -143,7 +157,14 @@ struct Fixture {
 }
 
 async fn start(directory: &Path, bindings: &FakeBindings) -> Fixture {
-    let principals = principals_capability();
+    start_with_principals(directory, bindings, principals_capability()).await
+}
+
+async fn start_with_principals(
+    directory: &Path,
+    bindings: &FakeBindings,
+    principals: ScriptedCapability,
+) -> Fixture {
     let binding_capability = bindings.capability();
     let harness = HarnessBuilder::new(router().into_backend())
         .package_identity("dev.teamarness.agent")
@@ -558,4 +579,71 @@ async fn unknown_operations_and_malformed_payloads_use_sdk_codes() {
         .unwrap_err();
     assert_eq!(error.code(), "agent.invalid_request");
     harness.shutdown().await.unwrap();
+}
+
+async fn wait_binding(harness: &mut Harness, expected: Option<&str>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = harness.request("agent.status.get", empty()).await.unwrap();
+            if status["agent"]["name"].as_str() == expected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("binding reconciliation without a future event");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_startup_snapshot_reconciles_a_missed_removal() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
+    let changed = bindings.clone();
+    let principals = ScriptedCapability::new().calls(move |method, _| {
+        assert_eq!(method, "current");
+        changed.remove_agent();
+        Ok(roster(2, false))
+    });
+    let mut fixture = start_with_principals(data.path(), &bindings, principals).await;
+    fixture.harness.activate().await.unwrap();
+    fixture.principals.stream().opened().await;
+    wait_binding(&mut fixture.harness, None).await;
+    assert_eq!(fixture.principals.recorded_opens()[0]["afterCursor"], "2");
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_reconnect_snapshot_reconciles_without_an_event() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
+    let mut fixture = start(data.path(), &bindings).await;
+    fixture.harness.activate().await.unwrap();
+    fixture.principals.stream().opened().await;
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Pathfinder"));
+    fixture.principals.stream().close("completed").await;
+    wait_binding(&mut fixture.harness, Some("Pathfinder")).await;
+    assert!(fixture.principals.recorded_opens().len() >= 2);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn roster_failed_refresh_retries_without_another_event() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
+    let mut fixture = start(data.path(), &bindings).await;
+    fixture.harness.activate().await.unwrap();
+    fixture.principals.stream().opened().await;
+    // Wait for the initial reconciliation to finish before failing the event refresh.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    bindings
+        .current_failures
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Pathfinder"));
+    assert!(fixture.principals.stream().send(roster(2, true)).await);
+    wait_binding(&mut fixture.harness, Some("Pathfinder")).await;
+    fixture.harness.shutdown().await.unwrap();
 }

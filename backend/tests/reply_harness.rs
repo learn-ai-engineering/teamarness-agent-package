@@ -436,6 +436,7 @@ struct Roster {
     agent_name: Arc<Mutex<String>>,
     bound: Arc<Mutex<bool>>,
     lookup_failures: Arc<std::sync::atomic::AtomicUsize>,
+    other_bound: Arc<Mutex<bool>>,
 }
 
 impl Roster {
@@ -444,6 +445,7 @@ impl Roster {
             agent_name: Arc::new(Mutex::new("Scout".into())),
             bound: Arc::new(Mutex::new(false)),
             lookup_failures: Arc::default(),
+            other_bound: Arc::default(),
         }
     }
 
@@ -470,7 +472,9 @@ impl Roster {
     }
 
     fn bound_row(&self) -> Value {
-        if *self.bound.lock().unwrap() {
+        if *self.other_bound.lock().unwrap() {
+            json!({"principalId":OTHER_ID,"identity":OTHER_KEY,"name":"Other"})
+        } else if *self.bound.lock().unwrap() {
             let name = self.agent_name.lock().unwrap().clone();
             json!({"principalId": AGENT_ID, "identity": AGENT_KEY, "name": name})
         } else {
@@ -511,13 +515,15 @@ impl Roster {
 
     fn binding_capability(&self) -> ScriptedCapability {
         let roster = self.clone();
-        ScriptedCapability::new().calls(move |method, _| match method {
+        ScriptedCapability::new().calls(move |method, payload| match method {
             "current" => Ok(json!({"agent": roster.bound_row()})),
             "bind" => {
+                *roster.other_bound.lock().unwrap() = payload["principalId"] == OTHER_ID;
                 *roster.bound.lock().unwrap() = true;
                 Ok(json!({"agent": roster.bound_row()}))
             }
             "unbind" => {
+                *roster.other_bound.lock().unwrap() = false;
                 *roster.bound.lock().unwrap() = false;
                 Ok(json!({"agent": null}))
             }
@@ -1298,5 +1304,142 @@ async fn suspend_cancels_a_reply_in_flight_and_nothing_is_posted() {
     .await;
     assert_eq!(stub.request_count(), 3);
     assert_no_secret(ports, data.path());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebind_drains_a_held_completion_before_changing_actor() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    let release = Arc::new(Notify::new());
+    stub.push(Behaviour::Hold(release.clone(), "old A completion".into()));
+    say(&conversations, &fixture.ports, BOB_KEY, "@Scout held").await;
+    wait_until("held A request", || stub.request_count() == 1).await;
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":OTHER_ID}))
+        .await
+        .unwrap();
+    let status = fixture
+        .harness
+        .request("agent.status.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(status["agent"]["principalId"], OTHER_ID);
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        conversations.posts().is_empty(),
+        "A completion posted after binding B"
+    );
+    fixture.ports.stream().opened().await;
+    say(&conversations, &fixture.ports, BOB_KEY, "@Other fresh").await;
+    wait_until("fresh B reply", || conversations.posts().len() == 1).await;
+    assert_eq!(stub.request_count(), 2);
+    assert!(
+        stub.requests()[1].body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are Other")
+    );
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn complete_settings_and_key_edits_clear_errors_without_hiding_active_work() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    let settings = json!({"settings": {"endpointBaseUrl":stub.base_url,"model":"stub/model-1","systemPrompt":"updated","contextMessages":0}});
+    for operation in ["agent.settings.set", "agent.key.set"] {
+        stub.push(Behaviour::Status(401, "rejected".into()));
+        say(&conversations, &fixture.ports, BOB_KEY, "@Scout rejected").await;
+        wait_status(
+            &mut fixture.harness,
+            "error",
+            Some("agent.endpoint_rejected"),
+        )
+        .await;
+        let payload = if operation == "agent.key.set" {
+            json!({"apiKey": SECRET})
+        } else {
+            settings.clone()
+        };
+        fixture
+            .harness
+            .request(operation, payload.clone())
+            .await
+            .unwrap();
+        wait_status(&mut fixture.harness, "ready", None).await;
+        let release = Arc::new(Notify::new());
+        stub.push(Behaviour::Hold(release.clone(), "still active".into()));
+        let before = stub.request_count();
+        say(&conversations, &fixture.ports, BOB_KEY, "@Scout held").await;
+        wait_until("held request", || stub.request_count() == before + 1).await;
+        // A second Channel fails while the first Channel remains active.
+        stub.push(Behaviour::Status(401, "rejected".into()));
+        conversations.append(SIDE, BOB_KEY, "@Scout side failure");
+        assert!(fixture.ports.stream().send(empty()).await);
+        wait_status(
+            &mut fixture.harness,
+            "error",
+            Some("agent.endpoint_rejected"),
+        )
+        .await;
+        fixture.harness.request(operation, payload).await.unwrap();
+        wait_status(&mut fixture.harness, "replying", None).await;
+        release.notify_one();
+        wait_status(&mut fixture.harness, "ready", None).await;
+    }
+    assert_eq!(conversations.posts().len(), 2);
+    assert_eq!(stub.request_count(), 6);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_binding_and_readiness_changes_leave_no_old_work() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    let release = Arc::new(Notify::new());
+    stub.push(Behaviour::Hold(release.clone(), "old".into()));
+    say(&conversations, &fixture.ports, BOB_KEY, "@Scout held").await;
+    wait_until("held request", || stub.request_count() == 1).await;
+    let bind = fixture
+        .harness
+        .start_request("agent.binding.set", json!({"principalId":OTHER_ID}))
+        .await;
+    let unbind = fixture
+        .harness
+        .start_request("agent.binding.clear", empty())
+        .await;
+    let clear = fixture
+        .harness
+        .start_request("agent.key.clear", empty())
+        .await;
+    bind.result().await.unwrap();
+    unbind.result().await.unwrap();
+    clear.result().await.unwrap();
+    wait_status(&mut fixture.harness, "unconfigured", None).await;
+    assert!(!fixture.ports.stream().is_open());
+    let status = fixture
+        .harness
+        .request("agent.status.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(status["agent"].is_null(), roster.bound_row().is_null());
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(conversations.posts().is_empty());
     fixture.harness.shutdown().await.unwrap();
 }

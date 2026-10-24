@@ -66,14 +66,18 @@ impl TaskHandle {
         self.task.is_finished()
     }
 
-    pub async fn stop(self) {
+    pub fn cancel(&self) {
         self.cancellation.cancel();
-        let abort = self.task.abort_handle();
-        if tokio::time::timeout(Duration::from_secs(2), self.task)
+    }
+
+    pub async fn stop(mut self) {
+        self.cancel();
+        if tokio::time::timeout(Duration::from_secs(2), &mut self.task)
             .await
             .is_err()
         {
-            abort.abort();
+            self.task.abort();
+            let _ = self.task.await;
         }
     }
 }
@@ -344,16 +348,28 @@ impl Loop {
             .iter()
             .filter_map(|row| row["id"].as_str().map(str::to_owned))
             .collect::<Vec<_>>();
-        let (context_messages, system_prompt) = {
-            let store = self
-                .inputs
-                .settings
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
+        // The same mutex protects blocking settings writes; never wait for it on this worker.
+        let settings = self.inputs.settings.clone();
+        let configured = teamarness_package_sdk::blocking(&self.work, move |cancel| {
+            let store = settings.lock().map_err(|_| crate::storage_failed())?;
+            if cancel.is_cancelled() {
+                return Err(crate::storage_failed());
+            }
+            Ok((
                 store.settings().context_messages as usize,
                 store.settings().system_prompt.clone(),
-            )
+            ))
+        })
+        .await;
+        let (context_messages, system_prompt) = match configured {
+            Ok(configured) => configured,
+            Err(_) => {
+                if !self.work.is_cancelled() {
+                    self.inputs.status.set_error(STORAGE_FAILED, true);
+                    self.schedule(RETRY);
+                }
+                return;
+            }
         };
         let mut lookups = HashMap::new();
         for channel in channels {
@@ -563,6 +579,9 @@ impl Loop {
         let slot = self.slots.entry(channel).or_default();
         slot.in_flight = false;
         let pending = std::mem::take(&mut slot.pending);
+        if self.replies.is_empty() {
+            self.inputs.status.set_idle_if_replying();
+        }
         match outcome {
             ReplyOutcome::Posted if self.replies.is_empty() => self.inputs.status.set_idle(),
             ReplyOutcome::Cancelled if self.replies.is_empty() => {
@@ -631,8 +650,11 @@ async fn reply(
     messages: Vec<ChatMessage>,
     cancellation: &CancellationToken,
 ) -> ReplyOutcome {
-    let configured = teamarness_package_sdk::blocking(cancellation, move |_| {
+    let configured = teamarness_package_sdk::blocking(cancellation, move |cancel| {
         let store = settings.lock().map_err(|_| crate::storage_failed())?;
+        if cancel.is_cancelled() {
+            return Err(crate::storage_failed());
+        }
         Ok((
             store.settings().endpoint_base_url.clone(),
             store.settings().model.clone(),

@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use teamarness_package_sdk::capabilities::agent_binding::{AgentBinding, AgentCandidate};
+use teamarness_package_sdk::capabilities::agent_binding::{
+    AgentBinding, AgentCandidate, BoundAgent,
+};
 use teamarness_package_sdk::capabilities::principals::Principals;
 use teamarness_package_sdk::ports::PortClient;
 use teamarness_package_sdk::{
@@ -59,11 +61,15 @@ fn capability_error(cause: &BackendError) -> BackendError {
 struct Tasks {
     /// Watches the Principal roster so a removed or renamed Agent reaches the status.
     roster: Option<TaskHandle>,
+    enabled: bool,
+    /// No reply work starts until startup/resume binding reconciliation succeeds.
+    reconciled: bool,
     /// The reply harness; runs while configuration and binding are both present.
     harness: Option<TaskHandle>,
 }
 
 /// Everything one activation of the Agent Package owns.
+#[derive(Clone)]
 pub struct AgentActive {
     settings: Arc<Mutex<SettingsStore>>,
     status: Arc<StatusCell>,
@@ -72,32 +78,60 @@ pub struct AgentActive {
     ports: Option<PortClient>,
     progress: Arc<Mutex<Progress>>,
     cancellation: CancellationToken,
-    tasks: tokio::sync::Mutex<Tasks>,
+    tasks: Arc<tokio::sync::Mutex<Tasks>>,
+    /// Serializes mutations, reconciliation and readiness against harness replacement.
+    transition: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AgentActive {
-    /// Re-reads whether endpoint, model and key are present.
-    fn refresh_configured(&self) {
-        let configured = self
-            .settings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_configured();
-        self.status.set_configured(configured);
+    /// Called under `transition`; drain old replies before publishing a different identity/name.
+    async fn apply_agent(&self, agent: Option<BoundAgent>) {
+        if self.status.agent() != agent {
+            self.stop_harness().await;
+            self.status.set_agent(agent);
+        }
+        self.sync_harness().await;
     }
 
-    /// Starts the roster watcher for this activation, replacing any earlier one.
-    async fn start_roster_watch(&self) {
-        let handle = spawn_roster_watch(
-            &self.cancellation,
-            self.principals.clone(),
-            self.binding.clone(),
-            self.status.clone(),
-        );
-        let mut tasks = self.tasks.lock().await;
-        if let Some(previous) = tasks.roster.replace(handle) {
+    async fn stop_harness(&self) {
+        if let Some(previous) = self.tasks.lock().await.harness.take() {
             previous.stop().await;
         }
+    }
+
+    /// Read metadata on the blocking pool, not the async lifecycle worker.
+    async fn configured(&self, cancellation: &CancellationToken) -> Result<bool, BackendError> {
+        let settings = self.settings.clone();
+        teamarness_package_sdk::blocking(cancellation, move |cancel| {
+            if cancel.is_cancelled() {
+                return Err(storage_failed());
+            }
+            Ok(settings
+                .lock()
+                .map_err(|_| storage_failed())?
+                .is_configured())
+        })
+        .await
+    }
+
+    /// Successful settings/key changes clear stale errors, but complete edits keep active work.
+    async fn apply_configured(&self, configured: bool) {
+        if !configured {
+            self.stop_harness().await;
+        }
+        self.status.set_configured(configured);
+        self.sync_harness().await;
+    }
+
+    /// Starts the watcher while the transition gate is held.
+    async fn start_roster_watch(&self) {
+        let state = self.clone();
+        let handle = TaskHandle::spawn(&self.cancellation, move |cancellation| async move {
+            watch_roster(&state, &cancellation).await;
+        });
+        let mut tasks = self.tasks.lock().await;
+        debug_assert!(tasks.roster.is_none());
+        tasks.roster = Some(handle);
     }
 
     /// The inputs a harness task needs, or `None` when the Package has no Port grant.
@@ -119,7 +153,7 @@ impl AgentActive {
     /// starts it again.
     async fn sync_harness(&self) {
         let mut tasks = self.tasks.lock().await;
-        if self.status.is_ready_to_run() {
+        if tasks.enabled && tasks.reconciled && self.status.is_ready_to_run() {
             if tasks
                 .harness
                 .as_ref()
@@ -140,16 +174,21 @@ impl AgentActive {
 
     /// Stops every background task; the state itself is kept.
     async fn stop_tasks(&self) {
-        let (roster, harness) = {
-            let mut tasks = self.tasks.lock().await;
-            (tasks.roster.take(), tasks.harness.take())
-        };
-        if let Some(task) = harness {
-            task.stop().await;
+        // Cancel roster reads/waits first, but never abort a transition halfway through draining.
+        let roster = self.tasks.lock().await.roster.take();
+        if let Some(task) = &roster {
+            task.cancel();
         }
+        let _transition = self.transition.lock().await;
         if let Some(task) = roster {
             task.stop().await;
         }
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.enabled = false;
+            tasks.reconciled = false;
+        }
+        self.stop_harness().await;
     }
 
     fn settings_view(&self) -> SettingsView {
@@ -164,71 +203,61 @@ impl AgentActive {
     }
 }
 
-/// Spawns the roster watcher under `parent`.
-fn spawn_roster_watch(
-    parent: &CancellationToken,
-    principals: Principals,
-    binding: AgentBinding,
-    status: Arc<StatusCell>,
-) -> TaskHandle {
-    TaskHandle::spawn(parent, move |cancellation| async move {
-        watch_roster(&principals, &binding, &status, &cancellation).await;
-    })
-}
-
-/// Re-reads the binding from the capability and publishes it. Nothing about the Agent is stored
-/// locally; the Host's answer is the truth.
-async fn refresh_binding(binding: &AgentBinding, status: &StatusCell) -> Result<(), BackendError> {
-    let agent = binding
-        .current()
-        .await
-        .map_err(|cause| capability_error(&cause))?;
-    status.set_agent(agent);
+/// Read the binding under the same gate as explicit bind/unbind and lifecycle changes.
+async fn refresh_binding(state: &AgentActive, cancellation: &CancellationToken) -> Result<(), ()> {
+    let _transition = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(()),
+        transition = state.transition.lock() => transition,
+    };
+    let agent = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(()),
+        agent = state.binding.current() => agent.map_err(|_| ())?,
+    };
+    state.tasks.lock().await.reconciled = true;
+    // Once replacement starts, finish draining even if the watcher is cancelled meanwhile.
+    state.apply_agent(agent).await;
     Ok(())
 }
 
-/// Follows the Principal roster. Each snapshot is a trigger to re-read the binding, whose answer
-/// is the truth: the Host reports no Agent once it left the registry, and the new name after a
-/// rename.
-async fn watch_roster(
-    principals: &Principals,
-    binding: &AgentBinding,
-    status: &StatusCell,
-    cancellation: &CancellationToken,
-) {
+/// Capture the roster cursor before reconciliation, then subscribe after that cursor. Changes
+/// during reconciliation remain replayable; initial/reconnect snapshots are never just discarded.
+/// Reconciliation failures restart this sequence without needing any future invalidation.
+async fn watch_roster(state: &AgentActive, cancellation: &CancellationToken) {
     const RETRY: std::time::Duration = std::time::Duration::from_secs(1);
     loop {
-        let cursor = match principals.current().await {
-            Ok(snapshot) => snapshot.cursor,
-            Err(_) => {
-                tokio::select! {
-                    () = cancellation.cancelled() => return,
-                    () = tokio::time::sleep(RETRY) => continue,
-                }
-            }
-        };
-        let Ok(mut stream) = principals.subscribe(cursor).await else {
-            tokio::select! {
-                () = cancellation.cancelled() => return,
-                () = tokio::time::sleep(RETRY) => continue,
-            }
-        };
-        loop {
-            let next = tokio::select! {
-                next = stream.next() => next,
-                () = cancellation.cancelled() => {
-                    stream.close().await;
-                    return;
-                }
+        let attempt = async {
+            let cursor = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok::<(), ()>(()),
+                snapshot = state.principals.current() => snapshot.map_err(|_| ())?.cursor,
             };
-            match next {
-                Some(Ok(_)) => {
-                    let _ = refresh_binding(binding, status).await;
+            refresh_binding(state, cancellation).await?;
+            let mut stream = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(()),
+                stream = state.principals.subscribe(cursor) => stream.map_err(|_| ())?,
+            };
+            loop {
+                let next = tokio::select! {
+                    next = stream.next() => next,
+                    () = cancellation.cancelled() => { stream.close().await; return Ok(()); }
+                };
+                match next {
+                    Some(Ok(_)) => {
+                        if let Err(error) = refresh_binding(state, cancellation).await {
+                            stream.close().await;
+                            return Err(error);
+                        }
+                    }
+                    Some(Err(_)) | None => break,
                 }
-                Some(Err(_)) | None => break,
             }
-        }
-        stream.close().await;
+            stream.close().await;
+            Ok(())
+        };
+        let _ = attempt.await;
         tokio::select! {
             () = cancellation.cancelled() => return,
             () = tokio::time::sleep(RETRY) => {}
@@ -306,13 +335,17 @@ pub fn router() -> Router<AgentActive> {
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
-            let (store, progress) = teamarness_package_sdk::blocking(&cancellation, move |_| {
-                Ok((
-                    SettingsStore::open(&directory).map_err(|_| storage_failed())?,
-                    Progress::open(&directory).map_err(|_| storage_failed())?,
-                ))
-            })
-            .await?;
+            let (store, progress, configured) =
+                teamarness_package_sdk::blocking(&cancellation, move |cancel| {
+                    if cancel.is_cancelled() {
+                        return Err(storage_failed());
+                    }
+                    let store = SettingsStore::open(&directory).map_err(|_| storage_failed())?;
+                    let progress = Progress::open(&directory).map_err(|_| storage_failed())?;
+                    let configured = store.is_configured();
+                    Ok((store, progress, configured))
+                })
+                .await?;
             let binding = AgentBinding::from_initialization(&initialization, capabilities.clone())
                 .map_err(|cause| capability_error(&cause))?;
             let principals = Principals::from_initialization(&initialization, capabilities.clone())
@@ -320,7 +353,6 @@ pub fn router() -> Router<AgentActive> {
             let ports = initialization
                 .capability("teamarness.package-ports")
                 .map(|grant| PortClient::new(capabilities.clone(), grant.grant.clone()));
-            let configured = store.is_configured();
             let agent = binding
                 .current()
                 .await
@@ -329,12 +361,6 @@ pub fn router() -> Router<AgentActive> {
             // Background tasks hang off a token the activation's own request cannot cancel
             // once it has answered; suspend and dispose stop them explicitly.
             let background = CancellationToken::new();
-            let roster = spawn_roster_watch(
-                &background,
-                principals.clone(),
-                binding.clone(),
-                status.clone(),
-            );
             let state = AgentActive {
                 settings: Arc::new(Mutex::new(store)),
                 status,
@@ -343,21 +369,29 @@ pub fn router() -> Router<AgentActive> {
                 ports,
                 progress: Arc::new(Mutex::new(progress)),
                 cancellation: background,
-                tasks: tokio::sync::Mutex::new(Tasks {
-                    roster: Some(roster),
+                tasks: Arc::new(tokio::sync::Mutex::new(Tasks {
+                    roster: None,
                     harness: None,
-                }),
+                    enabled: true,
+                    reconciled: false,
+                })),
+                transition: Arc::new(tokio::sync::Mutex::new(())),
             };
-            // A configured and bound Package resumes replying as soon as it activates.
-            state.sync_harness().await;
+            // Reconcile the startup roster before starting any reply work.
+            {
+                let _transition = state.transition.lock().await;
+                state.start_roster_watch().await;
+            }
             Ok(state)
         }
     })
     .on_resume(|state: Arc<AgentActive>| async move {
-        state.refresh_configured();
-        let _ = refresh_binding(&state.binding, &state.status).await;
+        let _transition = state.transition.lock().await;
+        state.tasks.lock().await.enabled = true;
+        let configured = state.configured(&state.cancellation).await?;
+        state.status.set_configured(configured);
+        // The watcher reconciles binding before subscribing and retries any read failure.
         state.start_roster_watch().await;
-        state.sync_harness().await;
         Ok(())
     })
     .on_suspend(|state: Arc<AgentActive>| async move {
@@ -388,22 +422,30 @@ pub fn router() -> Router<AgentActive> {
                 ));
             }
             let state = context.state().clone();
-            let view = {
+            let _transition = state.transition.lock().await;
+            let (view, configured) = {
                 let state = state.clone();
                 context
-                    .blocking(move |_| {
+                    .blocking(move |cancel| {
+                        if cancel.is_cancelled() {
+                            return Err(storage_failed());
+                        }
                         state
                             .settings
                             .lock()
                             .map_err(|_| storage_failed())?
                             .replace(settings)
                             .map_err(|_| storage_failed())?;
-                        state.refresh_configured();
-                        Ok(state.settings_view())
+                        let configured = state
+                            .settings
+                            .lock()
+                            .map_err(|_| storage_failed())?
+                            .is_configured();
+                        Ok((state.settings_view(), configured))
                     })
                     .await?
             };
-            state.sync_harness().await;
+            state.apply_configured(configured).await;
             Ok(view)
         },
     )
@@ -411,10 +453,14 @@ pub fn router() -> Router<AgentActive> {
         "agent.key.set",
         |context: Context<AgentActive>, request: KeySetRequest| async move {
             let state = context.state().clone();
-            let view = {
+            let _transition = state.transition.lock().await;
+            let (view, configured) = {
                 let state = state.clone();
                 context
-                    .blocking(move |_| {
+                    .blocking(move |cancel| {
+                        if cancel.is_cancelled() {
+                            return Err(storage_failed());
+                        }
                         let outcome = {
                             let store = state.settings.lock().map_err(|_| storage_failed())?;
                             store.set_key(&request.api_key)
@@ -426,14 +472,21 @@ pub fn router() -> Router<AgentActive> {
                             }
                             Err(KeyError::Io(_)) => return Err(storage_failed()),
                         }
-                        state.refresh_configured();
-                        Ok(KeyView {
-                            has_key: state.settings_view().has_key,
-                        })
+                        let configured = state
+                            .settings
+                            .lock()
+                            .map_err(|_| storage_failed())?
+                            .is_configured();
+                        Ok((
+                            KeyView {
+                                has_key: state.settings_view().has_key,
+                            },
+                            configured,
+                        ))
                     })
                     .await?
             };
-            state.sync_harness().await;
+            state.apply_configured(configured).await;
             Ok(view)
         },
     )
@@ -441,24 +494,35 @@ pub fn router() -> Router<AgentActive> {
         "agent.key.clear",
         |context: Context<AgentActive>, _: Empty| async move {
             let state = context.state().clone();
-            let view = {
+            let _transition = state.transition.lock().await;
+            let (view, configured) = {
                 let state = state.clone();
                 context
-                    .blocking(move |_| {
+                    .blocking(move |cancel| {
+                        if cancel.is_cancelled() {
+                            return Err(storage_failed());
+                        }
                         state
                             .settings
                             .lock()
                             .map_err(|_| storage_failed())?
                             .clear_key()
                             .map_err(|_| storage_failed())?;
-                        state.refresh_configured();
-                        Ok(KeyView {
-                            has_key: state.settings_view().has_key,
-                        })
+                        let configured = state
+                            .settings
+                            .lock()
+                            .map_err(|_| storage_failed())?
+                            .is_configured();
+                        Ok((
+                            KeyView {
+                                has_key: state.settings_view().has_key,
+                            },
+                            configured,
+                        ))
                     })
                     .await?
             };
-            state.sync_harness().await;
+            state.apply_configured(configured).await;
             Ok(view)
         },
     )
@@ -480,14 +544,19 @@ pub fn router() -> Router<AgentActive> {
         "agent.binding.set",
         |context: Context<AgentActive>, request: BindingSetRequest| async move {
             let state = context.state().clone();
-            let agent = state
-                .binding
-                .bind(&request.principal_id)
-                .await
-                .map_err(|cause| capability_error(&cause))?;
+            let _transition = state.transition.lock().await;
+            state.stop_harness().await;
+            let result = state.binding.bind(&request.principal_id).await;
+            let agent = match result {
+                Ok(agent) => agent,
+                Err(cause) => {
+                    state.sync_harness().await;
+                    return Err(capability_error(&cause));
+                }
+            };
             let summary = AgentSummary::from(&agent);
-            state.status.set_agent(Some(agent));
-            state.sync_harness().await;
+            state.tasks.lock().await.reconciled = true;
+            state.apply_agent(Some(agent)).await;
             Ok(BindingView {
                 agent: Some(summary),
             })
@@ -497,13 +566,14 @@ pub fn router() -> Router<AgentActive> {
         "agent.binding.clear",
         |context: Context<AgentActive>, _: Empty| async move {
             let state = context.state().clone();
-            state
-                .binding
-                .unbind()
-                .await
-                .map_err(|cause| capability_error(&cause))?;
-            state.status.set_agent(None);
-            state.sync_harness().await;
+            let _transition = state.transition.lock().await;
+            state.stop_harness().await;
+            if let Err(cause) = state.binding.unbind().await {
+                state.sync_harness().await;
+                return Err(capability_error(&cause));
+            }
+            state.tasks.lock().await.reconciled = true;
+            state.apply_agent(None).await;
             Ok(BindingView { agent: None })
         },
     )

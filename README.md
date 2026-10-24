@@ -39,11 +39,14 @@ This explicitly runs external-package checks, including the longer loopback two-
 
 Product source/tests/contracts were extracted without behavioral changes from Teamarness commit `c9304d0` on `don-smith/agent_package`. `teamarness-authoring.json` records the current generated SDK snapshot. The Agent identity, capabilities, UI contract, local data formats and Conversations Ports are unchanged.
 
-Unresolved findings from that workstream remain open:
+Bounded cleanup implements these finding corrections, pending consolidated verification/review:
 
-- CR-002: in-flight reply can post as a newly rebound Agent.
-- CR-003: startup/reconnect roster gaps can miss removal/rename.
-- CR-005: completion redirects can forward context to another origin or HTTP.
-- P2: stale configuration-error reset and concurrent status publication; canonical Person-only wording also remains upstream.
+- CR-002: binding/readiness transitions serialize; old replies are cancelled and drained before changing the bound actor. Held-completion rebind and overlapping bind/unbind/key-clear regressions cover this schedule.
+- CR-003: startup/reconnect reconcile binding after capturing the roster cursor and before subscribing; failed reconciliation retries without another event. Reply work waits for startup/resume reconciliation.
+- CR-005: completion redirects are rejected, with loopback 307/308 no-forwarding regressions; explicitly configured loopback HTTP remains supported.
+- CR-006: successful complete settings/key changes clear stale errors while preserving replies still active in another Channel.
+- CR-008: status mutation and watch publication share one lock, preserving their order.
+- SM-003: progress open/advance and key reads already use SDK blocking work; remaining activation/resume key metadata checks now do too. Storage formats and at-most-once revision settlement are unchanged.
+- SM-002: Teamarness Packages R14 now conditions its local-Installation check on Person actors and references the existing Agent-authority rule.
 
-Extraction does not resolve these findings or establish a full workstream Verify pass. Do not publish or push this project as verified until the outstanding review work is completed.
+Extraction alone did not resolve these findings. Focused cleanup regressions do not establish a full workstream Verify pass. Do not publish or push this project as verified until consolidated validation and fresh review are complete.

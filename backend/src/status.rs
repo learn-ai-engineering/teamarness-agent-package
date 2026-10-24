@@ -70,6 +70,8 @@ struct Inner {
     configured: bool,
     agent: Option<BoundAgent>,
     activity: Activity,
+    /// Errors may be visible while a different Channel still has a reply in flight.
+    replying: bool,
 }
 
 impl Inner {
@@ -111,6 +113,7 @@ impl StatusCell {
             configured,
             agent,
             activity: Activity::Idle,
+            replying: false,
         };
         let (sender, _) = watch::channel(inner.status());
         Self {
@@ -148,9 +151,16 @@ impl StatusCell {
     pub fn set_configured(&self, configured: bool) {
         self.update(|inner| {
             if inner.configured != configured {
-                inner.configured = configured;
                 inner.activity = Activity::Idle;
+                inner.replying = false;
+            } else if matches!(inner.activity, Activity::Error(_)) {
+                inner.activity = if inner.replying {
+                    Activity::Replying
+                } else {
+                    Activity::Idle
+                };
             }
+            inner.configured = configured;
         });
     }
 
@@ -160,23 +170,31 @@ impl StatusCell {
             if inner.agent != agent {
                 inner.agent = agent;
                 inner.activity = Activity::Idle;
+                inner.replying = false;
             }
         });
     }
 
     /// The harness has a reply in flight.
     pub fn set_replying(&self) {
-        self.update(|inner| inner.activity = Activity::Replying);
+        self.update(|inner| {
+            inner.replying = true;
+            inner.activity = Activity::Replying;
+        });
     }
 
     /// The harness finished without a failure.
     pub fn set_idle(&self) {
-        self.update(|inner| inner.activity = Activity::Idle);
+        self.update(|inner| {
+            inner.replying = false;
+            inner.activity = Activity::Idle;
+        });
     }
 
     /// A reply was cancelled: back to idle, but a recorded error is kept.
     pub fn set_idle_if_replying(&self) {
         self.update(|inner| {
+            inner.replying = false;
             if inner.activity == Activity::Replying {
                 inner.activity = Activity::Idle;
             }
@@ -193,11 +211,10 @@ impl StatusCell {
     }
 
     fn update(&self, change: impl FnOnce(&mut Inner)) {
-        let status = {
-            let mut inner = self.lock();
-            change(&mut inner);
-            inner.status()
-        };
+        // Keep publication in the mutation order, including concurrent harness/UI updates.
+        let mut inner = self.lock();
+        change(&mut inner);
+        let status = inner.status();
         self.sender.send_if_modified(|current| {
             if *current == status {
                 false
@@ -266,6 +283,49 @@ mod tests {
         assert_eq!(status.last_error, None);
         cell.set_configured(false);
         assert_eq!(cell.current().state, StatusState::Unconfigured);
+    }
+
+    #[test]
+    fn complete_configuration_clears_error_but_preserves_replying() {
+        let cell = StatusCell::new(true, Some(agent("Scout")));
+        cell.set_error("agent.endpoint_rejected", false);
+        cell.set_configured(true);
+        assert_eq!(cell.current().state, StatusState::Ready);
+        cell.set_replying();
+        cell.set_configured(true);
+        assert_eq!(cell.current().state, StatusState::Replying);
+        cell.set_error("agent.model_error", false);
+        cell.set_configured(true);
+        assert_eq!(cell.current().state, StatusState::Replying);
+        cell.set_idle_if_replying();
+        assert_eq!(cell.current().state, StatusState::Ready);
+    }
+
+    #[test]
+    fn mutation_stays_locked_until_publication_finishes() {
+        let cell = std::sync::Arc::new(StatusCell::new(true, Some(agent("Scout"))));
+        let receiver = cell.subscribe();
+        // A borrowed watch value holds publication, exposing the mutation/publication gap.
+        let borrowed = receiver.borrow();
+        let (changed, observed) = std::sync::mpsc::channel();
+        let writer = cell.clone();
+        let task = std::thread::spawn(move || {
+            writer.update(|inner| {
+                inner.activity = Activity::Replying;
+                changed.send(()).unwrap();
+            });
+        });
+        observed.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let locked = cell.inner.try_lock().is_err();
+        let other = cell.clone();
+        let next = std::thread::spawn(move || other.set_agent(None));
+        drop(borrowed);
+        task.join().unwrap();
+        next.join().unwrap();
+        assert!(locked, "mutation lock released before watch publication");
+        assert_eq!(*receiver.borrow(), cell.current());
+        assert_eq!(cell.current().state, StatusState::NoAgent);
     }
 
     #[test]
