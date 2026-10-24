@@ -129,6 +129,7 @@ impl ModelClient {
     pub fn with_timeout(timeout: Duration) -> Result<Self, ModelFailure> {
         install_crypto_provider();
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .connect_timeout(CONNECT_TIMEOUT.min(timeout))
             .build()
@@ -235,6 +236,33 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let line = line.to_ascii_lowercase();
+                        line.strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+        request
+    }
+
     /// Answers one connection with `response` after reading its request, or holds it open.
     async fn one_shot(response: Option<&'static str>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -257,6 +285,78 @@ mod tests {
             }
         });
         base
+    }
+
+    #[tokio::test]
+    async fn redirects_never_forward_completion_context() {
+        for status in [307, 308] {
+            let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_addr = target.local_addr().unwrap();
+            let target_task = tokio::spawn(async move {
+                match target.accept().await {
+                    Ok((mut socket, _)) => {
+                        let _ = read_http_request(&mut socket).await;
+                        let body = r#"{"choices":[{"message":{"content":"redirected"}}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                            .await
+                            .unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+
+            let source = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let source_addr = source.local_addr().unwrap();
+            let source_task = tokio::spawn(async move {
+                let (mut socket, _) = source.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: http://{target_addr}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                    .await
+                    .unwrap();
+                String::from_utf8_lossy(&request).into_owned()
+            });
+
+            let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
+            let outcome = client
+                .complete(
+                    &format!("http://{source_addr}"),
+                    "m",
+                    &[ChatMessage::user("private transcript sentinel".into())],
+                    "sk-test",
+                )
+                .await;
+            let sent_request = source_task.await.unwrap();
+            assert!(sent_request.contains("private transcript sentinel"));
+            assert_eq!(outcome.unwrap_err().code, MODEL_ERROR);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(250), target_task)
+                    .await
+                    .is_err(),
+                "redirect target received the transcript"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_loopback_http_completion_still_succeeds() {
+        let base = one_shot(Some(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 45\r\nConnection: close\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"hello\"}}]}",
+        ))
+        .await;
+        let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
+        let result = client
+            .complete(&base, "m", &[ChatMessage::user("hi".into())], "sk-test")
+            .await;
+        assert_eq!(result.unwrap(), "hello");
     }
 
     #[tokio::test]
