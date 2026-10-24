@@ -30,16 +30,16 @@ From a compatible Teamarness checkout, after a fresh build of this project:
 
 ```sh
 TEAMARNESS_AGENT_PACKAGE_DIR=/absolute/path/to/agent/dist/dev.teamarness.agent \
-  cargo test -p teamarness-system-tests --test agent_reply_flow -- --ignored
+  cargo test -p teamarness-system-tests --test agent_reply_flow --locked -- --ignored
 ```
 
-This explicitly runs external-package checks, including the longer loopback two-profile reply/delivery scenario. The default Teamarness suite does not require this separate project. The focused `local_agent_package_loads_from_registration` check covers the packaging boundary without repeating model/backlog behavior.
+This explicitly runs four external-package checks: registration, loopback two-profile reply and backlog delivery, queued-post actor attribution during rebinding, and cancelled-binding-waiter ownership. The default Teamarness suite does not require this separate project. The focused `local_agent_package_loads_from_registration` check covers the packaging boundary without repeating model/backlog behavior.
 
-## Provenance and open findings
+## Provenance and verification
 
 Product source/tests/contracts were extracted without behavioral changes from Teamarness commit `c9304d0` on `don-smith/agent_package`. `teamarness-authoring.json` records the current generated SDK snapshot. The Agent identity, capabilities, UI contract, local data formats and Conversations Ports are unchanged.
 
-Bounded cleanup implements these finding corrections, pending consolidated verification/review:
+Bounded cleanup resolves the following findings. Consolidated verification and independent review passed for Backend/test source `ed3c016`, then passed again against merged Teamarness Host `a67f3c4` with the unchanged Agent distribution:
 
 - CR-002 / CR-009: binding/readiness transitions serialize. Posts still waiting to dispatch are cancelled; independent owners fence already-dispatched posts and binding RPCs through safe outcomes, even if their local waiter is aborted. Pending posts promptly refuse bind/unbind with `agent.post_failed`; uncertain outcomes stay latched across configuration edits and suspend/resume. The compatible Host must fence old-generation actor lookups and binding writes before initializing replacement Backends. Enqueue-before-actor-read attribution and cancelled-binding regressions use a real test Host, alongside held-completion and lifecycle tests.
 - Fail-closed limit: every non-success post terminal is conservatively uncertain; binding errors other than named pre-write rejections also latch dispatch closed. No local timeout, status reset, or later binding read proves remote quiescence. Full application-process restart is the conservative operational recovery; Backend-only replacement is safe only with the corrected Host generation fence. There is no automatic replay or persisted recovery machinery.
@@ -50,4 +50,8 @@ Bounded cleanup implements these finding corrections, pending consolidated verif
 - SM-003: progress open/advance and key reads already use SDK blocking work; remaining activation/resume key metadata checks now do too. Storage formats and at-most-once revision settlement are unchanged.
 - SM-002: Teamarness Packages R14 now conditions its local-Installation check on Person actors and references the existing Agent-authority rule.
 
-Extraction alone did not resolve these findings. Focused cleanup regressions do not establish a full workstream Verify pass. Do not publish or push this project as verified until consolidated validation and fresh review are complete.
+The `agent-package` workstream records the passing consolidated review and validation at `verify/20261024T080059Z_agent-package-{review,validation}.md` and passing merged-Host qualification at `verify/20261024T092503Z_post-merge-{review,validation}.md`. All four explicit integration cases pass. Extraction alone did not resolve the findings; the later code corrections and review did. The vendored SDK snapshot remains unchanged.
+
+The developer observed real-endpoint replies, Personal Package discovery, retained configuration after restart, and an offline-addressed reply visible at first inspection after the Steward returned. This is limited manual evidence, not exhaustive desktop coverage or measured latency. It was not repeated after the Host merge. Local verification does not authorize source push, remote creation, or publication.
+
+Key-at-rest protection beyond file mode `0600`, streaming, tools, Documents participation, scheduled posts, supported SDK publication, and stronger Package isolation need separate Scopes. The Teamarness roadmap owns those follow-ups. Incoming Teamarness Documents limitations and its record-log JSON authoring-schema mismatch remain separate upstream debt, not cleared by Agent qualification.
