@@ -34,6 +34,7 @@ fn agent_row(principal_id: &str, identity: &str, name: &str) -> Value {
 struct FakeBindings {
     bound: Arc<Mutex<Option<Value>>>,
     current_failures: Arc<std::sync::atomic::AtomicUsize>,
+    mutation_failure: Arc<Mutex<Option<&'static str>>>,
     /// Agents the Installation stewards: `(principalId, identity, name)`.
     stewarded: Arc<Mutex<Vec<(String, String, String)>>>,
 }
@@ -75,6 +76,9 @@ impl FakeBindings {
                 Ok(json!({"agents": agents}))
             }
             "bind" => {
+                if let Some(code) = state.mutation_failure.lock().unwrap().take() {
+                    return Err(BackendError::new(code, false, empty()));
+                }
                 let id = payload["principalId"]
                     .as_str()
                     .unwrap_or_default()
@@ -645,5 +649,69 @@ async fn roster_failed_refresh_retries_without_another_event() {
     *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Pathfinder"));
     assert!(fixture.principals.stream().send(roster(2, true)).await);
     wait_binding(&mut fixture.harness, Some("Pathfinder")).await;
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ambiguous_binding_failure_survives_configuration_and_resume_resets() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    let mut fixture = start(data.path(), &bindings).await;
+    fixture.harness.activate().await.unwrap();
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":AGENT_ID}))
+        .await
+        .unwrap();
+    *bindings.mutation_failure.lock().unwrap() = Some("host_unavailable");
+    assert!(
+        fixture
+            .harness
+            .request("agent.binding.set", json!({"principalId":OTHER_ID}))
+            .await
+            .is_err()
+    );
+    let before = fixture
+        .binding_capability
+        .recorded_calls()
+        .into_iter()
+        .filter(|call| matches!(call.method.as_str(), "bind" | "unbind"))
+        .count();
+    fixture
+        .harness
+        .request(
+            "agent.settings.set",
+            json!({"settings":complete_settings()}),
+        )
+        .await
+        .unwrap();
+    fixture
+        .harness
+        .request("agent.key.set", json!({"apiKey":SECRET}))
+        .await
+        .unwrap();
+    fixture.harness.suspend().await.unwrap();
+    fixture.harness.recover().await.unwrap();
+    let error = fixture
+        .harness
+        .request("agent.binding.clear", empty())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "agent.post_failed");
+    assert!(!error.retryable());
+    let after = fixture
+        .binding_capability
+        .recorded_calls()
+        .into_iter()
+        .filter(|call| matches!(call.method.as_str(), "bind" | "unbind"))
+        .count();
+    assert_eq!(
+        before, after,
+        "reset allowed another remote mutation after ambiguous bind"
+    );
+    assert_eq!(
+        bindings.bound.lock().unwrap().as_ref().unwrap()["principalId"],
+        AGENT_ID
+    );
     fixture.harness.shutdown().await.unwrap();
 }

@@ -5,6 +5,7 @@
 //! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
 //! family.
 
+mod dispatch;
 pub mod harness;
 pub mod mention;
 pub mod model;
@@ -81,6 +82,7 @@ pub struct AgentActive {
     tasks: Arc<tokio::sync::Mutex<Tasks>>,
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
+    dispatch: Arc<dispatch::DispatchFence>,
 }
 
 impl AgentActive {
@@ -94,6 +96,7 @@ impl AgentActive {
     }
 
     async fn stop_harness(&self) {
+        self.dispatch.close();
         if let Some(previous) = self.tasks.lock().await.harness.take() {
             previous.stop().await;
         }
@@ -142,6 +145,7 @@ impl AgentActive {
             settings: self.settings.clone(),
             status: self.status.clone(),
             progress: self.progress.clone(),
+            dispatch: self.dispatch.clone(),
         })
     }
 
@@ -154,6 +158,10 @@ impl AgentActive {
     async fn sync_harness(&self) {
         let mut tasks = self.tasks.lock().await;
         if tasks.enabled && tasks.reconciled && self.status.is_ready_to_run() {
+            if self.dispatch.open().is_err() {
+                self.status.set_error(harness::POST_FAILED, false);
+                return;
+            }
             if tasks
                 .harness
                 .as_ref()
@@ -189,6 +197,42 @@ impl AgentActive {
             tasks.reconciled = false;
         }
         self.stop_harness().await;
+    }
+
+    async fn change_binding(&self, principal: Option<String>) -> Result<BindingView, BackendError> {
+        let _transition = self.transition.lock().await;
+        self.stop_harness().await;
+        if let Err(cause) = self.dispatch.begin_binding() {
+            self.status
+                .set_error(harness::POST_FAILED, cause.retryable());
+            return Err(cause);
+        }
+        // The latch is set before the RPC. Panic/abort/ambiguous terminal leaves it closed.
+        let result = match principal {
+            Some(principal) => self.binding.bind(&principal).await.map(Some),
+            None => self.binding.unbind().await.map(|()| None),
+        };
+        let agent = match result {
+            Ok(agent) => {
+                self.dispatch.binding_resolved();
+                agent
+            }
+            Err(cause) => {
+                // These named Host rejections precede the Core binding write. All other
+                // errors (including storage/readback errors) can follow an accepted write.
+                if !cause.outcome_uncertain()
+                    && matches!(cause.code(), "agent_not_found" | "agent_not_stewarded")
+                {
+                    self.dispatch.binding_resolved();
+                }
+                self.sync_harness().await;
+                return Err(capability_error(&cause));
+            }
+        };
+        let summary = agent.as_ref().map(AgentSummary::from);
+        self.tasks.lock().await.reconciled = true;
+        self.apply_agent(agent).await;
+        Ok(BindingView { agent: summary })
     }
 
     fn settings_view(&self) -> SettingsView {
@@ -329,7 +373,10 @@ struct CandidatesView {
 /// The Agent Backend.
 #[must_use]
 pub fn router() -> Router<AgentActive> {
-    Router::new(|activation| {
+    // Kept across dispose/reactivate within this Backend process, not just one activation.
+    let dispatch = Arc::new(dispatch::DispatchFence::default());
+    Router::new(move |activation| {
+        let dispatch = dispatch.clone();
         let initialization = activation.initialization().clone();
         let capabilities = activation.capabilities().clone();
         let cancellation = activation.cancellation().clone();
@@ -376,6 +423,7 @@ pub fn router() -> Router<AgentActive> {
                     reconciled: false,
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
+                dispatch,
             };
             // Reconcile the startup roster before starting any reply work.
             {
@@ -544,37 +592,19 @@ pub fn router() -> Router<AgentActive> {
         "agent.binding.set",
         |context: Context<AgentActive>, request: BindingSetRequest| async move {
             let state = context.state().clone();
-            let _transition = state.transition.lock().await;
-            state.stop_harness().await;
-            let result = state.binding.bind(&request.principal_id).await;
-            let agent = match result {
-                Ok(agent) => agent,
-                Err(cause) => {
-                    state.sync_harness().await;
-                    return Err(capability_error(&cause));
-                }
-            };
-            let summary = AgentSummary::from(&agent);
-            state.tasks.lock().await.reconciled = true;
-            state.apply_agent(Some(agent)).await;
-            Ok(BindingView {
-                agent: Some(summary),
-            })
+            // Dropping/aborting the UI waiter detaches this owner, never its transition.
+            tokio::spawn(async move { state.change_binding(Some(request.principal_id)).await })
+                .await
+                .map_err(|_| error("agent.capability_unavailable", false))?
         },
     )
     .request(
         "agent.binding.clear",
         |context: Context<AgentActive>, _: Empty| async move {
             let state = context.state().clone();
-            let _transition = state.transition.lock().await;
-            state.stop_harness().await;
-            if let Err(cause) = state.binding.unbind().await {
-                state.sync_harness().await;
-                return Err(capability_error(&cause));
-            }
-            state.tasks.lock().await.reconciled = true;
-            state.apply_agent(None).await;
-            Ok(BindingView { agent: None })
+            tokio::spawn(async move { state.change_binding(None).await })
+                .await
+                .map_err(|_| error("agent.capability_unavailable", false))?
         },
     )
     .request(

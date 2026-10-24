@@ -105,7 +105,8 @@ test("reads the Backend from a custom CARGO_TARGET_DIR", async () => {
 test("refuses to assemble when a required Backend input is missing", async () => {
   const root = await fixtureRoot();
   try {
-    await assert.rejects(assemblePackage({ projectRoot: root }), /ENOENT/);
+    const { CARGO_TARGET_DIR: _ignored, ...env } = process.env;
+    await assert.rejects(assemblePackage({ projectRoot: root, env }), /ENOENT/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

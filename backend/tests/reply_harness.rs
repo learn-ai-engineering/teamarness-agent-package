@@ -1443,3 +1443,47 @@ async fn overlapping_binding_and_readiness_changes_leave_no_old_work() {
     assert!(conversations.posts().is_empty());
     fixture.harness.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncertain_post_refuses_binding_after_settings_key_and_resume_resets() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    conversations.set_post_mode(PostMode::Uncertain);
+    say(&conversations, &fixture.ports, BOB_KEY, "@Scout uncertain").await;
+    wait_status(&mut fixture.harness, "error", Some("agent.post_failed")).await;
+    fixture.harness.request("agent.settings.set", json!({"settings": {
+        "endpointBaseUrl":stub.base_url,"model":"stub/model-1","systemPrompt":"reset","contextMessages":0
+    }})).await.unwrap();
+    fixture
+        .harness
+        .request("agent.key.clear", empty())
+        .await
+        .unwrap();
+    fixture
+        .harness
+        .request("agent.key.set", json!({"apiKey":SECRET}))
+        .await
+        .unwrap();
+    fixture.harness.suspend().await.unwrap();
+    fixture.harness.recover().await.unwrap();
+    for (operation, payload) in [
+        ("agent.binding.set", json!({"principalId":OTHER_ID})),
+        ("agent.binding.clear", empty()),
+    ] {
+        let error = fixture
+            .harness
+            .request(operation, payload)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "agent.post_failed");
+        assert!(!error.retryable());
+        assert_eq!(roster.bound_row()["principalId"], AGENT_ID);
+    }
+    assert_eq!(conversations.posts().len(), 1);
+    assert_eq!(stub.request_count(), 1);
+    fixture.harness.shutdown().await.unwrap();
+}
