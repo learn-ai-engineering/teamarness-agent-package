@@ -1,0 +1,16 @@
+{
+  "name": "teamarness-agent-package-project",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "workspaces": ["ui", "vendor/teamarness/package-ui-sdk"],
+  "scripts": {
+    "build": "cargo build --release --locked && npm --workspace @teamarness/agent-package-ui run build && node scripts/assemble-package.mjs && npm run validate:dist",
+    "typecheck": "cargo check --workspace --locked && npm --workspace @teamarness/agent-package-ui run typecheck",
+    "lint": "cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features --locked -- -D warnings && npm --workspace @teamarness/agent-package-ui run lint",
+    "validate": "cargo run --quiet --locked -p teamarness-package-contract --bin teamarness-package-validate -- source .",
+    "validate:dist": "node scripts/validate-dist.mjs",
+    "check:vendor": "node scripts/verify-vendor.mjs",
+    "test": "npm run validate && npm run check:vendor && cargo test --workspace --locked && npm --workspace @teamarness/agent-package-ui test && node --test scripts/assemble-package.test.mjs"
+  }
+}

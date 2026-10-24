@@ -1,0 +1,20 @@
+[package]
+name = "teamarness-agent-package"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teamarness-package-protocol = { path = "../vendor/teamarness/package-protocol" }
+teamarness-package-sdk = { path = "../vendor/teamarness/package-sdk" }
+tokio.workspace = true
+
+[dev-dependencies]
+teamarness-package-sdk = { path = "../vendor/teamarness/package-sdk", features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net"] }

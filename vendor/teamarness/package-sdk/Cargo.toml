@@ -1,0 +1,17 @@
+[package]
+name = "teamarness-package-sdk"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# The Backend test harness, which a generated project's `backend/tests` enables.
+testing = []
+
+[dependencies]
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+teamarness-package-protocol = { path = "../package-protocol" }
+tokio.workspace = true

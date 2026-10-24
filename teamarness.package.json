@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "identity": "dev.teamarness.agent",
+  "version": "1.0.0",
+  "presentation": {
+    "displayName": "Agent"
+  },
+  "protocol": {
+    "major": 1,
+    "minMinor": 0,
+    "maxMinor": 0
+  },
+  "backends": [
+    {
+      "target": "aarch64-apple-darwin",
+      "path": "backend/teamarness-agent-package-aarch64-apple-darwin",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "ui": {
+    "entrypoint": {
+      "path": "ui/index.js",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "assets": [],
+    "contract": {
+      "path": "ui-contract.json",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "capabilities": [
+    {
+      "identity": "teamarness.workspace-context",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.principals",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.agent-binding",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    },
+    {
+      "identity": "teamarness.package-ports",
+      "major": 1,
+      "minMinor": 0,
+      "maxMinor": 0
+    }
+  ],
+  "consumedPorts": [
+    {
+      "identity": "dev.teamarness.conversations",
+      "major": 1,
+      "minMinor": 2,
+      "maxMinor": 2,
+      "ports": [
+        { "name": "message.post", "kind": "command" },
+        { "name": "message.page", "kind": "query" },
+        { "name": "message.changes", "kind": "query" },
+        { "name": "channel.list", "kind": "query" },
+        { "name": "messages.changed", "kind": "event" }
+      ]
+    }
+  ],
+  "extensions": {
+    "dev.teamarness.build": {
+      "generatedFields": [
+        "backends.0.size",
+        "backends.0.sha256",
+        "ui.entrypoint.size",
+        "ui.entrypoint.sha256",
+        "ui.contract.sha256"
+      ]
+    }
+  }
+}

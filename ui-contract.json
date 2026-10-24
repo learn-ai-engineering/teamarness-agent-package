@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "empty": { "type": "object", "additionalProperties": false },
+    "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpointBaseUrl", "model", "systemPrompt", "contextMessages"],
+      "properties": {
+        "endpointBaseUrl": { "type": "string", "maxLength": 2048 },
+        "model": { "type": "string", "maxLength": 256 },
+        "systemPrompt": { "type": "string", "maxLength": 16384 },
+        "contextMessages": { "type": "integer", "minimum": 0, "maximum": 64 }
+      }
+    },
+    "settingsView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["settings", "hasKey"],
+      "properties": {
+        "settings": { "$ref": "#/$defs/settings" },
+        "hasKey": { "type": "boolean" }
+      }
+    },
+    "keyView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hasKey"],
+      "properties": { "hasKey": { "type": "boolean" } }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principalId", "name"],
+      "properties": {
+        "principalId": { "$ref": "#/$defs/principalId" },
+        "name": { "$ref": "#/$defs/name" }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principalId", "name", "bound"],
+      "properties": {
+        "principalId": { "$ref": "#/$defs/principalId" },
+        "name": { "$ref": "#/$defs/name" },
+        "bound": { "type": "boolean" }
+      }
+    },
+    "candidates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agents"],
+      "properties": {
+        "agents": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/$defs/candidate" } }
+      }
+    },
+    "bindingView": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent"],
+      "properties": {
+        "agent": { "anyOf": [{ "$ref": "#/$defs/agent" }, { "type": "null" }] }
+      }
+    },
+    "statusError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "retryable"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "retryable": { "type": "boolean" }
+      }
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "type": "string", "enum": ["unconfigured", "no_agent", "ready", "replying", "error"] },
+        "agent": { "$ref": "#/$defs/agent" },
+        "lastError": { "$ref": "#/$defs/statusError" }
+      }
+    }
+  },
+  "requests": {
+    "agent.settings.get": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/settingsView" }
+    },
+    "agent.settings.set": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["settings"],
+        "properties": { "settings": { "$ref": "#/$defs/settings" } }
+      },
+      "response": { "$ref": "#/$defs/settingsView" }
+    },
+    "agent.key.set": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["apiKey"],
+        "properties": { "apiKey": { "type": "string", "minLength": 1, "maxLength": 4096 } }
+      },
+      "response": { "$ref": "#/$defs/keyView" }
+    },
+    "agent.key.clear": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/keyView" }
+    },
+    "agent.binding.candidates": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/candidates" }
+    },
+    "agent.binding.set": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["principalId"],
+        "properties": { "principalId": { "$ref": "#/$defs/principalId" } }
+      },
+      "response": { "$ref": "#/$defs/bindingView" }
+    },
+    "agent.binding.clear": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/bindingView" }
+    },
+    "agent.status.get": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/status" }
+    }
+  },
+  "subscriptions": {
+    "agent.status.changes": {
+      "request": { "$ref": "#/$defs/empty" },
+      "event": { "$ref": "#/$defs/status" }
+    }
+  }
+}

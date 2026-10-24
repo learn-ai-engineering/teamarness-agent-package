@@ -1,0 +1,16 @@
+{
+  "templateVersion": 2,
+  "packageProcessProtocol": "1.0",
+  "uiHostVersion": 1,
+  "sdkSource": "vendored-from-teamarness-checkout",
+  "sdkUpgrade": "unsupported-in-place",
+  "sdkRevision": "c9304d03e2b8e27e7a3c4298f6056f524df76b20",
+  "sdkRevisionDirty": false,
+  "vendorDigests": {
+    "package-contract": "sha256:9180441df79af6349d73bdca53341101306d11aec6011cfaa84c3afc05a959e8",
+    "package-protocol": "sha256:7efa14b378b1297a4bdb5820a44b4697e9baf5c9124a37beb59ef352a92ec9b5",
+    "package-sdk": "sha256:0876bf6b44666d26a864a582634f2ad7085928df573dfb7da34268b1e8c47477",
+    "package-ui-sdk": "sha256:2a39dddb02fd9f81f9df4cff250932042da4297d87a6bccf09d4691f73f21542"
+  },
+  "requestNamespace": "agent"
+}
