@@ -1445,46 +1445,66 @@ async fn overlapping_binding_and_readiness_changes_leave_no_old_work() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn uncertain_post_refuses_binding_after_settings_key_and_resume_resets() {
+async fn a_post_failure_does_not_block_later_replies_or_binding() {
     let data = tempfile::tempdir().unwrap();
     let stub = StubEndpoint::start().await;
     let roster = Roster::new();
     let conversations = FakeConversations::new();
     let mut fixture = start(data.path(), &roster, &conversations).await;
     make_ready(&mut fixture, &stub, 0).await;
+
+    // One post fails with an uncertain outcome: the status says so, and it is not retried.
     conversations.set_post_mode(PostMode::Uncertain);
     say(&conversations, &fixture.ports, BOB_KEY, "@Scout uncertain").await;
-    wait_status(&mut fixture.harness, "error", Some("agent.post_failed")).await;
-    fixture.harness.request("agent.settings.set", json!({"settings": {
-        "endpointBaseUrl":stub.base_url,"model":"stub/model-1","systemPrompt":"reset","contextMessages":0
-    }})).await.unwrap();
-    fixture
-        .harness
-        .request("agent.key.clear", empty())
-        .await
-        .unwrap();
-    fixture
-        .harness
-        .request("agent.key.set", json!({"apiKey":SECRET}))
-        .await
-        .unwrap();
-    fixture.harness.suspend().await.unwrap();
-    fixture.harness.recover().await.unwrap();
-    for (operation, payload) in [
-        ("agent.binding.set", json!({"principalId":OTHER_ID})),
-        ("agent.binding.clear", empty()),
-    ] {
-        let error = fixture
-            .harness
-            .request(operation, payload)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), "agent.post_failed");
-        assert!(!error.retryable());
-        assert_eq!(roster.bound_row()["principalId"], AGENT_ID);
-    }
+    let status = wait_status(&mut fixture.harness, "error", Some("agent.post_failed")).await;
+    assert_eq!(status["lastError"]["retryable"], false);
     assert_eq!(conversations.posts().len(), 1);
-    assert_eq!(stub.request_count(), 1);
+
+    // A later trigger is answered, without a restart, and success clears the error.
+    conversations.set_post_mode(PostMode::Accept);
+    say(&conversations, &fixture.ports, BOB_KEY, "@Scout again").await;
+    wait_until("a reply after the failed post", || {
+        conversations.posts().len() == 2
+    })
+    .await;
+    wait_status(&mut fixture.harness, "ready", None).await;
+    assert_eq!(stub.request_count(), 2);
+
+    // Binding changes are not refused either.
+    let bound = fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId": OTHER_ID}))
+        .await
+        .unwrap();
+    assert_eq!(bound["agent"]["principalId"], OTHER_ID);
+    let cleared = fixture
+        .harness
+        .request("agent.binding.clear", empty())
+        .await
+        .unwrap();
+    assert!(cleared["agent"].is_null());
+    assert!(roster.bound_row().is_null());
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId": AGENT_ID}))
+        .await
+        .unwrap();
+    assert_eq!(roster.bound_row()["principalId"], AGENT_ID);
+    wait_status(&mut fixture.harness, "ready", None).await;
+    fixture.ports.stream().opened().await;
+    say(
+        &conversations,
+        &fixture.ports,
+        BOB_KEY,
+        "@Scout after rebind",
+    )
+    .await;
+    wait_until("a reply after rebinding", || {
+        conversations.posts().len() == 3
+    })
+    .await;
+    assert_eq!(stub.request_count(), 3);
+    assert_no_secret(&fixture.ports, data.path());
     fixture.harness.shutdown().await.unwrap();
 }
 

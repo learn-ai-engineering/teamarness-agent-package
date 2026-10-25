@@ -43,7 +43,6 @@ pub struct HarnessInputs {
     pub status: Arc<StatusCell>,
     /// Shared across suspend/resume so blocking writes have one serialized owner.
     pub progress: Arc<Mutex<Progress>>,
-    pub(crate) dispatch: Arc<crate::dispatch::DispatchFence>,
 }
 
 pub struct TaskHandle {
@@ -567,18 +566,8 @@ impl Loop {
         let ports = self.inputs.ports.clone();
         let settings = self.inputs.settings.clone();
         let cancellation = self.work.clone();
-        let dispatch = self.inputs.dispatch.clone();
         self.replies.spawn(async move {
-            let outcome = reply(
-                &client,
-                &ports,
-                settings,
-                &channel,
-                messages,
-                &cancellation,
-                dispatch,
-            )
-            .await;
+            let outcome = reply(&client, &ports, settings, &channel, messages, &cancellation).await;
             (channel, outcome)
         });
     }
@@ -660,7 +649,6 @@ async fn reply(
     channel: &str,
     messages: Vec<ChatMessage>,
     cancellation: &CancellationToken,
-    dispatch: Arc<crate::dispatch::DispatchFence>,
 ) -> ReplyOutcome {
     let configured = teamarness_package_sdk::blocking(cancellation, move |cancel| {
         let store = settings.lock().map_err(|_| crate::storage_failed())?;
@@ -692,28 +680,24 @@ async fn reply(
     if markdown.trim().is_empty() {
         return ReplyOutcome::Failed(crate::model::MODEL_ERROR, false);
     }
-    let ports = ports.clone();
-    let channel = channel.to_owned();
-    let Some(post) = dispatch.start(cancellation, async move {
-        ports
-            .command(
-                CONVERSATIONS_CONTRACT,
-                "message.post",
-                json!({"channelId":channel,"markdown":markdown}),
-            )
-            .await
-    }) else {
+    // The trigger is already persisted, so a post is attempted at most once and never re-sent.
+    // If cancellation wins after the command was polled, its outcome is unknown; it is not
+    // retried either way.
+    if cancellation.is_cancelled() {
         return ReplyOutcome::Cancelled;
-    };
+    }
     let post = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        post = post => post,
+        post = ports.command(
+            CONVERSATIONS_CONTRACT,
+            "message.post",
+            json!({"channelId":channel,"markdown":markdown}),
+        ) => post,
     };
     match post {
-        Ok(Some(Ok(_))) => ReplyOutcome::Posted,
-        Ok(None) => ReplyOutcome::Cancelled,
-        _ => ReplyOutcome::Failed(POST_FAILED, false),
+        Ok(_) => ReplyOutcome::Posted,
+        Err(_) => ReplyOutcome::Failed(POST_FAILED, false),
     }
 }
 

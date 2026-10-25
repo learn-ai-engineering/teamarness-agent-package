@@ -6,7 +6,6 @@
 //! family, and the Steward's direct [`chat`] with the same model.
 
 pub mod chat;
-mod dispatch;
 pub mod harness;
 pub mod mention;
 pub mod model;
@@ -88,7 +87,6 @@ pub struct AgentActive {
     tasks: Arc<tokio::sync::Mutex<Tasks>>,
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
-    dispatch: Arc<dispatch::DispatchFence>,
     chat: Arc<ChatCell>,
 }
 
@@ -112,7 +110,6 @@ impl AgentActive {
     }
 
     async fn stop_harness(&self) {
-        self.dispatch.close();
         if let Some(previous) = self.tasks.lock().await.harness.take() {
             previous.stop().await;
         }
@@ -161,7 +158,6 @@ impl AgentActive {
             settings: self.settings.clone(),
             status: self.status.clone(),
             progress: self.progress.clone(),
-            dispatch: self.dispatch.clone(),
         })
     }
 
@@ -174,10 +170,6 @@ impl AgentActive {
     async fn sync_harness(&self) {
         let mut tasks = self.tasks.lock().await;
         if tasks.enabled && tasks.reconciled && self.status.is_ready_to_run() {
-            if self.dispatch.open().is_err() {
-                self.status.set_error(harness::POST_FAILED, false);
-                return;
-            }
             if tasks
                 .harness
                 .as_ref()
@@ -295,29 +287,13 @@ impl AgentActive {
     async fn change_binding(&self, principal: Option<String>) -> Result<BindingView, BackendError> {
         let _transition = self.transition.lock().await;
         self.stop_harness().await;
-        if let Err(cause) = self.dispatch.begin_binding() {
-            self.status
-                .set_error(harness::POST_FAILED, cause.retryable());
-            return Err(cause);
-        }
-        // The latch is set before the RPC. Panic/abort/ambiguous terminal leaves it closed.
         let result = match principal {
             Some(principal) => self.binding.bind(&principal).await.map(Some),
             None => self.binding.unbind().await.map(|()| None),
         };
         let agent = match result {
-            Ok(agent) => {
-                self.dispatch.binding_resolved();
-                agent
-            }
+            Ok(agent) => agent,
             Err(cause) => {
-                // These named Host rejections precede the Core binding write. All other
-                // errors (including storage/readback errors) can follow an accepted write.
-                if !cause.outcome_uncertain()
-                    && matches!(cause.code(), "agent_not_found" | "agent_not_stewarded")
-                {
-                    self.dispatch.binding_resolved();
-                }
                 self.sync_harness().await;
                 return Err(capability_error(&cause));
             }
@@ -500,10 +476,7 @@ where
 /// The Agent Backend.
 #[must_use]
 pub fn router() -> Router<AgentActive> {
-    // Kept across dispose/reactivate within this Backend process, not just one activation.
-    let dispatch = Arc::new(dispatch::DispatchFence::default());
     Router::new(move |activation| {
-        let dispatch = dispatch.clone();
         let initialization = activation.initialization().clone();
         let capabilities = activation.capabilities().clone();
         let cancellation = activation.cancellation().clone();
@@ -551,7 +524,6 @@ pub fn router() -> Router<AgentActive> {
                     reconciled: false,
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
-                dispatch,
                 chat: Arc::new(ChatCell::default()),
             };
             // Reconcile the startup roster before starting any reply work.

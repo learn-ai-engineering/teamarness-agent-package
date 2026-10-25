@@ -653,7 +653,7 @@ async fn roster_failed_refresh_retries_without_another_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn ambiguous_binding_failure_survives_configuration_and_resume_resets() {
+async fn a_failed_binding_change_does_not_block_later_binding_changes() {
     let data = tempfile::tempdir().unwrap();
     let bindings = stewarded();
     let mut fixture = start(data.path(), &bindings).await;
@@ -671,34 +671,19 @@ async fn ambiguous_binding_failure_survives_configuration_and_resume_resets() {
             .await
             .is_err()
     );
+    *bindings.mutation_failure.lock().unwrap() = None;
     let before = fixture
         .binding_capability
         .recorded_calls()
         .into_iter()
         .filter(|call| matches!(call.method.as_str(), "bind" | "unbind"))
         .count();
-    fixture
-        .harness
-        .request(
-            "agent.settings.set",
-            json!({"settings":complete_settings()}),
-        )
-        .await
-        .unwrap();
-    fixture
-        .harness
-        .request("agent.key.set", json!({"apiKey":SECRET}))
-        .await
-        .unwrap();
-    fixture.harness.suspend().await.unwrap();
-    fixture.harness.recover().await.unwrap();
-    let error = fixture
+    let cleared = fixture
         .harness
         .request("agent.binding.clear", empty())
         .await
-        .unwrap_err();
-    assert_eq!(error.code(), "agent.post_failed");
-    assert!(!error.retryable());
+        .unwrap();
+    assert!(cleared["agent"].is_null());
     let after = fixture
         .binding_capability
         .recorded_calls()
@@ -706,12 +691,10 @@ async fn ambiguous_binding_failure_survives_configuration_and_resume_resets() {
         .filter(|call| matches!(call.method.as_str(), "bind" | "unbind"))
         .count();
     assert_eq!(
-        before, after,
-        "reset allowed another remote mutation after ambiguous bind"
+        after,
+        before + 1,
+        "the later binding change reached the Host"
     );
-    assert_eq!(
-        bindings.bound.lock().unwrap().as_ref().unwrap()["principalId"],
-        AGENT_ID
-    );
+    assert!(bindings.bound.lock().unwrap().is_none());
     fixture.harness.shutdown().await.unwrap();
 }
