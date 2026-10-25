@@ -12,6 +12,7 @@ pub mod model;
 pub mod progress;
 pub mod settings;
 pub mod status;
+pub mod turn;
 
 use std::sync::{Arc, Mutex};
 

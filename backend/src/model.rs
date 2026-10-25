@@ -1,15 +1,19 @@
-//! The model client: one non-streaming chat completion per reply against an OpenAI-compatible
-//! endpoint.
+//! The model client: one non-streaming chat completion per model call against an
+//! OpenAI-compatible endpoint, optionally offering tools the model may call.
 //!
 //! The request is `POST {endpointBaseUrl}/chat/completions` with the key as a bearer token, a
 //! 60 s overall timeout and a 256 KiB response cap. Every failure is mapped to one of three
 //! Package-owned codes here, so the harness never sees transport detail — and nothing in this
 //! module keeps the key, writes a log line or puts anything but a code in an error.
+//!
+//! With no tools the request body is exactly `model`, `messages` and `stream`. With tools it adds
+//! `tools` only: never `tool_choice` or `parallel_tool_calls`, which endpoints disagree about.
 
 use std::sync::Once;
 use std::time::Duration;
 
-use serde::Serialize;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 /// The endpoint could not be reached or did not answer in time; a later attempt may succeed.
@@ -25,37 +29,134 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest response body the client reads.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
-/// One message in the completion request.
+/// One message in the completion request, serialized in the OpenAI shape for its role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ChatMessage {
-    pub role: &'static str,
-    pub content: String,
+#[serde(tag = "role", rename_all = "lowercase")]
+pub enum ChatMessage {
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
+    /// Text, tool calls, or both. `content` is `null` when the model only called tools.
+    Assistant {
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ToolCall>,
+    },
+    /// The result of one tool call, answered by its id.
+    Tool {
+        tool_call_id: String,
+        content: String,
+    },
 }
 
 impl ChatMessage {
     #[must_use]
     pub fn system(content: String) -> Self {
-        Self {
-            role: "system",
-            content,
-        }
+        Self::System { content }
     }
 
     #[must_use]
     pub fn user(content: String) -> Self {
-        Self {
-            role: "user",
-            content,
-        }
+        Self::User { content }
     }
 
     #[must_use]
     pub fn assistant(content: String) -> Self {
-        Self {
-            role: "assistant",
+        Self::Assistant {
+            content: Some(content),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// The assistant's turn that asked for `tool_calls`, replayed so their results can follow.
+    #[must_use]
+    pub fn assistant_tool_calls(content: Option<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self::Assistant {
+            content,
+            tool_calls,
+        }
+    }
+
+    #[must_use]
+    pub fn tool(tool_call_id: String, content: String) -> Self {
+        Self::Tool {
+            tool_call_id,
             content,
         }
     }
+}
+
+/// A function the model may call; serialized as `{"type":"function","function":{…}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// The JSON Schema of the call's arguments.
+    pub parameters: Value,
+}
+
+impl Serialize for ToolDefinition {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Function<'a> {
+            name: &'a str,
+            description: &'a str,
+            parameters: &'a Value,
+        }
+        let mut tool = serializer.serialize_struct("ToolDefinition", 2)?;
+        tool.serialize_field("type", "function")?;
+        tool.serialize_field(
+            "function",
+            &Function {
+                name: &self.name,
+                description: &self.description,
+                parameters: &self.parameters,
+            },
+        )?;
+        tool.end()
+    }
+}
+
+/// One call the model asked for. `arguments` is the model's JSON text, not yet parsed or
+/// validated; serialized back as `{"id","type":"function","function":{"name","arguments"}}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+impl Serialize for ToolCall {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Function<'a> {
+            name: &'a str,
+            arguments: &'a str,
+        }
+        let mut call = serializer.serialize_struct("ToolCall", 3)?;
+        call.serialize_field("id", &self.id)?;
+        call.serialize_field("type", "function")?;
+        call.serialize_field(
+            "function",
+            &Function {
+                name: &self.name,
+                arguments: &self.arguments,
+            },
+        )?;
+        call.end()
+    }
+}
+
+/// What the model answered: non-empty text, tool calls, or both — never neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assistant {
+    /// Trimmed; `None` when the model sent no text.
+    pub content: Option<String>,
+    /// In the order the model gave them.
+    pub tool_calls: Vec<ToolCall>,
 }
 
 /// Why a completion failed, as the status shows it.
@@ -93,6 +194,8 @@ struct CompletionBody<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    #[serde(skip_serializing_if = "<[ToolDefinition]>::is_empty")]
+    tools: &'a [ToolDefinition],
 }
 
 /// Installs the `ring` crypto provider once per process. `reqwest` is built with
@@ -137,7 +240,28 @@ impl ModelClient {
         Ok(Self { client })
     }
 
-    /// Requests one completion and returns the assistant's text.
+    /// Requests one completion without tools and returns the assistant's text.
+    ///
+    /// `api_key` is used for this one request and dropped with it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ModelClient::respond`]; a completion without text is `agent.model_error`.
+    pub async fn complete(
+        &self,
+        endpoint_base_url: &str,
+        model: &str,
+        messages: &[ChatMessage],
+        api_key: &str,
+    ) -> Result<String, ModelFailure> {
+        self.respond(endpoint_base_url, model, messages, &[], api_key)
+            .await?
+            .content
+            .ok_or_else(ModelFailure::model_error)
+    }
+
+    /// Requests one completion offering `tools` (none when empty) and returns the assistant's
+    /// text and tool calls.
     ///
     /// `api_key` is used for this one request and dropped with it.
     ///
@@ -146,14 +270,16 @@ impl ModelClient {
     /// Returns the Package-owned failure: transport failures and timeouts are
     /// `agent.endpoint_unreachable` (retryable); `401`/`403` are `agent.endpoint_rejected`;
     /// `5xx`, `408` and `429` are `agent.endpoint_unreachable`; any other failure status, an
-    /// oversized or malformed body, or a completion without text is `agent.model_error`.
-    pub async fn complete(
+    /// oversized or malformed body, malformed tool calls, or a completion with neither text nor
+    /// tool calls is `agent.model_error`.
+    pub async fn respond(
         &self,
         endpoint_base_url: &str,
         model: &str,
         messages: &[ChatMessage],
+        tools: &[ToolDefinition],
         api_key: &str,
-    ) -> Result<String, ModelFailure> {
+    ) -> Result<Assistant, ModelFailure> {
         let url = format!(
             "{}/chat/completions",
             endpoint_base_url.trim_end_matches('/')
@@ -162,6 +288,7 @@ impl ModelClient {
             model,
             messages,
             stream: false,
+            tools,
         })
         .map_err(|_| ModelFailure::model_error())?;
         let response = self
@@ -187,18 +314,50 @@ impl ModelClient {
         let bytes = read_capped(response).await?;
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| ModelFailure::model_error())?;
-        let content = value
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|content| !content.is_empty())
-            .ok_or_else(ModelFailure::model_error)?;
-        Ok(content.to_owned())
+        parse_assistant(&value).ok_or_else(ModelFailure::model_error)
     }
+}
+
+/// The first choice's message, or `None` when it is unusable: no text and no tool calls, or a
+/// tool call without an id or name or with non-string arguments.
+fn parse_assistant(value: &Value) -> Option<Assistant> {
+    let message = value.get("choices")?.as_array()?.first()?.get("message")?;
+    let content = match message.get("content") {
+        None | Some(Value::Null) => None,
+        Some(content) => Some(content.as_str()?.trim()),
+    }
+    .filter(|content| !content.is_empty())
+    .map(str::to_owned);
+    let tool_calls = match message.get("tool_calls") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(calls) => calls
+            .as_array()?
+            .iter()
+            .map(parse_tool_call)
+            .collect::<Option<Vec<_>>>()?,
+    };
+    if content.is_none() && tool_calls.is_empty() {
+        return None;
+    }
+    Some(Assistant {
+        content,
+        tool_calls,
+    })
+}
+
+fn parse_tool_call(call: &Value) -> Option<ToolCall> {
+    let non_empty = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    let function = call.get("function")?;
+    Some(ToolCall {
+        id: non_empty(call.get("id"))?,
+        name: non_empty(function.get("name"))?,
+        arguments: function.get("arguments")?.as_str()?.to_owned(),
+    })
 }
 
 /// Reads the body up to the cap; a longer body is a model error, not a truncated reply.
@@ -402,6 +561,169 @@ mod tests {
             .complete(&base, "m", &[ChatMessage::user("hi".into())], "sk-test")
             .await;
         assert_eq!(outcome.unwrap_err().code, MODEL_ERROR);
+    }
+
+    /// Answers one connection with `body` as a `200` JSON response and hands back the request
+    /// body the client sent.
+    async fn capturing(body: String) -> (String, tokio::task::JoinHandle<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                .await
+                .unwrap();
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap();
+            serde_json::from_slice(&request[header_end + 4..]).unwrap()
+        });
+        (base, task)
+    }
+
+    fn lookup_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "exhibits__exhibit_list".into(),
+            description: "Lists exhibits.".into(),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_tools_body_is_unchanged() {
+        let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
+        let history = [
+            ChatMessage::system("rules".into()),
+            ChatMessage::user("hi".into()),
+            ChatMessage::assistant("hello".into()),
+        ];
+        let expected = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role":"system","content":"rules"},
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello"},
+            ],
+            "stream": false,
+        });
+
+        let (base, request) =
+            capturing(r#"{"choices":[{"message":{"content":"ok"}}]}"#.into()).await;
+        let answer = client.complete(&base, "m", &history, "sk").await;
+        assert_eq!(answer.unwrap(), "ok");
+        assert_eq!(request.await.unwrap(), expected);
+
+        let (base, request) =
+            capturing(r#"{"choices":[{"message":{"content":" ok "}}]}"#.into()).await;
+        let answer = client.respond(&base, "m", &history, &[], "sk").await;
+        assert_eq!(
+            answer.unwrap(),
+            Assistant {
+                content: Some("ok".into()),
+                tool_calls: Vec::new(),
+            }
+        );
+        assert_eq!(request.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn tools_are_sent_and_tool_calls_parsed() {
+        let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
+        let earlier = ToolCall {
+            id: "call_0".into(),
+            name: "exhibits__runtime_guide".into(),
+            arguments: "{}".into(),
+        };
+        let history = [
+            ChatMessage::user("what exhibits?".into()),
+            ChatMessage::assistant_tool_calls(None, vec![earlier]),
+            ChatMessage::tool("call_0".into(), "guide text".into()),
+        ];
+        let (base, request) = capturing(
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[
+                {"id":"call_1","type":"function","function":{"name":"exhibits__exhibit_list","arguments":"{\"limit\":5}"}},
+                {"id":"call_2","type":"function","function":{"name":"exhibits__runtime_guide","arguments":"{}"}}
+            ]}}]}"#
+                .into(),
+        )
+        .await;
+        let answer = client
+            .respond(&base, "m", &history, &[lookup_tool()], "sk")
+            .await
+            .unwrap();
+        assert_eq!(
+            answer,
+            Assistant {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_1".into(),
+                        name: "exhibits__exhibit_list".into(),
+                        arguments: r#"{"limit":5}"#.into(),
+                    },
+                    ToolCall {
+                        id: "call_2".into(),
+                        name: "exhibits__runtime_guide".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            }
+        );
+        let body = request.await.unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "model": "m",
+                "messages": [
+                    {"role":"user","content":"what exhibits?"},
+                    {"role":"assistant","content":null,"tool_calls":[
+                        {"id":"call_0","type":"function","function":{"name":"exhibits__runtime_guide","arguments":"{}"}}
+                    ]},
+                    {"role":"tool","tool_call_id":"call_0","content":"guide text"},
+                ],
+                "stream": false,
+                "tools": [{"type":"function","function":{
+                    "name":"exhibits__exhibit_list",
+                    "description":"Lists exhibits.",
+                    "parameters":{"type":"object","properties":{}}
+                }}],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_or_malformed_tool_calls_are_model_errors() {
+        let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
+        let bodies = [
+            r#"{"choices":[{"message":{"content":"  "}}]}"#,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[]}}]}"#,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"type":"function","function":{"name":"t","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c","type":"function","function":{"arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"t","arguments":{}}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":"text","tool_calls":{"id":"c"}}}]}"#,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"","type":"function","function":{"name":"t","arguments":"{}"}}]}}]}"#,
+        ];
+        for body in bodies {
+            let (base, request) = capturing(body.into()).await;
+            let outcome = client
+                .respond(
+                    &base,
+                    "m",
+                    &[ChatMessage::user("hi".into())],
+                    &[lookup_tool()],
+                    "sk",
+                )
+                .await;
+            request.await.unwrap();
+            assert_eq!(outcome.unwrap_err().code, MODEL_ERROR, "{body}");
+        }
     }
 
     #[test]
