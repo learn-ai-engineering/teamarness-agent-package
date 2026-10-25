@@ -5,6 +5,7 @@
 //! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
 //! family, the Steward's direct [`chat`] with the same model, and the Steward's Package
 //! enablement ([`packages`]), which [`access`] combines with the [`catalog`] and Host availability.
+//! A turn's [`tools`] are the usable contracts' ports plus the Agent's compiled-in [`skills`].
 
 pub mod access;
 pub mod catalog;
@@ -15,6 +16,7 @@ pub mod model;
 pub mod packages;
 pub mod progress;
 pub mod settings;
+pub mod skills;
 pub mod status;
 pub mod tools;
 pub mod turn;
@@ -266,7 +268,11 @@ impl AgentActive {
         config: ChatConfig,
     ) -> Result<ChatView, BackendError> {
         let name = self.status.agent().and_then(|agent| agent.name);
-        let system = chat::system_message(name.as_deref(), &config.system_prompt);
+        let system = chat::system_message(
+            name.as_deref(),
+            &config.system_prompt,
+            &tools::ToolContext::default(),
+        );
         let (turn, view) = self
             .chat
             .update(|session| session.begin(content, system, config.context_messages));
