@@ -5,6 +5,7 @@
 //! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
 //! family, and the Steward's direct [`chat`] with the same model.
 
+pub mod catalog;
 pub mod chat;
 pub mod harness;
 pub mod mention;
@@ -12,6 +13,7 @@ pub mod model;
 pub mod progress;
 pub mod settings;
 pub mod status;
+pub mod tools;
 pub mod turn;
 
 use std::sync::{Arc, Mutex};

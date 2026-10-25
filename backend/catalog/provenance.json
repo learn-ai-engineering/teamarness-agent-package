@@ -1,0 +1,9 @@
+{
+  "teamarnessRevision": "d25a42d3ef47a168a22ba4275c4b06d0468e19ca",
+  "teamarnessRevisionDirty": false,
+  "files": {
+    "conversations.ports.json": "sha256:9558e533b61f19228f19f9ca1a52c59c1bf635ca9658755e2fab61031cb28874",
+    "documents.ports.json": "sha256:39988506497bfe2a65e779aff0f370d2e572465023b29e20384cbac25b921606",
+    "exhibits.ports.json": "sha256:9109c926206f76eadccd59844068703ddb354ff59b7e6651056b322d35c912d0"
+  }
+}

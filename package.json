@@ -11,6 +11,7 @@
     "validate": "cargo run --quiet --locked -p teamarness-package-contract --bin teamarness-package-validate -- source .",
     "validate:dist": "node scripts/validate-dist.mjs",
     "check:vendor": "node scripts/verify-vendor.mjs",
-    "test": "npm run validate && npm run check:vendor && cargo test --workspace --locked && npm --workspace @teamarness/agent-package-ui test && node --test scripts/assemble-package.test.mjs"
+    "check:catalog": "node scripts/verify-catalog.mjs",
+    "test": "npm run validate && npm run check:vendor && npm run check:catalog && cargo test --workspace --locked && npm --workspace @teamarness/agent-package-ui test && node --test scripts/assemble-package.test.mjs"
   }
 }

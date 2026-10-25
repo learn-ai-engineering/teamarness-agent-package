@@ -1,0 +1,117 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "exhibitId": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 },
+    "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+    "path": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "expectedRevision": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "minLength": 1, "maxLength": 32 },
+    "actor": { "type": "object", "additionalProperties": false, "required": ["kind", "identity"], "properties": {
+      "kind": { "type": "string", "enum": ["person", "agent"] }, "identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    } },
+    "count": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+    "missing": { "type": "object", "additionalProperties": false, "required": ["sha256", "chunks"], "properties": {
+      "sha256": { "$ref": "#/$defs/sha256" },
+      "chunks": { "oneOf": [
+        { "const": "all" },
+        { "type": "array", "maxItems": 128, "items": { "type": "integer", "minimum": 0, "maximum": 127 } }
+      ] }
+    } },
+    "summary": { "type": "object", "additionalProperties": false, "required": ["id", "title", "updatedAt", "kind", "revision"], "properties": {
+      "id": { "$ref": "#/$defs/exhibitId" }, "title": { "$ref": "#/$defs/title" }, "updatedAt": { "$ref": "#/$defs/timestamp" },
+      "kind": { "const": "draft" }, "revision": { "$ref": "#/$defs/revision" }
+    } },
+    "file": { "type": "object", "additionalProperties": false, "required": ["path", "sha256", "size", "mediaType"], "properties": {
+      "path": { "$ref": "#/$defs/path" }, "sha256": { "$ref": "#/$defs/sha256" },
+      "size": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+      "mediaType": { "type": "string", "minLength": 1, "maxLength": 64 }
+    } },
+    "limits": { "type": "object", "additionalProperties": false,
+      "required": ["chunkBytes", "maxFileBytes", "maxTotalBytes", "maxFiles", "maxPathBytes", "maxIdChars", "maxTitleChars", "maxConcurrentPuts"],
+      "properties": {
+        "chunkBytes": { "type": "integer", "minimum": 1 }, "maxFileBytes": { "type": "integer", "minimum": 1 },
+        "maxTotalBytes": { "type": "integer", "minimum": 1 }, "maxFiles": { "type": "integer", "minimum": 1 },
+        "maxPathBytes": { "type": "integer", "minimum": 1 }, "maxIdChars": { "type": "integer", "minimum": 1 },
+        "maxTitleChars": { "type": "integer", "minimum": 1 }, "maxConcurrentPuts": { "type": "integer", "minimum": 1 }
+      } }
+  },
+  "contracts": [{
+    "identity": "dev.teamarness.exhibits", "major": 1, "minor": 0,
+    "description": "Author Exhibits: static multi-page websites (HTML, CSS, JavaScript, images, media, WebAssembly) that a Person views inside Teamarness. Upload files in chunks by SHA-256, then create or replace a Draft that names them. Call runtime.guide first.",
+    "ports": [
+      { "name": "runtime.guide", "kind": "query", "description": "Read this first. Returns how to author an Exhibit as Markdown, plus the enforced limits, the allowed extensions with their media types (lowercase extensions only) and the Exhibit ID pattern. Exhibits bundle every file: no CDN or network, relative links only, one entry page, no workers or nested frames.",
+        "request": { "type": "object", "additionalProperties": false },
+        "response": { "type": "object", "additionalProperties": false, "required": ["markdown", "limits", "mediaTypes", "idPattern"], "properties": {
+          "markdown": { "type": "string", "minLength": 1, "maxLength": 16384 },
+          "limits": { "$ref": "#/$defs/limits" },
+          "mediaTypes": { "type": "object", "maxProperties": 64, "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 64 } },
+          "idPattern": { "type": "string", "minLength": 1, "maxLength": 64 }
+        } }
+      },
+      { "name": "file.put", "kind": "command", "description": "Upload one chunk of a file named by its lowercase hex SHA-256 and size. data is standard base64 of exactly 131072 raw bytes, except the last chunk; chunkCount is ceil(size / 131072), or 1 for an empty file. Chunks are idempotent and may arrive in any order; complete is true once the file is verified and stored. Files over 16 MiB are refused (exhibits.too_large). Keep at most 4 calls in flight. After outcome_unknown, ask files.missing instead of guessing.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["sha256", "size", "chunkIndex", "chunkCount", "data"], "properties": {
+          "sha256": { "$ref": "#/$defs/sha256" }, "size": { "$ref": "#/$defs/count" },
+          "chunkIndex": { "$ref": "#/$defs/count" }, "chunkCount": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+          "data": { "type": "string", "maxLength": 174764 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["complete"], "properties": { "complete": { "type": "boolean" } } }
+      },
+      { "name": "files.missing", "kind": "query", "description": "Report which of up to 256 files are not yet stored completely: chunks is \"all\" when nothing was received, or the chunk indices to send. Files already stored are left out, so an empty list means every file is present. Use it before uploading, to skip files another Exhibit already stored, and to resume after an uncertain file.put.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["sha256s"], "properties": {
+          "sha256s": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/sha256" } }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["missing"], "properties": {
+          "missing": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/missing" } }
+        } }
+      },
+      { "name": "draft.update", "kind": "command", "description": "Create the Draft exhibitId, or replace its title, entry page and complete file list atomically, and return the new revision. Every file must be uploaded first; otherwise exhibits.missing_files names them. Pass expectedRevision (0 for a new Draft) to avoid overwriting another update: exhibits.revision_conflict carries the current revision. Other refusals: exhibits.invalid_id, invalid_title, invalid_path, type_refused, too_large.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["exhibitId", "title", "entry", "files"], "properties": {
+          "exhibitId": { "$ref": "#/$defs/exhibitId" }, "title": { "$ref": "#/$defs/title" }, "entry": { "$ref": "#/$defs/path" },
+          "files": { "type": "array", "minItems": 1, "maxItems": 1100, "items": { "type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {
+            "path": { "$ref": "#/$defs/path" }, "sha256": { "$ref": "#/$defs/sha256" }
+          } } },
+          "expectedRevision": { "$ref": "#/$defs/expectedRevision" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["revision"], "properties": { "revision": { "$ref": "#/$defs/revision" } } }
+      },
+      { "name": "exhibit.list", "kind": "query", "description": "List Exhibits newest first by last update, at most 64 per page. Pass nextBefore back as before for the next page; it is absent on the last page. Every Exhibit is a Draft in this version.",
+        "request": { "type": "object", "additionalProperties": false, "properties": {
+          "before": { "type": "string", "minLength": 1, "maxLength": 128 }, "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["exhibits"], "properties": {
+          "exhibits": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/summary" } },
+          "nextBefore": { "type": "string", "minLength": 1, "maxLength": 128 }
+        } }
+      },
+      { "name": "exhibit.read", "kind": "query", "description": "Read a Draft's title, entry page, revision, who last updated it (person or agent) and files (path, sha256, size, mediaType), sorted by path, 500 files per page; pass nextOffset back as offset for the next page. Fetch file bytes with file.read. Unknown IDs fail with exhibits.not_found.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["exhibitId"], "properties": {
+          "exhibitId": { "$ref": "#/$defs/exhibitId" }, "offset": { "type": "integer", "minimum": 0, "maximum": 1000 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["exhibitId", "title", "entry", "revision", "updatedAt", "updatedBy", "fileCount", "files"], "properties": {
+          "exhibitId": { "$ref": "#/$defs/exhibitId" }, "title": { "$ref": "#/$defs/title" }, "entry": { "$ref": "#/$defs/path" },
+          "revision": { "$ref": "#/$defs/revision" }, "updatedAt": { "$ref": "#/$defs/timestamp" },
+          "updatedBy": { "$ref": "#/$defs/actor" },
+          "fileCount": { "type": "integer", "minimum": 1, "maximum": 1000 },
+          "files": { "type": "array", "maxItems": 500, "items": { "$ref": "#/$defs/file" } },
+          "nextOffset": { "type": "integer", "minimum": 1, "maximum": 1000 }
+        } }
+      },
+      { "name": "file.read", "kind": "query", "description": "Read one 131072-byte chunk of a stored file as standard base64, with the file's chunkCount, so you can read back or revise content you did not keep. Files not stored completely fail with exhibits.not_found.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["sha256", "chunkIndex"], "properties": {
+          "sha256": { "$ref": "#/$defs/sha256" }, "chunkIndex": { "type": "integer", "minimum": 0, "maximum": 127 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["data", "chunkCount"], "properties": {
+          "data": { "type": "string", "maxLength": 174764 }, "chunkCount": { "type": "integer", "minimum": 1, "maximum": 128 }
+        } }
+      },
+      { "name": "draft.delete", "kind": "command", "description": "Delete a Draft; deleted is false when it did not exist, so a repeat is safe. Pass expectedRevision to refuse deleting an update you have not seen (exhibits.revision_conflict). Its files stay stored for 24 hours, so recreating it soon needs no upload.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["exhibitId"], "properties": {
+          "exhibitId": { "$ref": "#/$defs/exhibitId" }, "expectedRevision": { "$ref": "#/$defs/expectedRevision" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["deleted"], "properties": { "deleted": { "type": "boolean" } } }
+      }
+    ]
+  }]
+}

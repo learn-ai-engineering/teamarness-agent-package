@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "recordId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "version": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,1024}$" },
+    "cursor": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "markdown": { "type": "string", "maxLength": 262144 },
+    "collection": { "type": "object", "additionalProperties": false, "required": ["id", "name", "archived"], "properties": {
+      "id": { "$ref": "#/$defs/recordId" },
+      "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+      "archived": { "type": "boolean" }
+    } },
+    "document": { "type": "object", "additionalProperties": false, "required": ["id", "collectionId", "title", "archived", "body"], "properties": {
+      "id": { "$ref": "#/$defs/recordId" },
+      "collectionId": { "$ref": "#/$defs/recordId" },
+      "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+      "archived": { "type": "boolean" },
+      "body": { "type": "string", "enum": ["available", "pending", "unavailable"] },
+      "version": { "$ref": "#/$defs/version" }
+    } },
+    "page": { "type": "object", "additionalProperties": false, "required": ["collections", "documents"], "properties": {
+      "collections": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/collection" } },
+      "documents": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/document" } },
+      "next": { "$ref": "#/$defs/cursor" }
+    } }
+  },
+  "contracts": [{
+    "identity": "dev.teamarness.documents", "major": 1, "minor": 1,
+    "description": "Documents as Canonical Markdown with opaque version tokens: list, read, base-versioned revise by the local Installation Person or a locally bound Workspace Agent (1.1), and live change invalidation.",
+    "ports": [
+      { "name": "document.list", "kind": "query", "description": "List Collections and Documents in Order Key order, at most 64 per page; pass next as after for the following page. With collectionId, only that Collection's Documents. version is present only for an available body. Errors: documents.unknown_collection, documents.invalid_cursor.",
+        "request": { "type": "object", "additionalProperties": false, "properties": {
+          "collectionId": { "$ref": "#/$defs/recordId" },
+          "after": { "$ref": "#/$defs/cursor" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+        } },
+        "response": { "$ref": "#/$defs/page" }
+      },
+      { "name": "document.markdown", "kind": "query", "description": "Read a Document body as Canonical Markdown with the version token it was exported at. Errors: documents.pending (records not yet opened; retry later), documents.unavailable (conflicted, failed import, or a version the token cannot carry), documents.too_large (the response exceeds the Host Port value bound, MAX_UI_PAYLOAD_BYTES), documents.unknown_document.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["documentId"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["markdown", "version"], "properties": {
+          "markdown": { "$ref": "#/$defs/markdown" }, "version": { "$ref": "#/$defs/version" }
+        } }
+      },
+      { "name": "document.revise", "kind": "command", "description": "Merge Markdown revised from the baseVersion export as one record signed by the local Person or (1.1) the caller's bound Agent; changed false appends nothing. Errors: documents.base_unavailable, documents.revision_too_large, documents.schema_violation, documents.unknown_document, documents.pending, documents.unavailable, documents.actor_unauthorized, documents.principal_not_bound. version may include concurrent edits; read again before revising. An uncertain command must not be retried automatically.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "baseVersion", "markdown"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "baseVersion": { "$ref": "#/$defs/version" },
+          "markdown": { "$ref": "#/$defs/markdown" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["changed", "normalised"], "properties": {
+          "version": { "$ref": "#/$defs/version" },
+          "changed": { "type": "boolean" },
+          "normalised": { "type": "boolean" }
+        } }
+      },
+      { "name": "documents.changed", "kind": "event", "description": "Live-only, at-most-once invalidation that may coalesce; no initial event or replay. documentIds names Documents whose body changed; without it, re-list. Re-query on receipt or reconnection.",
+        "event": { "type": "object", "additionalProperties": false, "properties": {
+          "documentIds": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/recordId" } }
+        } }
+      }
+    ]
+  }]
+}

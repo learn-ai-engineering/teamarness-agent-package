@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+jsonschema.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

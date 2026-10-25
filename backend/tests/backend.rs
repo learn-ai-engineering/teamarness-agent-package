@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
+use teamarness_agent_package::catalog::{BundledCatalog, Catalog, PortKind};
 use teamarness_agent_package::router;
 use teamarness_package_sdk::BackendError;
 use teamarness_package_sdk::testing::{
@@ -230,6 +231,97 @@ fn router_matches_the_ui_contract() {
     assert_router_matches_contract(
         &router().operations(),
         include_str!("../../ui-contract.json"),
+    );
+}
+
+fn manifest() -> Value {
+    serde_json::from_str(include_str!("../../teamarness.package.json")).expect("manifest is JSON")
+}
+
+/// A consumed contract: identity, major, minor range and `(port, kind)` pairs.
+type Consumed = (String, u64, u64, u64, Vec<(String, String)>);
+
+#[test]
+fn manifest_and_catalog_agree() {
+    let manifest = manifest();
+    let declared: Vec<Consumed> = manifest["consumedPorts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|contract| {
+            (
+                contract["identity"].as_str().unwrap().to_owned(),
+                contract["major"].as_u64().unwrap(),
+                contract["minMinor"].as_u64().unwrap(),
+                contract["maxMinor"].as_u64().unwrap(),
+                contract["ports"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|port| {
+                        (
+                            port["name"].as_str().unwrap().to_owned(),
+                            port["kind"].as_str().unwrap().to_owned(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let kind = |kind: PortKind| match kind {
+        PortKind::Command => "command",
+        PortKind::Query => "query",
+        PortKind::Event => "event",
+    };
+    let bundled: Vec<Consumed> = BundledCatalog::get()
+        .contracts()
+        .iter()
+        .map(|contract| {
+            (
+                contract.identity.clone(),
+                u64::from(contract.major),
+                u64::from(contract.minor),
+                u64::from(contract.minor),
+                contract
+                    .ports
+                    .iter()
+                    .map(|port| (port.name.clone(), kind(port.kind).to_owned()))
+                    .collect(),
+            )
+        })
+        .collect();
+    // Same contracts, the exact bundled minor, and the same ports; order is not meaningful.
+    let sorted = |mut contracts: Vec<Consumed>| {
+        for contract in &mut contracts {
+            contract.4.sort();
+        }
+        contracts.sort();
+        contracts
+    };
+    assert_eq!(sorted(declared), sorted(bundled));
+}
+
+#[test]
+fn optional_contracts_are_not_required() {
+    let manifest = manifest();
+    let required: Vec<(&str, bool)> = manifest["consumedPorts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|contract| {
+            (
+                contract["identity"].as_str().unwrap(),
+                contract["required"].as_bool().unwrap_or(true),
+            )
+        })
+        .collect();
+    assert_eq!(
+        required,
+        [
+            ("dev.teamarness.conversations", true),
+            ("dev.teamarness.documents", false),
+            ("dev.teamarness.exhibits", false),
+        ]
     );
 }
 

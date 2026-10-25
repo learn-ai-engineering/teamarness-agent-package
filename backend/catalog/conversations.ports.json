@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "channelId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "message": { "type": "object", "additionalProperties": false, "required": ["id", "position", "author", "markdown", "isLocal"], "properties": {
+      "id": { "type": "string" }, "position": { "type": "string", "minLength": 1 }, "author": { "type": "string" },
+      "markdown": { "type": "string", "maxLength": 32768 }, "isLocal": { "type": "boolean" }
+    } },
+    "pendingRow": { "type": "object", "additionalProperties": false, "required": ["id", "position", "status"], "properties": {
+      "id": { "type": "string" }, "position": { "type": "string", "minLength": 1 },
+      "status": { "type": "string", "enum": ["pending", "unavailable"] }
+    } },
+    "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "change": { "type": "object", "additionalProperties": false, "required": ["revision", "id", "position", "kind"], "properties": {
+      "revision": { "$ref": "#/$defs/revision" }, "id": { "type": "string" }, "position": { "type": "string", "minLength": 1 },
+      "kind": { "type": "string", "enum": ["insert", "remove"] },
+      "message": { "$ref": "#/$defs/message" }, "status": { "type": "string", "enum": ["ready", "pending", "unavailable"] }
+    } },
+    "changes": { "type": "object", "additionalProperties": false, "required": ["events", "continuation", "highWater"], "properties": {
+      "events": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/change" } },
+      "continuation": { "$ref": "#/$defs/revision" }, "highWater": { "$ref": "#/$defs/revision" },
+      "resyncRequired": { "type": "boolean" }
+    } },
+    "channelSummary": { "type": "object", "additionalProperties": false, "required": ["id", "name"], "properties": {
+      "id": { "$ref": "#/$defs/channelId" },
+      "name": { "type": "string", "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$", "minLength": 1, "maxLength": 48 }
+    } },
+    "page": { "type": "object", "additionalProperties": false, "required": ["messages", "pending", "epoch", "revision"], "properties": {
+      "messages": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/message" } },
+      "pending": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/pendingRow" } },
+      "epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+      "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+      "nextBefore": { "type": "string", "minLength": 1 }
+    } }
+  },
+  "contracts": [{
+    "identity": "dev.teamarness.conversations", "major": 1, "minor": 2,
+    "description": "Conversations Messages posted by the local Installation Person or a locally bound Workspace Agent, bounded Channel and Message reads, and live Workspace projection invalidation.",
+    "ports": [
+      { "name": "message.post", "kind": "command", "description": "Post a Message as the Host-derived actor: the local Installation Person, or the Workspace Agent the calling Package Instance is bound to (1.1), whose key then signs the Message. A Person from another Installation is refused. An uncertain command must not be retried automatically.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "markdown"], "properties": {
+          "channelId": { "$ref": "#/$defs/channelId" }, "markdown": { "type": "string", "minLength": 1, "maxLength": 32768 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["ok"], "properties": { "ok": { "const": true } } }
+      },
+      { "name": "message.page", "kind": "query", "description": "Read a bounded Channel page without marking it read; re-query after missed invalidations.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["channelId"], "properties": {
+          "channelId": { "$ref": "#/$defs/channelId" }, "before": { "type": "string", "minLength": 1 },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+        } },
+        "response": { "$ref": "#/$defs/page" }
+      },
+      { "name": "messages.changed", "kind": "event", "description": "Live-only payload-free Workspace projection invalidation. May coalesce; no initial event or replay. Re-query on receipt or reconnection.",
+        "event": { "type": "object", "additionalProperties": false }
+      },
+      { "name": "message.changes", "kind": "query", "description": "Recover bounded Channel projection changes after an acknowledged revision (1.2). Revisions track newly projected Messages independently of display order. Pending content can be retried at the same revision; a changed epoch requires explicit resynchronization. Does not mark the Channel read.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["channelId", "epoch", "after"], "properties": {
+          "channelId": { "$ref": "#/$defs/channelId" }, "epoch": { "$ref": "#/$defs/epoch" }, "after": { "$ref": "#/$defs/revision" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 32 }
+        } },
+        "response": { "$ref": "#/$defs/changes" }
+      },
+      { "name": "channel.list", "kind": "query", "description": "List the Channels a Message can be posted to, in creation order with #general first, exactly as this Installation's UI shows them: hidden Channels are excluded. At most 64 Channels are returned (1.1).",
+        "request": { "type": "object", "additionalProperties": false },
+        "response": { "type": "object", "additionalProperties": false, "required": ["channels"], "properties": {
+          "channels": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/channelSummary" } }
+        } }
+      }
+    ]
+  }]
+}

@@ -1397,6 +1397,7 @@ dependencies = [
 name = "teamarness-agent-package"
 version = "0.1.0"
 dependencies = [
+ "jsonschema",
  "reqwest",
  "rustls",
  "serde",
