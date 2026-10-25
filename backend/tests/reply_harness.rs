@@ -2003,8 +2003,8 @@ async fn chat_with_fixture_documents_contract_uses_document_list() {
     use teamarness_agent_package::chat::{self, ChatSession};
     use teamarness_agent_package::model::{ConfiguredModel, ModelClient};
     use teamarness_agent_package::skills;
-    use teamarness_agent_package::tools::{ToolContext, Toolset};
-    use teamarness_agent_package::turn::{self, ToolExecutor, Turn, TurnBounds, TurnOutcome};
+    use teamarness_agent_package::tools::TurnTools;
+    use teamarness_agent_package::turn::TurnOutcome;
 
     const DOCUMENTS: &str = "dev.teamarness.documents";
     // The bundled Documents contract, plus the guide `package-alignment` will publish.
@@ -2029,13 +2029,10 @@ async fn chat_with_fixture_documents_contract_uses_document_list() {
     assert_eq!(usable.len(), 1);
 
     let ports = RecordingPorts::default();
-    let tools = Toolset::for_turn(&usable, ports.clone(), skills::bundled()).unwrap();
+    // The same turn assembly the chat handler and replies use.
+    let tools = TurnTools::new(&usable, ports.clone(), skills::bundled());
     let mut session = ChatSession::default();
-    let system = chat::system_message(
-        None,
-        "Be brief.",
-        &ToolContext::for_turn(&usable, skills::bundled()),
-    );
+    let system = chat::system_message(None, "Be brief.", tools.context());
     let started = session
         .begin("what documents are in this Workspace?", system, 20)
         .unwrap();
@@ -2056,18 +2053,14 @@ async fn chat_with_fixture_documents_contract_uses_document_list() {
         "stub/model-1".into(),
         SECRET.into(),
     );
-    let outcome = turn::drive(
-        Turn::new(
+    let outcome = tools
+        .run(
             system,
             history,
-            tools.definitions().to_vec(),
-            TurnBounds::PRODUCTION,
-        ),
-        &model,
-        &tools,
-        &teamarness_package_sdk::CancellationToken::new(),
-    )
-    .await;
+            &model,
+            &teamarness_package_sdk::CancellationToken::new(),
+        )
+        .await;
     assert!(
         matches!(&outcome, TurnOutcome::Done(result) if result.text == "One Document: Roadmap.")
     );
@@ -2301,6 +2294,47 @@ async fn provider_error_recovered_in_same_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_chat_turn_keeps_the_activity_it_recorded() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let harness = &mut fixture.harness;
+    harness.activate().await.unwrap();
+    configure(harness, &stub).await;
+    set_exhibits(harness, true).await;
+
+    // The tool call succeeds, then the endpoint fails: the turn fails, keeping that call.
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "exhibits__exhibit_list",
+        "{}",
+    )]));
+    stub.push(Behaviour::Status(500, "{}".into()));
+    let failed = chat(harness, "what exhibits are there?").await;
+    assert_eq!(
+        failed,
+        json!({
+            "entries": [{"id": 1, "role": "user", "content": "what exhibits are there?"}],
+            "pending": false,
+            "lastError": {"code": "agent.endpoint_unreachable", "retryable": true},
+            "failedActivity": [{"package": "exhibits", "port": "exhibit.list", "ok": true}],
+        })
+    );
+    assert_eq!(stub.request_count(), 2);
+    assert_eq!(conversations.exhibits_calls().len(), 1);
+
+    // The next turn starts clean.
+    stub.push(Behaviour::Reply("Q3 review.".into()));
+    let answered = chat(harness, "try again").await;
+    assert_eq!(answered.get("lastError"), None, "{answered}");
+    assert_eq!(answered.get("failedActivity"), None, "{answered}");
+    assert!(conversations.posts().is_empty());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn turn_limit_ends_reply_with_status_code_and_no_post() {
     let data = tempfile::tempdir().unwrap();
     let stub = StubEndpoint::start().await;
@@ -2395,5 +2429,59 @@ async fn nothing_enabled_requests_are_unchanged() {
             .iter()
             .all(|call| call.method != "available" && call.payload["contract"] != EXHIBITS)
     );
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_enabled_large_history_is_still_sent() {
+    // Only the bytes a turn's own tool exchange adds count against the message bound, so a
+    // history over 96 KiB is sent as it was before Package tools existed.
+    const BOUND: usize = 96 * 1024;
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 20).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
+
+    // Five full-size chat messages of three-byte characters: under the transcript's character
+    // bound, but well over the message bound in bytes.
+    let long = "中".repeat(8192);
+    for round in 1..=5 {
+        stub.push(Behaviour::Reply(format!("Noted {round}.")));
+        let answered = chat(harness, &long).await;
+        assert_eq!(answered.get("lastError"), None, "round {round}");
+        assert_eq!(
+            answered["entries"].as_array().unwrap().last().unwrap()["content"],
+            format!("Noted {round}.")
+        );
+    }
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 5);
+    let last = &requests[4].body;
+    assert_eq!(offered(last), None);
+    assert_eq!(last["messages"].as_array().unwrap().len(), 1 + 9);
+    assert!(serde_json::to_vec(&last["messages"]).unwrap().len() > BOUND);
+
+    // A reply whose Channel context is over the bound is sent and posted once.
+    for _ in 0..4 {
+        conversations.append(GENERAL, BOB_KEY, &"x".repeat(30_000));
+    }
+    say(&conversations, ports, BOB_KEY, "@Scout summarize that").await;
+    wait_until("the reply", || conversations.posts().len() == 1).await;
+    wait_status(harness, "ready", None).await;
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 6);
+    let reply = &requests[5].body;
+    assert_eq!(offered(reply), None);
+    assert!(serde_json::to_vec(&reply["messages"]).unwrap().len() > BOUND);
+    assert_eq!(
+        last_message(reply)["content"],
+        "Bob (person): @Scout summarize that"
+    );
+    settle_pass(ports).await;
+    assert_eq!(conversations.posts().len(), 1);
     fixture.harness.shutdown().await.unwrap();
 }

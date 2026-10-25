@@ -134,7 +134,8 @@
       "properties": {
         "entries": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/chatEntry" } },
         "pending": { "type": "boolean" },
-        "lastError": { "$ref": "#/$defs/statusError" }
+        "lastError": { "$ref": "#/$defs/statusError" },
+        "failedActivity": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "$ref": "#/$defs/activity" } }
       }
     }
   },

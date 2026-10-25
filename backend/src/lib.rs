@@ -44,7 +44,6 @@ use packages::PackagesStore;
 use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
-use turn::ToolExecutor;
 
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, json!({}))
@@ -285,25 +284,18 @@ impl AgentActive {
     ) -> Result<ChatView, BackendError> {
         let usable = access::usable_now(self.catalog, self.ports.as_ref(), &config.enabled).await;
         let name = self.status.agent().and_then(|agent| agent.name);
-        let system = chat::system_message(
-            name.as_deref(),
-            &config.system_prompt,
-            &tools::ToolContext::for_turn(&usable, skills::bundled()),
-        );
+        let tools = tools::TurnTools::new(&usable, self.ports.clone(), skills::bundled());
+        let system = chat::system_message(name.as_deref(), &config.system_prompt, tools.context());
         let (turn, view) = self
             .chat
             .update(|session| session.begin(content, system, config.context_messages));
         let turn = turn.map_err(|code| error(code, code == chat::CHAT_BUSY))?;
         let cell = self.chat.clone();
-        let ports = self.ports.clone();
         let task = TaskHandle::spawn(&self.cancellation, move |cancellation| async move {
             let generation = turn.generation;
             let (system, history) = turn.into_parts();
-            let outcome = match (
-                ModelClient::new(),
-                tools::Toolset::for_turn(&usable, ports, skills::bundled()),
-            ) {
-                (Ok(client), Ok(toolset)) => {
+            let outcome = match ModelClient::new() {
+                Ok(client) => {
                     let ChatConfig {
                         endpoint_base_url,
                         model,
@@ -311,18 +303,9 @@ impl AgentActive {
                         ..
                     } = config;
                     let model = ConfiguredModel::new(client, endpoint_base_url, model, api_key);
-                    let turn = turn::Turn::new(
-                        system,
-                        history,
-                        toolset.definitions().to_vec(),
-                        turn::TurnBounds::PRODUCTION,
-                    );
-                    turn::drive(turn, &model, &toolset, &cancellation).await
+                    tools.run(system, history, &model, &cancellation).await
                 }
-                (Err(failure), _) => turn::TurnOutcome::Failed(failure.code, failure.retryable),
-                // The bundled catalog always loads; a tool set that cannot be built is reported,
-                // never a panic.
-                (_, Err(_)) => turn::TurnOutcome::Failed(turn::TOOL_UNAVAILABLE, false),
+                Err(failure) => turn::TurnOutcome::failed(failure.code, failure.retryable),
             };
             if outcome == turn::TurnOutcome::Cancelled {
                 return;

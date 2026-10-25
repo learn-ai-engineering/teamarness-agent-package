@@ -7,7 +7,11 @@
 //! a [`Model`] and a [`ToolExecutor`]. Tool calls run one at a time, in the order the model gave
 //! them. Nothing here retries a model call or a tool call, and nothing is truncated silently: a
 //! bound either ends the turn with `agent.turn_limit_exceeded` or, for an oversized tool result,
-//! replaces the result with a coded error the model can read.
+//! replaces the result with a coded error the model can read. A turn that fails keeps the
+//! activity of the tool calls that ran before it ended.
+//!
+//! The message bound covers only what a turn adds to its starting messages. The system message
+//! and history are sent whatever their size, as they were before tools existed.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -38,7 +42,8 @@ pub struct TurnBounds {
     pub tool_calls: usize,
     /// Characters in one tool result.
     pub result_chars: usize,
-    /// Serialized bytes of all messages, checked before each model call.
+    /// Serialized bytes the turn's own tool exchange adds to its starting messages, checked
+    /// before each model call.
     pub message_bytes: usize,
     /// Wall-clock time for the whole turn.
     pub deadline: Duration,
@@ -82,22 +87,44 @@ pub struct TurnResult {
 /// What the caller must do next.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step<'a> {
-    /// Ask the model, offering [`Turn::tools`]; answer with [`Turn::model_answered`].
+    /// Ask the model, offering the executor's tools; answer with [`Turn::model_answered`].
     CallModel(&'a [ChatMessage]),
     /// Run this call; answer with [`Turn::tool_finished`].
     RunTool(ToolCall),
     Done(TurnResult),
-    /// The turn ended with this code and retryability.
-    Failed(&'static str, bool),
+    /// The turn ended with this code and retryability, keeping the activity of every tool call
+    /// that ran before it ended.
+    Failed {
+        code: &'static str,
+        retryable: bool,
+        activity: Vec<Activity>,
+    },
 }
 
 /// How a driven turn ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnOutcome {
     Done(TurnResult),
-    Failed(&'static str, bool),
+    /// As [`Step::Failed`]: a code, its retryability, and the activity recorded before the end.
+    Failed {
+        code: &'static str,
+        retryable: bool,
+        activity: Vec<Activity>,
+    },
     /// The caller's cancellation token fired; nothing further was called.
     Cancelled,
+}
+
+impl TurnOutcome {
+    /// A failure before any tool call ran.
+    #[must_use]
+    pub fn failed(code: &'static str, retryable: bool) -> Self {
+        Self::Failed {
+            code,
+            retryable,
+            activity: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -113,7 +140,8 @@ enum Phase {
 #[derive(Debug)]
 pub struct Turn {
     messages: Vec<ChatMessage>,
-    tools: Vec<ToolDefinition>,
+    /// The serialized size of the starting messages, which the message bound does not count.
+    baseline: usize,
     bounds: TurnBounds,
     model_calls: usize,
     tool_calls: usize,
@@ -123,20 +151,17 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// A turn that starts with the `system` message followed by `history`.
+    /// A turn that starts with the `system` message followed by `history`. Its tools are the
+    /// executor's that [`drive`] runs it with.
     #[must_use]
-    pub fn new(
-        system: String,
-        history: Vec<ChatMessage>,
-        tools: Vec<ToolDefinition>,
-        bounds: TurnBounds,
-    ) -> Self {
+    pub fn new(system: String, history: Vec<ChatMessage>, bounds: TurnBounds) -> Self {
         let mut messages = Vec::with_capacity(history.len() + 1);
         messages.push(ChatMessage::system(system));
         messages.extend(history);
+        let baseline = message_bytes(&messages);
         Self {
             messages,
-            tools,
+            baseline,
             bounds,
             model_calls: 0,
             tool_calls: 0,
@@ -144,12 +169,6 @@ impl Turn {
             activity: Vec::new(),
             phase: Phase::NeedModel,
         }
-    }
-
-    /// The tools every model call offers.
-    #[must_use]
-    pub fn tools(&self) -> &[ToolDefinition] {
-        &self.tools
     }
 
     #[must_use]
@@ -165,8 +184,9 @@ impl Turn {
     )]
     pub fn next(&mut self) -> Step<'_> {
         if matches!(self.phase, Phase::NeedModel) {
+            let added = message_bytes(&self.messages).saturating_sub(self.baseline);
             self.phase = if self.model_calls >= self.bounds.model_calls
-                || self.message_bytes() > self.bounds.message_bytes
+                || added > self.bounds.message_bytes
             {
                 Phase::Failed(TURN_LIMIT_EXCEEDED, false)
             } else {
@@ -178,7 +198,11 @@ impl Turn {
             Phase::NeedModel | Phase::AwaitingModel => Step::CallModel(&self.messages),
             Phase::AwaitingTool(call) => Step::RunTool(call.clone()),
             Phase::Done(result) => Step::Done(result.clone()),
-            Phase::Failed(code, retryable) => Step::Failed(code, *retryable),
+            Phase::Failed(code, retryable) => Step::Failed {
+                code,
+                retryable: *retryable,
+                activity: self.activity.clone(),
+            },
         }
     }
 
@@ -249,10 +273,19 @@ impl Turn {
         };
     }
 
-    fn message_bytes(&self) -> usize {
-        // A message list that cannot be serialized cannot be sent either.
-        serde_json::to_vec(&self.messages).map_or(usize::MAX, |bytes| bytes.len())
+    /// The turn ended at the deadline, keeping the activity recorded so far.
+    fn out_of_time(&self) -> TurnOutcome {
+        TurnOutcome::Failed {
+            code: TURN_LIMIT_EXCEEDED,
+            retryable: false,
+            activity: self.activity.clone(),
+        }
     }
+}
+
+fn message_bytes(messages: &[ChatMessage]) -> usize {
+    // A message list that cannot be serialized cannot be sent either.
+    serde_json::to_vec(messages).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// The model a turn calls.
@@ -279,9 +312,9 @@ pub trait ToolExecutor {
 
 /// Runs `turn` to its end under `cancel` and the turn's deadline.
 ///
-/// Cancellation wins over everything: once `cancel` fires no further model or tool call starts,
-/// and the result is [`TurnOutcome::Cancelled`]. The deadline ends the turn with
-/// `agent.turn_limit_exceeded`.
+/// Every model call offers `executor`'s tools. Cancellation wins over everything: once `cancel`
+/// fires no further model or tool call starts, and the result is [`TurnOutcome::Cancelled`]. The
+/// deadline ends the turn with `agent.turn_limit_exceeded` and the activity recorded so far.
 pub async fn drive<M: Model, E: ToolExecutor>(
     mut turn: Turn,
     model: &M,
@@ -289,8 +322,7 @@ pub async fn drive<M: Model, E: ToolExecutor>(
     cancel: &CancellationToken,
 ) -> TurnOutcome {
     let deadline = turn.bounds().deadline;
-    // The offer is fixed for the turn; a copy lets the machine advance while a call borrows it.
-    let tools = turn.tools().to_vec();
+    let tools = executor.definitions();
     let run = async {
         loop {
             if cancel.is_cancelled() {
@@ -298,7 +330,7 @@ pub async fn drive<M: Model, E: ToolExecutor>(
             }
             match turn.next() {
                 Step::CallModel(messages) => {
-                    let answer = model.respond(messages, &tools).await;
+                    let answer = model.respond(messages, tools).await;
                     turn.model_answered(answer);
                 }
                 Step::RunTool(call) => {
@@ -306,17 +338,27 @@ pub async fn drive<M: Model, E: ToolExecutor>(
                     turn.tool_finished(outcome);
                 }
                 Step::Done(result) => return TurnOutcome::Done(result),
-                Step::Failed(code, retryable) => return TurnOutcome::Failed(code, retryable),
+                Step::Failed {
+                    code,
+                    retryable,
+                    activity,
+                } => {
+                    return TurnOutcome::Failed {
+                        code,
+                        retryable,
+                        activity,
+                    };
+                }
             }
         }
     };
-    tokio::select! {
+    let ended = tokio::select! {
         biased;
-        () = cancel.cancelled() => TurnOutcome::Cancelled,
-        outcome = tokio::time::timeout(deadline, run) => {
-            outcome.unwrap_or(TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false))
-        }
-    }
+        () = cancel.cancelled() => Some(TurnOutcome::Cancelled),
+        outcome = tokio::time::timeout(deadline, run) => outcome.ok(),
+    };
+    // `None` is the deadline; the run is dropped, so the turn can say what it did.
+    ended.unwrap_or_else(|| turn.out_of_time())
 }
 
 #[cfg(test)]
@@ -474,17 +516,16 @@ mod tests {
         }
     }
 
-    fn turn(tools: &FakeTools, bounds: TurnBounds) -> Turn {
+    fn turn(bounds: TurnBounds) -> Turn {
         Turn::new(
             "system".into(),
             vec![ChatMessage::user("question".into())],
-            tools.definitions().to_vec(),
             bounds,
         )
     }
 
     async fn run(model: &FakeModel, tools: &FakeTools, bounds: TurnBounds) -> TurnOutcome {
-        drive(turn(tools, bounds), model, tools, &CancellationToken::new()).await
+        drive(turn(bounds), model, tools, &CancellationToken::new()).await
     }
 
     #[test]
@@ -592,7 +633,7 @@ mod tests {
         let outcome = run(&model, &tools, TurnBounds::PRODUCTION).await;
         assert_eq!(
             outcome,
-            TurnOutcome::Failed(crate::model::ENDPOINT_UNREACHABLE, true)
+            TurnOutcome::failed(crate::model::ENDPOINT_UNREACHABLE, true)
         );
     }
 
@@ -608,7 +649,14 @@ mod tests {
             ..TurnBounds::PRODUCTION
         };
         let outcome = run(&model, &tools, bounds).await;
-        assert_eq!(outcome, TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false));
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: TURN_LIMIT_EXCEEDED,
+                retryable: false,
+                activity: vec![activity("t__a", true, None); 3],
+            }
+        );
         assert_eq!(model.requests().len(), 3);
         assert_eq!(tools.names().len(), 3);
     }
@@ -626,7 +674,14 @@ mod tests {
             ..TurnBounds::PRODUCTION
         };
         let outcome = run(&model, &tools, bounds).await;
-        assert_eq!(outcome, TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false));
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: TURN_LIMIT_EXCEEDED,
+                retryable: false,
+                activity: vec![activity("t__a", true, None); 16],
+            }
+        );
         assert_eq!(tools.names().len(), 16);
 
         // A batch that would cross the budget runs none of its calls.
@@ -641,7 +696,7 @@ mod tests {
             ..TurnBounds::PRODUCTION
         };
         let outcome = run(&model, &tools, bounds).await;
-        assert_eq!(outcome, TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false));
+        assert_eq!(outcome, TurnOutcome::failed(TURN_LIMIT_EXCEEDED, false));
         assert!(tools.names().is_empty());
     }
 
@@ -689,24 +744,8 @@ mod tests {
 
     #[tokio::test]
     async fn message_bound_exceeded() {
-        // The history alone is over the bound: no model call is made.
-        let model = FakeModel::new(vec![text("never")]);
-        let tools = FakeTools::new(ok_result("{}"));
-        let bounds = TurnBounds {
-            message_bytes: 64,
-            ..TurnBounds::PRODUCTION
-        };
-        let big = Turn::new(
-            "system".into(),
-            vec![ChatMessage::user("x".repeat(64))],
-            Vec::new(),
-            bounds,
-        );
-        let outcome = drive(big, &model, &tools, &CancellationToken::new()).await;
-        assert_eq!(outcome, TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false));
-        assert!(model.requests().is_empty());
-
-        // A tool result pushes the messages over the bound before the next model call.
+        // A tool result pushes the turn's own messages over the bound before the next model
+        // call; the call that ran is kept.
         let model = FakeModel::new(vec![calls(vec![call("c1", "t__a")]), text("never")]);
         let tools = FakeTools::new(ok_result(&"y".repeat(2000)));
         let bounds = TurnBounds {
@@ -714,9 +753,132 @@ mod tests {
             ..TurnBounds::PRODUCTION
         };
         let outcome = run(&model, &tools, bounds).await;
-        assert_eq!(outcome, TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false));
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: TURN_LIMIT_EXCEEDED,
+                retryable: false,
+                activity: vec![activity("t__a", true, None)],
+            }
+        );
         assert_eq!(model.requests().len(), 1);
         assert_eq!(tools.names().len(), 1);
+
+        // Growth inside the bound is sent.
+        let model = FakeModel::new(vec![calls(vec![call("c1", "t__a")]), text("done")]);
+        let tools = FakeTools::new(ok_result(&"y".repeat(500)));
+        let outcome = run(&model, &tools, bounds).await;
+        assert!(matches!(outcome, TurnOutcome::Done(_)), "{outcome:?}");
+        assert_eq!(model.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn large_initial_history_is_not_bounded() {
+        // The starting messages alone are far over the bound: the model is still asked, with
+        // every one of them.
+        let bounds = TurnBounds {
+            message_bytes: 64,
+            ..TurnBounds::PRODUCTION
+        };
+        let history = vec![
+            ChatMessage::user("x".repeat(10_000)),
+            ChatMessage::assistant("中".repeat(10_000)),
+            ChatMessage::user("question".into()),
+        ];
+        let model = FakeModel::new(vec![text("answer")]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let big = Turn::new("system".into(), history.clone(), bounds);
+        let outcome = drive(big, &model, &tools, &CancellationToken::new()).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Done(TurnResult {
+                text: "answer".into(),
+                activity: Vec::new(),
+            })
+        );
+        assert_eq!(model.requests()[0][1..], history[..]);
+
+        // The same turn still bounds what its own tool exchange adds.
+        let model = FakeModel::new(vec![calls(vec![call("c1", "t__a")]), text("never")]);
+        let tools = FakeTools::new(ok_result(&"y".repeat(200)));
+        let big = Turn::new("system".into(), history, bounds);
+        let outcome = drive(big, &model, &tools, &CancellationToken::new()).await;
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Failed {
+                    code: TURN_LIMIT_EXCEEDED,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(model.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_turn_keeps_activity() {
+        // A model failure after a tool call keeps that call's activity.
+        let failure = ModelFailure {
+            code: crate::model::ENDPOINT_UNREACHABLE,
+            retryable: true,
+        };
+        let model = FakeModel::new(vec![
+            calls(vec![call("c1", "t__a")]),
+            Scripted::Answer(Err(failure)),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let outcome = run(&model, &tools, TurnBounds::PRODUCTION).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: crate::model::ENDPOINT_UNREACHABLE,
+                retryable: true,
+                activity: vec![activity("t__a", true, None)],
+            }
+        );
+
+        // A batch that crosses the tool-call budget keeps the calls that already ran.
+        let model = FakeModel::new(vec![
+            calls(vec![call("c1", "t__a")]),
+            calls(vec![call("c2", "t__b"), call("c3", "t__a")]),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let bounds = TurnBounds {
+            tool_calls: 2,
+            ..TurnBounds::PRODUCTION
+        };
+        let outcome = run(&model, &tools, bounds).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: TURN_LIMIT_EXCEEDED,
+                retryable: false,
+                activity: vec![activity("t__a", true, None)],
+            }
+        );
+
+        // The step machine reports the same activity, and repeats it if asked again.
+        let mut turn = turn(TurnBounds::PRODUCTION);
+        assert!(matches!(turn.next(), Step::CallModel(_)));
+        turn.model_answered(Ok(Assistant {
+            content: None,
+            tool_calls: vec![call("c1", "t__b")],
+        }));
+        assert_eq!(turn.next(), Step::RunTool(call("c1", "t__b")));
+        turn.tool_finished(ToolOutcome {
+            content: "{}".into(),
+            activity: Some(activity("t__b", false, Some("t.refused"))),
+        });
+        assert!(matches!(turn.next(), Step::CallModel(_)));
+        turn.model_answered(Err(failure));
+        let failed = Step::Failed {
+            code: crate::model::ENDPOINT_UNREACHABLE,
+            retryable: true,
+            activity: vec![activity("t__b", false, Some("t.refused"))],
+        };
+        assert_eq!(turn.next(), failed);
+        assert_eq!(turn.next(), failed);
     }
 
     #[tokio::test]
@@ -730,7 +892,15 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_secs(5), run(&model, &tools, bounds))
             .await
             .expect("the turn deadline did not end the turn");
-        assert_eq!(outcome, TurnOutcome::Failed(TURN_LIMIT_EXCEEDED, false));
+        // The call that ran before the deadline is kept.
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: TURN_LIMIT_EXCEEDED,
+                retryable: false,
+                activity: vec![activity("t__a", true, None)],
+            }
+        );
         assert_eq!(model.requests().len(), 2);
     }
 
@@ -741,13 +911,7 @@ mod tests {
         let model = FakeModel::new(vec![calls(vec![call("c1", "t__a"), call("c2", "t__b")])]);
         let mut tools = FakeTools::new(ok_result("{}"));
         tools.cancel_on_run = Some(cancel.clone());
-        let outcome = drive(
-            turn(&tools, TurnBounds::PRODUCTION),
-            &model,
-            &tools,
-            &cancel,
-        )
-        .await;
+        let outcome = drive(turn(TurnBounds::PRODUCTION), &model, &tools, &cancel).await;
         assert_eq!(outcome, TurnOutcome::Cancelled);
         assert_eq!(model.requests().len(), 1);
         assert_eq!(tools.names(), ["t__a"]);
@@ -762,13 +926,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             cancelling.cancel();
         });
-        let outcome = drive(
-            turn(&tools, TurnBounds::PRODUCTION),
-            &model,
-            &tools,
-            &cancel,
-        )
-        .await;
+        let outcome = drive(turn(TurnBounds::PRODUCTION), &model, &tools, &cancel).await;
         assert_eq!(outcome, TurnOutcome::Cancelled);
         assert!(tools.names().is_empty());
 
@@ -776,13 +934,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
         let model = FakeModel::new(vec![text("never")]);
-        let outcome = drive(
-            turn(&tools, TurnBounds::PRODUCTION),
-            &model,
-            &tools,
-            &cancel,
-        )
-        .await;
+        let outcome = drive(turn(TurnBounds::PRODUCTION), &model, &tools, &cancel).await;
         assert_eq!(outcome, TurnOutcome::Cancelled);
         assert!(model.requests().is_empty());
     }

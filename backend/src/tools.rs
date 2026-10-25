@@ -10,6 +10,7 @@
 //! [`Toolset`] is what one turn runs: the port tools plus the built-in [`SKILL_READ`], which is
 //! offered only when a contract is usable. [`ToolContext`] is the matching one-line-per-item
 //! text the system message carries; guide and skill bodies are read on request, never inlined.
+//! [`TurnTools`] builds both from the same inputs and runs a chat or reply turn over them.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -24,8 +25,9 @@ use crate::access::display_name;
 use crate::catalog::{CatalogContract, CatalogPort, GUIDE_PORT, PortKind, alias};
 use crate::skills::Skill;
 use crate::turn::{
-    Activity, TOOL_ARGUMENTS_INVALID, TOOL_OUTCOME_UNKNOWN, TOOL_UNAVAILABLE, ToolCall,
-    ToolDefinition, ToolExecutor, ToolOutcome,
+    self, Activity, ChatMessage, Model, TOOL_ARGUMENTS_INVALID, TOOL_OUTCOME_UNKNOWN,
+    TOOL_UNAVAILABLE, ToolCall, ToolDefinition, ToolExecutor, ToolOutcome, Turn, TurnBounds,
+    TurnOutcome,
 };
 
 /// How many `$ref`s may be written out inside one another.
@@ -39,8 +41,7 @@ const CANCELLED: &str = "cancelled";
 
 /// A contract the model may use now, minus any withheld ports.
 ///
-/// Phase 4's `access::usable` decides which contracts these are; this module only turns them
-/// into tools.
+/// `access::usable` decides which contracts these are; this module only turns them into tools.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsableContract {
     pub identity: String,
@@ -613,6 +614,48 @@ impl ToolContext {
                  appear in a tool result.",
             );
         }
+    }
+}
+
+/// One chat or reply turn's tools, and the system-message context that describes them, built
+/// together from the same usable contracts and skills.
+pub struct TurnTools<P> {
+    context: ToolContext,
+    toolset: Result<Toolset<P>, LoadError>,
+}
+
+impl<P: PortCaller> TurnTools<P> {
+    #[must_use]
+    pub fn new(usable: &[UsableContract], ports: P, skills: &[Skill]) -> Self {
+        Self {
+            context: ToolContext::for_turn(usable, skills),
+            toolset: Toolset::for_turn(usable, ports, skills),
+        }
+    }
+
+    /// What the turn's system message says about these tools.
+    #[must_use]
+    pub fn context(&self) -> &ToolContext {
+        &self.context
+    }
+
+    /// Runs one turn within [`TurnBounds::PRODUCTION`]: the `system` message, then `history`,
+    /// against `model`, offering these tools.
+    ///
+    /// The bundled catalog always loads; a tool set that cannot be built ends the turn with
+    /// `agent.tool_unavailable` before the model is asked, never a panic.
+    pub async fn run(
+        self,
+        system: String,
+        history: Vec<ChatMessage>,
+        model: &impl Model,
+        cancel: &CancellationToken,
+    ) -> TurnOutcome {
+        let Ok(toolset) = self.toolset else {
+            return TurnOutcome::failed(TOOL_UNAVAILABLE, false);
+        };
+        let turn = Turn::new(system, history, TurnBounds::PRODUCTION);
+        turn::drive(turn, model, &toolset, cancel).await
     }
 }
 

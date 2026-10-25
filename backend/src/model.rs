@@ -240,26 +240,6 @@ impl ModelClient {
         Ok(Self { client })
     }
 
-    /// Requests one completion without tools and returns the assistant's text.
-    ///
-    /// `api_key` is used for this one request and dropped with it.
-    ///
-    /// # Errors
-    ///
-    /// As [`ModelClient::respond`]; a completion without text is `agent.model_error`.
-    pub async fn complete(
-        &self,
-        endpoint_base_url: &str,
-        model: &str,
-        messages: &[ChatMessage],
-        api_key: &str,
-    ) -> Result<String, ModelFailure> {
-        self.respond(endpoint_base_url, model, messages, &[], api_key)
-            .await?
-            .content
-            .ok_or_else(ModelFailure::model_error)
-    }
-
     /// Requests one completion offering `tools` (none when empty) and returns the assistant's
     /// text and tool calls.
     ///
@@ -530,10 +510,11 @@ mod tests {
 
             let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
             let outcome = client
-                .complete(
+                .respond(
                     &format!("http://{source_addr}"),
                     "m",
                     &[ChatMessage::user("private transcript sentinel".into())],
+                    &[],
                     "sk-test",
                 )
                 .await;
@@ -557,9 +538,15 @@ mod tests {
         .await;
         let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
         let result = client
-            .complete(&base, "m", &[ChatMessage::user("hi".into())], "sk-test")
+            .respond(
+                &base,
+                "m",
+                &[ChatMessage::user("hi".into())],
+                &[],
+                "sk-test",
+            )
             .await;
-        assert_eq!(result.unwrap(), "hello");
+        assert_eq!(result.unwrap().content.as_deref(), Some("hello"));
     }
 
     #[tokio::test]
@@ -567,7 +554,13 @@ mod tests {
         let base = one_shot(None).await;
         let client = ModelClient::with_timeout(Duration::from_millis(200)).unwrap();
         let outcome = client
-            .complete(&base, "m", &[ChatMessage::user("hi".into())], "sk-test")
+            .respond(
+                &base,
+                "m",
+                &[ChatMessage::user("hi".into())],
+                &[],
+                "sk-test",
+            )
             .await;
         assert_eq!(
             outcome,
@@ -585,11 +578,23 @@ mod tests {
         drop(listener);
         let client = ModelClient::with_timeout(Duration::from_secs(5)).unwrap();
         let outcome = client
-            .complete(&base, "m", &[ChatMessage::user("hi".into())], "sk-test")
+            .respond(
+                &base,
+                "m",
+                &[ChatMessage::user("hi".into())],
+                &[],
+                "sk-test",
+            )
             .await;
         assert_eq!(outcome.unwrap_err().code, ENDPOINT_UNREACHABLE);
         let outcome = client
-            .complete("http://[::1", "m", &[ChatMessage::user("hi".into())], "sk")
+            .respond(
+                "http://[::1",
+                "m",
+                &[ChatMessage::user("hi".into())],
+                &[],
+                "sk",
+            )
             .await;
         assert_eq!(outcome.unwrap_err().code, ENDPOINT_REJECTED);
     }
@@ -602,7 +607,13 @@ mod tests {
         .await;
         let client = ModelClient::with_timeout(Duration::from_secs(5)).unwrap();
         let outcome = client
-            .complete(&base, "m", &[ChatMessage::user("hi".into())], "sk-test")
+            .respond(
+                &base,
+                "m",
+                &[ChatMessage::user("hi".into())],
+                &[],
+                "sk-test",
+            )
             .await;
         assert_eq!(outcome.unwrap_err().code, MODEL_ERROR);
     }
@@ -660,8 +671,8 @@ mod tests {
 
         let (base, request) =
             capturing(r#"{"choices":[{"message":{"content":"ok"}}]}"#.into()).await;
-        let answer = client.complete(&base, "m", &history, "sk").await;
-        assert_eq!(answer.unwrap(), "ok");
+        let answer = client.respond(&base, "m", &history, &[], "sk").await;
+        assert_eq!(answer.unwrap().content.as_deref(), Some("ok"));
         assert_eq!(request.await.unwrap(), expected);
 
         let (base, request) =

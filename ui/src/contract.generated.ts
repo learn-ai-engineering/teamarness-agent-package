@@ -28,6 +28,7 @@ export type Candidates = {
 
 export type Chat = {
   readonly "entries": readonly ChatEntry[];
+  readonly "failedActivity"?: readonly Activity[];
   readonly "lastError"?: StatusError;
   readonly "pending": boolean;
 };

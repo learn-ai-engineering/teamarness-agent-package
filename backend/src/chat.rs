@@ -65,6 +65,10 @@ pub struct ChatView {
     pub pending: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<StatusError>,
+    /// The Package operations the failed turn used before it ended; present only beside
+    /// `last_error`, and absent when it used none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_activity: Option<Vec<Activity>>,
 }
 
 /// What a started turn sends to the model.
@@ -94,6 +98,7 @@ pub struct ChatSession {
     next_id: u64,
     pending: bool,
     last_error: Option<StatusError>,
+    failed_activity: Option<Vec<Activity>>,
     generation: u64,
 }
 
@@ -104,6 +109,7 @@ impl ChatSession {
             entries: self.entries.iter().cloned().collect(),
             pending: self.pending,
             last_error: self.last_error.clone(),
+            failed_activity: self.failed_activity.clone(),
         }
     }
 
@@ -134,6 +140,7 @@ impl ChatSession {
         self.push(ChatRole::User, content.to_owned(), None);
         self.pending = true;
         self.last_error = None;
+        self.failed_activity = None;
         self.generation += 1;
         let start = self.entries.len().saturating_sub(context.saturating_add(1));
         let messages = std::iter::once(ChatMessage::system(system))
@@ -168,12 +175,20 @@ impl ChatSession {
                 let text = truncate_chars(result.text.trim(), MAX_ENTRY_CHARS);
                 if text.is_empty() {
                     self.fail(crate::model::MODEL_ERROR, false);
+                    self.keep_failed_activity(result.activity);
                 } else {
                     let activity = (!result.activity.is_empty()).then_some(result.activity);
                     self.push(ChatRole::Assistant, text, activity);
                 }
             }
-            TurnOutcome::Failed(code, retryable) => self.fail(code, retryable),
+            TurnOutcome::Failed {
+                code,
+                retryable,
+                activity,
+            } => {
+                self.fail(code, retryable);
+                self.keep_failed_activity(activity);
+            }
             TurnOutcome::Cancelled => self.fail(CHAT_INTERRUPTED, true),
         }
         true
@@ -193,6 +208,7 @@ impl ChatSession {
         self.entries.clear();
         self.pending = false;
         self.last_error = None;
+        self.failed_activity = None;
         self.generation += 1;
     }
 
@@ -201,6 +217,12 @@ impl ChatSession {
             code: code.to_owned(),
             retryable,
         });
+        self.failed_activity = None;
+    }
+
+    /// Shows what a failed turn did beside its error. It never becomes history.
+    fn keep_failed_activity(&mut self, activity: Vec<Activity>) {
+        self.failed_activity = (!activity.is_empty()).then_some(activity);
     }
 
     fn push(&mut self, role: ChatRole, content: String, activity: Option<Vec<Activity>>) {
@@ -418,7 +440,7 @@ mod tests {
     fn failures_are_recorded_and_the_next_send_clears_them() {
         let mut session = ChatSession::default();
         let turn = begin(&mut session, "hi", 4);
-        let failure = TurnOutcome::Failed(crate::model::ENDPOINT_UNREACHABLE, true);
+        let failure = TurnOutcome::failed(crate::model::ENDPOINT_UNREACHABLE, true);
         assert!(session.finish(turn.generation, failure));
         let view = session.view();
         assert!(!view.pending);
@@ -665,7 +687,7 @@ mod tests {
         let turn = begin(&mut session, "hi", 4);
         assert!(session.finish(
             turn.generation,
-            TurnOutcome::Failed(crate::turn::TURN_LIMIT_EXCEEDED, false)
+            TurnOutcome::failed(crate::turn::TURN_LIMIT_EXCEEDED, false)
         ));
         assert_eq!(
             session.view().last_error,
@@ -678,6 +700,66 @@ mod tests {
         let turn = begin(&mut session, "again", 4);
         assert!(session.finish(turn.generation, TurnOutcome::Cancelled));
         assert_eq!(session.view().last_error.unwrap().code, CHAT_INTERRUPTED);
+    }
+
+    #[test]
+    fn a_failed_turn_keeps_the_activity_it_recorded() {
+        use crate::turn::{Activity, TurnResult};
+
+        let used = vec![Activity {
+            package: "exhibits".into(),
+            port: "exhibit.list".into(),
+            ok: true,
+            code: None,
+        }];
+        let mut session = ChatSession::default();
+        let turn = begin(&mut session, "what exhibits are there?", 4);
+        assert!(session.finish(
+            turn.generation,
+            TurnOutcome::Failed {
+                code: crate::model::ENDPOINT_UNREACHABLE,
+                retryable: true,
+                activity: used.clone(),
+            }
+        ));
+        let view = session.view();
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(
+            view.last_error.unwrap().code,
+            crate::model::ENDPOINT_UNREACHABLE
+        );
+        assert_eq!(view.failed_activity, Some(used.clone()));
+        assert_eq!(
+            serde_json::to_value(session.view()).unwrap()["failedActivity"],
+            serde_json::json!([{"package": "exhibits", "port": "exhibit.list", "ok": true}])
+        );
+        // The failure's activity never becomes history, and the next send clears it.
+        let next = begin(&mut session, "again", 4);
+        assert_eq!(
+            next.messages[1..],
+            [
+                ChatMessage::user("what exhibits are there?".into()),
+                ChatMessage::user("again".into()),
+            ]
+        );
+        assert_eq!(session.view().failed_activity, None);
+
+        // An answer with no text keeps its activity beside the model error.
+        assert!(session.finish(
+            next.generation,
+            TurnOutcome::Done(TurnResult {
+                text: "  ".into(),
+                activity: used.clone(),
+            })
+        ));
+        assert_eq!(session.view().failed_activity, Some(used));
+        // A failure without activity, an interruption or a clear carries none.
+        session.clear();
+        assert_eq!(session.view().failed_activity, None);
+        let turn = begin(&mut session, "hi", 4);
+        assert!(session.finish(turn.generation, TurnOutcome::failed(CHAT_BUSY, true)));
+        let view = serde_json::to_value(session.view()).unwrap();
+        assert_eq!(view.get("failedActivity"), None, "{view}");
     }
 
     #[test]

@@ -35,7 +35,7 @@ Package UI
 
 The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports capabilities, and consumes Documents 1.1 and Exhibits 1.0 as optional contracts. It also offers the Steward a direct, in-memory chat with the configured model on a separate UI tab. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
 
-Chat and reply turns can call the tools of enabled Packages. A turn is a bounded loop (`backend/src/turn.rs`) between the model and a tool set (`backend/src/tools.rs`): the usable contracts' ports plus the Agent's compiled-in skills. `access::usable` is the only place that decides which contracts are usable. A contract is agent-facing only when it has a `runtime.guide` query; today only Exhibits has one. The Steward enables Packages in the Packages section on Configuration, stored in `packages.json`. The model is never offered `message.post`; the harness posts each reply's final text once. A dispatched command is never re-sent. There is no dispatch fence: a post already dispatched when the binding changes may be attributed to the new Agent. README.md lists the turn bounds and the `agent.*` codes.
+Chat and reply turns can call the tools of enabled Packages. A turn is a bounded loop (`backend/src/turn.rs`) between the model and a tool set (`backend/src/tools.rs`): the usable contracts' ports plus the Agent's compiled-in skills. `access::usable` is the only place that decides which contracts are usable. A contract is agent-facing only when it has a `runtime.guide` query; today only Exhibits has one. The Steward enables Packages in the Packages section on Configuration, stored in `packages.json`. The model is never offered `message.post`, nor Exhibits `file.read`/`file.put` (`access::WITHHELD`); the harness posts each reply's final text once. Chat and replies assemble a turn through one helper, `tools::TurnTools`. The message bound counts only what a turn's tool calls add, never its starting history. A dispatched command is never re-sent. There is no dispatch fence: a post already dispatched when the binding changes may be attributed to the new Agent. README.md lists the turn bounds and the `agent.*` codes.
 
 ## Project map
 
@@ -46,7 +46,7 @@ Chat and reply turns can call the tools of enabled Packages. A turn is a bounded
 | `backend/src/lib.rs` | Owns domain behavior, lifecycle handling, validation, and Package data. |
 | `backend/src/turn.rs` | The sans-I/O turn engine and its bounds (`TurnBounds`) and stable codes. |
 | `backend/src/model.rs` | The OpenAI-compatible model client, with tool definitions and tool calls. |
-| `backend/src/tools.rs` | The generic port tool executor, `skill_read`, and the system-message tool context. |
+| `backend/src/tools.rs` | The generic port tool executor, `skill_read`, the system-message tool context, and `TurnTools`, which runs a chat or reply turn. |
 | `backend/src/catalog.rs` | The `Catalog` seam and the bundled Provider contracts. |
 | `backend/src/access.rs` | Decides which contracts are listed and usable. |
 | `backend/src/packages.rs` | The Steward's Package enablement, `packages.json` (schema v1). |

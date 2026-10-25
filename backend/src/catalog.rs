@@ -1,6 +1,6 @@
 //! The Catalog seam: which Provider contracts the Agent knows, with their ports and schemas.
 //!
-//! [`BundledCatalog`] is the slice-1 implementation. It compiles in verbatim copies of Provider
+//! [`BundledCatalog`] is the implementation used today. It compiles in verbatim copies of Provider
 //! `ports.json` files from `backend/catalog/`, whose provenance and digests
 //! `npm run check:catalog` verifies. A later Host-discovery implementation answers the same
 //! [`Catalog`] trait.
@@ -69,15 +69,7 @@ pub struct CatalogContract {
     pub defs: Map<String, Value>,
 }
 
-impl CatalogContract {
-    /// The last segment of the identity: `dev.teamarness.exhibits` → `exhibits`.
-    #[must_use]
-    pub fn alias(&self) -> &str {
-        alias(&self.identity)
-    }
-}
-
-/// The last segment of a contract identity.
+/// The last segment of a contract identity: `dev.teamarness.exhibits` → `exhibits`.
 #[must_use]
 pub fn alias(identity: &str) -> &str {
     identity.rsplit('.').next().unwrap_or(identity)
@@ -276,7 +268,7 @@ mod tests {
         assert!(changed.request.is_none() && changed.response.is_none());
 
         let exhibits = find(&catalog, "dev.teamarness.exhibits");
-        assert_eq!(exhibits.alias(), "exhibits");
+        assert_eq!(alias(&exhibits.identity), "exhibits");
         assert_eq!(exhibits.ports.len(), 8);
         assert!(exhibits.defs.contains_key("sha256"));
         assert!(exhibits.description.starts_with("Author Exhibits"));

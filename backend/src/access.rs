@@ -2,7 +2,7 @@
 //!
 //! A contract is offered to the model ([`usable`]) only when it is agent-facing (its catalog
 //! entry has `runtime.guide`), the Host reports it declared and available, and the Steward has
-//! enabled it. Ports withheld in this slice are removed. [`listed`] is the Steward's view of the
+//! enabled it. The [`WITHHELD`] ports are removed. [`listed`] is the Steward's view of the
 //! same facts: every agent-facing contract, whatever its availability or enablement.
 //!
 //! "Declared" is read from the Host: the package-ports `available` answer lists only contracts
@@ -20,8 +20,15 @@ use crate::tools::UsableContract;
 /// The UI asked to enable or disable a contract that is not agent-facing. Not retryable.
 pub const UNKNOWN_PACKAGE: &str = "agent.unknown_package";
 
-/// Ports never offered to the model, as `(contract, port)`. The harness posts replies itself.
-pub const WITHHELD: [(&str, &str); 1] = [("dev.teamarness.conversations", "message.post")];
+/// Ports never offered to the model, as `(contract, port)`.
+///
+/// The harness posts replies itself. Exhibits file transfer waits for blob references: a full
+/// chunk is larger than one tool result or a turn's message bound can carry.
+pub const WITHHELD: [(&str, &str); 3] = [
+    ("dev.teamarness.conversations", "message.post"),
+    ("dev.teamarness.exhibits", "file.read"),
+    ("dev.teamarness.exhibits", "file.put"),
+];
 
 /// The contracts the Host reports available, by identity and major.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -350,6 +357,34 @@ mod tests {
             usable[0].description,
             "dev.teamarness.conversations contract"
         );
+    }
+
+    #[test]
+    fn file_transfer_ports_are_withheld() {
+        const EXHIBITS: &str = "dev.teamarness.exhibits";
+        let catalog = BundledCatalog::get();
+        let bundled: Vec<&str> = catalog
+            .contracts()
+            .iter()
+            .find(|contract| contract.identity == EXHIBITS)
+            .unwrap()
+            .ports
+            .iter()
+            .map(|port| port.name.as_str())
+            .collect();
+        assert!(bundled.contains(&"file.read") && bundled.contains(&"file.put"));
+        let availability = Availability::parse(&answer(&[(EXHIBITS, 1, true)]));
+        let usable = usable(catalog, &availability, &all(&[EXHIBITS]));
+        let ports: Vec<&str> = usable[0]
+            .ports
+            .iter()
+            .map(|port| port.name.as_str())
+            .collect();
+        assert!(!ports.contains(&"file.read"), "{ports:?}");
+        assert!(!ports.contains(&"file.put"), "{ports:?}");
+        // Everything else Exhibits declares is still offered.
+        assert_eq!(ports.len(), bundled.len() - 2);
+        assert!(ports.contains(&GUIDE_PORT));
     }
 
     #[test]

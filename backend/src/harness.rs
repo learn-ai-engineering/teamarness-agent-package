@@ -29,8 +29,8 @@ use crate::progress::{Cursor, Progress};
 use crate::settings::SettingsStore;
 use crate::skills;
 use crate::status::StatusCell;
-use crate::tools::{ToolContext, Toolset};
-use crate::turn::{self, ToolExecutor, TurnBounds, TurnOutcome};
+use crate::tools::{ToolContext, TurnTools};
+use crate::turn::TurnOutcome;
 
 pub const CONVERSATIONS_CONTRACT: &str = "dev.teamarness.conversations";
 pub const POST_FAILED: &str = "agent.post_failed";
@@ -698,28 +698,17 @@ async fn reply(
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
         usable = access::usable_now(inputs.catalog, Some(&inputs.ports), &enabled) => usable,
     };
-    // The bundled catalog always loads; a tool set that cannot be built is reported, never a
-    // panic.
-    let Ok(toolset) = Toolset::for_turn(&usable, inputs.ports.clone(), skills::bundled()) else {
-        return ReplyOutcome::Failed(turn::TOOL_UNAVAILABLE, false);
-    };
-    let system = system_message(
-        &prompt.agent,
-        &prompt.system_prompt,
-        &ToolContext::for_turn(&usable, skills::bundled()),
-    );
+    let tools = TurnTools::new(&usable, inputs.ports.clone(), skills::bundled());
+    let system = system_message(&prompt.agent, &prompt.system_prompt, tools.context());
     let model = ConfiguredModel::new(client.clone(), endpoint, model, key);
-    let turn = turn::Turn::new(
-        system,
-        history,
-        toolset.definitions().to_vec(),
-        TurnBounds::PRODUCTION,
-    );
-    let outcome = turn::drive(turn, &model, &toolset, cancellation).await;
+    let outcome = tools.run(system, history, &model, cancellation).await;
     drop(model);
+    // A failed turn's activity never reaches the Channel; the status shows its code.
     let markdown = match outcome {
         TurnOutcome::Done(result) => truncate_chars(result.text, MAX_REPLY_CHARS),
-        TurnOutcome::Failed(code, retryable) => return ReplyOutcome::Failed(code, retryable),
+        TurnOutcome::Failed {
+            code, retryable, ..
+        } => return ReplyOutcome::Failed(code, retryable),
         TurnOutcome::Cancelled => return ReplyOutcome::Cancelled,
     };
     if markdown.trim().is_empty() {

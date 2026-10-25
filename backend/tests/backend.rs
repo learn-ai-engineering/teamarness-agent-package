@@ -246,11 +246,17 @@ fn router_matches_the_ui_contract() {
 #[test]
 fn chat_activity_bound_matches_the_contract() {
     let contract: Value = serde_json::from_str(include_str!("../../ui-contract.json")).unwrap();
-    let activity = &contract["$defs"]["chatEntry"]["properties"]["activity"];
-    assert_eq!(
-        activity["maxItems"],
-        json!(teamarness_agent_package::chat::MAX_ACTIVITY)
-    );
+    // An answer's activity and a failed turn's activity share one bound and one item shape.
+    for activity in [
+        &contract["$defs"]["chatEntry"]["properties"]["activity"],
+        &contract["$defs"]["chat"]["properties"]["failedActivity"],
+    ] {
+        assert_eq!(
+            activity["maxItems"],
+            json!(teamarness_agent_package::chat::MAX_ACTIVITY)
+        );
+        assert_eq!(activity["items"], json!({"$ref": "#/$defs/activity"}));
+    }
     assert_eq!(
         contract["$defs"]["activity"]["additionalProperties"],
         json!(false)

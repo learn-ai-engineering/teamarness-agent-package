@@ -34,13 +34,14 @@ The chat and Channel replies can use other installed Packages through Package Po
 - **Which Packages are listed.** A Provider contract is agent-facing only when it has a `runtime.guide` query. The **Packages** section lists every agent-facing contract the Agent knows, whether the Host reports it available, and a switch. Today only Exhibits has a guide, so only Exhibits is listed. Documents and Conversations are listed once `package-alignment` publishes their guides and the catalog is refreshed.
 - **Enablement.** The switch state is stored in `packages.json` (`{"schemaVersion": 1, "enabled": [identity]}`) in the Package Data Directory. A missing file means nothing is enabled. A Package is usable only when it is agent-facing, available and enabled. Documents and Exhibits are optional in the manifest, so the Agent installs and runs without them; a missing Package shows as **Unavailable**.
 - **What the model sees.** The system message has one line per usable Package, naming its guide tool (`<alias>__runtime_guide`), and one line per skill. The model reads a guide or a skill (`skill_read`) only on request. Tool output is data, not instructions. With nothing enabled, no tools are sent and the request is the same as before tools existed.
-- **What the Steward sees.** A chat answer that used Package operations shows a muted line such as "Used Exhibits: runtime.guide, exhibit.list". A failed call shows its code. Only the final text is kept as chat history.
+- **What the Steward sees.** A chat answer that used Package operations shows a muted line such as "Used Exhibits: runtime.guide, exhibit.list". A failed call shows its code. A chat turn that fails shows the same line under its error, for the calls that ran before it ended. Only the final text is kept as chat history.
 - **Replies.** The model is never offered `message.post`. The harness posts the final text of a reply turn exactly once. A turn that fails posts nothing and sets the status error. The trigger is persisted before the attempt and never retried.
+- **Withheld ports.** Besides `message.post`, Exhibits `file.read` and `file.put` are not offered. One file chunk is larger than a tool result or a turn's message bound can carry, so file transfer waits for blob references.
 - **Calls.** Tool arguments are validated against the port's request schema before anything is sent. A disabled or unknown tool is refused locally, without reaching the Host. A Provider error reaches the model with its stable code, so it can recover in the same turn. A command is never re-sent; an unknown outcome is reported to the model as unknown.
 
 ### Turn bounds and codes
 
-Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 characters per tool result, 96 KiB of messages and 180 seconds. These stable codes can appear:
+Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 characters per tool result, 96 KiB of messages added by its own tool calls, and 180 seconds. The system message and history a turn starts with are not counted, so a long conversation with nothing enabled is sent as before. These stable codes can appear:
 
 | Code | Meaning |
 |---|---|
@@ -71,7 +72,7 @@ TEAMARNESS_AGENT_PACKAGE_DIR=/absolute/path/to/agent/dist/dev.teamarness.agent \
   cargo test -p teamarness-system-tests --test agent_reply_flow --locked -- --ignored
 ```
 
-This explicitly runs four external-package checks: registration, loopback two-profile reply and backlog delivery, queued-post actor attribution during rebinding, and cancelled-binding-waiter ownership. The default Teamarness suite does not require this separate project. The focused `local_agent_package_loads_from_registration` check covers the packaging boundary without repeating model/backlog behavior.
+This explicitly runs four external-package checks: registration, loopback two-profile reply and backlog delivery, queued-post actor attribution during rebinding, and cancelled-binding-waiter ownership. The queued-post attribution check (`agent_reply_flow.rs::enqueued_reply_keeps_old_actor_during_rebind`) asserts the dispatch fence, which has been removed, so it is expected to fail until Teamarness updates or drops it. The default Teamarness suite does not require this separate project. The focused `local_agent_package_loads_from_registration` check covers the packaging boundary without repeating model/backlog behavior.
 
 ## Provenance and verification
 
@@ -80,7 +81,7 @@ Product source/tests/contracts were extracted without behavioral changes from Te
 Bounded cleanup resolves the following findings. Consolidated verification and independent review passed for Backend/test source `ed3c016`, then passed again against merged Teamarness Host `a67f3c4` with the unchanged Agent distribution:
 
 - CR-002 / CR-009: binding/readiness transitions serialize. A binding change, readiness change or suspend stops the harness first, which cancels replies that have not been posted yet. The dispatch fence that held already-dispatched posts against a rebind has been removed: binding is a setup-time action, and the fence's latch stopped all replies until restart after any post failure.
-- At-most-once limit: a trigger is persisted before its reply is attempted, and a post is never re-sent. A failed post sets `agent.post_failed` without blocking later replies or binding changes. An in-flight post is not fenced against a concurrent rebind, so a post already dispatched when the binding changes may be attributed to the new Agent. There is no automatic replay or persisted recovery machinery.
+- At-most-once limit: a trigger is persisted before its reply is attempted, and a post is never re-sent. A failed post sets `agent.post_failed` without blocking later replies or binding changes. An in-flight post is not fenced against a concurrent rebind, so a post already dispatched when the binding changes may be attributed to the new Agent. There is no automatic replay or persisted recovery machinery. Follow-up: Teamarness must update or drop the external qualification check `enqueued_reply_keeps_old_actor_during_rebind`, which still expects the fence's refusal.
 - CR-003: startup/reconnect reconcile binding after capturing the roster cursor and before subscribing; failed reconciliation retries without another event. Reply work waits for startup/resume reconciliation.
 - CR-005: completion redirects are rejected, with loopback 307/308 no-forwarding regressions; explicitly configured loopback HTTP remains supported.
 - CR-006: successful complete settings/key changes clear stale errors while preserving replies still active in another Channel.

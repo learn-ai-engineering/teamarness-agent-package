@@ -24,6 +24,8 @@ function fakeBackend(input?: {
   status?: Status;
   candidates?: Array<{ principalId: string; name: string | null; bound: boolean }>;
   packages?: PackageView[];
+  /** Every `agent.packages.set` fails with this code. */
+  refusePackageSet?: string;
 }) {
   let settings = defaults();
   let hasKey = false;
@@ -89,6 +91,9 @@ function fakeBackend(input?: {
       "agent.packages.get": () => ({ packages }),
       "agent.packages.set": (payload) => {
         const { contract, enabled } = payload as { contract: string; enabled: boolean };
+        if (input?.refusePackageSet) {
+          throw createPackageRequestError({ stage: "ui", packageError: { code: input.refusePackageSet, retryable: true } });
+        }
         if (!packages.some((entry) => entry.contract === contract)) {
           throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.unknown_package" } });
         }
@@ -438,19 +443,20 @@ describe("Agent Package UI tabs and chat", () => {
 });
 
 describe("Agent Package UI chat activity", () => {
-  async function chatWith(entries: Chat["entries"]) {
+  async function chatWith(entries: Chat["entries"], failure?: Pick<Chat, "lastError" | "failedActivity">) {
     const backend = fakeBackend({ status: { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } } });
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
     const unmount = await mount(createTestMountContext({ root, client: backend.client }));
-    await backend.fake.emit("agent.chat.changes", { entries, pending: false } satisfies PackageValue);
+    const chat: Chat = { entries, pending: false, ...failure };
+    await backend.fake.emit("agent.chat.changes", chat satisfies PackageValue);
     const items = Array.from(root.querySelectorAll<HTMLElement>(".chat-entry"));
     const cleanup = async () => {
       await unmount();
       host.remove();
     };
-    return { items, cleanup };
+    return { root, items, cleanup };
   }
 
   it("shows the Package operations an answer used, grouped by package", async () => {
@@ -503,6 +509,30 @@ describe("Agent Package UI chat activity", () => {
     );
     await cleanup();
   });
+
+  it("shows a failed turn's activity under its error", async () => {
+    const { root, cleanup } = await chatWith([{ id: 1, role: "user", content: "What exhibits are there?" }], {
+      lastError: { code: "agent.endpoint_unreachable", retryable: true },
+      failedActivity: [{ package: "exhibits", port: "exhibit.list", ok: true }],
+    });
+    const message = root.querySelector<HTMLElement>('[data-role="chat-message"]');
+    expect(message?.textContent).toBe("The endpoint could not be reached. Try again.");
+    const line = root.querySelector<HTMLElement>('[data-role="chat-failed-activity"]');
+    expect(line?.hidden).toBe(false);
+    expect(line?.textContent).toBe("Used Exhibits: exhibit.list");
+    expect(line?.previousElementSibling).toBe(message);
+    expect(line?.getAttribute("aria-hidden")).toBeNull();
+    await cleanup();
+  });
+
+  it("shows no failed-turn activity line without failedActivity", async () => {
+    const { root, cleanup } = await chatWith([{ id: 1, role: "user", content: "Hello" }], {
+      lastError: { code: "agent.endpoint_unreachable", retryable: true },
+    });
+    const line = root.querySelector<HTMLElement>('[data-role="chat-failed-activity"]');
+    expect(line === null || line.hidden).toBe(true);
+    await cleanup();
+  });
 });
 
 describe("Agent Package UI packages", () => {
@@ -521,8 +551,8 @@ describe("Agent Package UI packages", () => {
     enabled: true,
   };
 
-  async function mountedWith(packages: PackageView[]) {
-    const backend = fakeBackend({ packages });
+  async function mountedWith(packages: PackageView[], refusePackageSet?: string) {
+    const backend = fakeBackend({ packages, ...(refusePackageSet ? { refusePackageSet } : {}) });
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
@@ -596,6 +626,23 @@ describe("Agent Package UI packages", () => {
     expect(lastState(states).packages).toEqual([EXHIBITS]);
     expect(lastState(states).packagesBusy).toBe(false);
     controller.dispose();
+  });
+
+  it("returns a refused switch to the stored state", async () => {
+    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES], "agent.storage_failed");
+    const exhibits = () => section.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Exhibits"]');
+    const toggle = exhibits();
+    if (!toggle) throw new Error("Exhibits switch missing");
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(fake.calls.filter((call) => call.operation === "agent.packages.set")).toHaveLength(1);
+    expect(section.querySelector('[data-role="packages-message"]')?.textContent).toBe("agent.storage_failed");
+    // The switch shows what is stored, not what was asked for.
+    expect(exhibits()).toBe(toggle);
+    expect(toggle.checked).toBe(false);
+    expect(toggle.disabled).toBe(false);
+    await cleanup();
   });
 
   it("renders the empty state", async () => {

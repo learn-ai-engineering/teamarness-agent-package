@@ -585,6 +585,11 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   chatMessage.className = "message";
   chatMessage.dataset.role = "chat-message";
   chatMessage.setAttribute("role", "status");
+  // What a failed turn did before it ended, under its error.
+  const chatFailedActivity = document.createElement("p");
+  chatFailedActivity.className = "chat-activity";
+  chatFailedActivity.dataset.role = "chat-failed-activity";
+  chatFailedActivity.hidden = true;
   const chatForm = document.createElement("form");
   chatForm.className = "teamarness-stack chat-form";
   chatForm.noValidate = true;
@@ -599,7 +604,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const clearChatButton = button("Clear conversation", "clear-chat", "secondary");
   chatRow.append(sendButton, clearChatButton);
   chatForm.append(field("Message", chatInput, "Enter sends; Shift+Enter adds a line."), chatRow);
-  chatSection.append(chatIntro, chatEmpty, chatLog, chatMessage, chatForm);
+  chatSection.append(chatIntro, chatEmpty, chatLog, chatMessage, chatFailedActivity, chatForm);
   chatPanel.append(chatSection);
 
   page.append(header, tabList, configPanel, chatPanel);
@@ -702,7 +707,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
           .find((toggle) => toggle.dataset.contract === focused)?.focus();
       }
     }
+    // Every render shows the stored state, so a refused change does not leave the switch flipped.
     for (const toggle of packageList.querySelectorAll<HTMLInputElement>(".package-switch")) {
+      toggle.checked = packages.some((entry) => entry.contract === toggle.dataset.contract && entry.enabled);
       toggle.disabled = state.packagesBusy;
     }
     packagesEmpty.remove();
@@ -760,6 +767,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
       chatMessage.textContent = "";
       delete chatMessage.dataset.kind;
     }
+    const failedActivity = !state.chatError && chat?.lastError ? chat.failedActivity : undefined;
+    chatFailedActivity.textContent = failedActivity && failedActivity.length > 0 ? describeActivity(failedActivity) : "";
+    chatFailedActivity.hidden = !chatFailedActivity.textContent;
     chatLog.setAttribute("aria-busy", String(pending));
     sendButton.disabled = !configured || pending || state.chatBusy;
     clearChatButton.disabled = state.chatBusy || (entries.length === 0 && !pending);
