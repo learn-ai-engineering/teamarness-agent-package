@@ -34,7 +34,11 @@ export type AgentUiState = Readonly<{
   /** A Packages read or change is on its way. */
   packagesBusy: boolean;
   packagesError: string | undefined;
+  /** The change on its way, shown on its switch until the Backend answers. */
+  pendingPackage: PendingPackage | undefined;
 }>;
+
+export type PendingPackage = Readonly<{ contract: string; enabled: boolean }>;
 
 export type AgentController = Readonly<{
   start(): Promise<void>;
@@ -47,7 +51,7 @@ export type AgentController = Readonly<{
   /** Resolves `true` when the Backend accepted the message. */
   sendChat(content: string): Promise<boolean>;
   clearChat(): Promise<void>;
-  /** Enables or disables one agent-facing contract, then re-reads the list. */
+  /** Enables or disables one agent-facing contract and shows the stored state it returns. */
   setPackage(contract: string, enabled: boolean): Promise<void>;
   dispose(): void;
 }>;
@@ -152,6 +156,7 @@ export function createAgentController(
     packages: null,
     packagesBusy: false,
     packagesError: undefined,
+    pendingPackage: undefined,
   };
 
   const update = (changes: Partial<AgentUiState>): void => {
@@ -190,16 +195,17 @@ export function createAgentController(
     }
   };
 
-  const packagesRequest = async (work: () => Promise<void>): Promise<void> => {
+  const packagesRequest = async (
+    work: () => Promise<readonly PackageView[]>,
+    pendingPackage?: PendingPackage,
+  ): Promise<void> => {
     if (disposed) return;
-    update({ packagesBusy: true, packagesError: undefined });
+    update({ packagesBusy: true, packagesError: undefined, pendingPackage });
     try {
-      await work();
-      const read = await typed.request("agent.packages.get", {});
-      update({ packages: read.packages, packagesBusy: false });
+      update({ packages: await work(), packagesBusy: false, pendingPackage: undefined });
     } catch (error) {
       if (isAbortError(error)) return;
-      update({ packagesBusy: false, packagesError: describePackageError(error) });
+      update({ packagesBusy: false, packagesError: describePackageError(error), pendingPackage: undefined });
     }
   };
 
@@ -222,7 +228,7 @@ export function createAgentController(
         return { settings: settings.settings, hasKey: settings.hasKey, status, candidates, chat };
       });
       // A Packages failure stays in its own section; the rest of the page still works.
-      await packagesRequest(async () => undefined);
+      await packagesRequest(async () => (await typed.request("agent.packages.get", {})).packages);
     },
 
     async saveSettings(settings: Settings): Promise<void> {
@@ -275,9 +281,10 @@ export function createAgentController(
     },
 
     async setPackage(contract: string, enabled: boolean): Promise<void> {
-      await packagesRequest(async () => {
-        await typed.request("agent.packages.set", { contract, enabled });
-      });
+      await packagesRequest(
+        async () => (await typed.request("agent.packages.set", { contract, enabled })).packages,
+        { contract, enabled },
+      );
     },
 
     dispose(): void {
@@ -707,9 +714,14 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
           .find((toggle) => toggle.dataset.contract === focused)?.focus();
       }
     }
-    // Every render shows the stored state, so a refused change does not leave the switch flipped.
+    // A change on its way shows what was asked for; otherwise every render shows the stored
+    // state, so a refused change does not leave the switch flipped.
+    const pending = state.pendingPackage;
     for (const toggle of packageList.querySelectorAll<HTMLInputElement>(".package-switch")) {
-      toggle.checked = packages.some((entry) => entry.contract === toggle.dataset.contract && entry.enabled);
+      const contract = toggle.dataset.contract;
+      toggle.checked = pending !== undefined && pending.contract === contract
+        ? pending.enabled
+        : packages.some((entry) => entry.contract === contract && entry.enabled);
       toggle.disabled = state.packagesBusy;
     }
     packagesEmpty.remove();

@@ -26,6 +26,10 @@ function fakeBackend(input?: {
   packages?: PackageView[];
   /** Every `agent.packages.set` fails with this code. */
   refusePackageSet?: string;
+  /** Every `agent.packages.set` waits for this before it answers. */
+  holdPackageSet?: Promise<void>;
+  /** Every `agent.packages.get` after the first fails with this code. */
+  failLaterPackageGets?: string;
 }) {
   let settings = defaults();
   let hasKey = false;
@@ -33,6 +37,7 @@ function fakeBackend(input?: {
   const candidates = input?.candidates ?? [{ principalId: AGENT_ID, name: "Scout", bound: false }];
   let chat: Chat = { entries: [], pending: false };
   let packages: PackageView[] = input?.packages ?? [];
+  let packageGets = 0;
   const fake = createFakePackageClient({
     requests: {
       "agent.settings.get": () => ({ settings, hasKey }),
@@ -88,9 +93,16 @@ function fakeBackend(input?: {
         chat = { entries: [], pending: false };
         return chat;
       },
-      "agent.packages.get": () => ({ packages }),
-      "agent.packages.set": (payload) => {
+      "agent.packages.get": () => {
+        packageGets += 1;
+        if (input?.failLaterPackageGets && packageGets > 1) {
+          throw createPackageRequestError({ stage: "ui", packageError: { code: input.failLaterPackageGets, retryable: true } });
+        }
+        return { packages };
+      },
+      "agent.packages.set": async (payload) => {
         const { contract, enabled } = payload as { contract: string; enabled: boolean };
+        await input?.holdPackageSet;
         if (input?.refusePackageSet) {
           throw createPackageRequestError({ stage: "ui", packageError: { code: input.refusePackageSet, retryable: true } });
         }
@@ -551,8 +563,11 @@ describe("Agent Package UI packages", () => {
     enabled: true,
   };
 
-  async function mountedWith(packages: PackageView[], refusePackageSet?: string) {
-    const backend = fakeBackend({ packages, ...(refusePackageSet ? { refusePackageSet } : {}) });
+  async function mountedWith(
+    packages: PackageView[],
+    options?: { refusePackageSet?: string; holdPackageSet?: Promise<void>; failLaterPackageGets?: string },
+  ) {
+    const backend = fakeBackend({ packages, ...options });
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
@@ -591,18 +606,18 @@ describe("Agent Package UI packages", () => {
     await cleanup();
   });
 
-  it("toggling sends agent.packages.set, re-reads and re-renders", async () => {
-    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES]);
+  it("toggling sends agent.packages.set and renders the stored state it returns", async () => {
+    // A later read would fail: the switch and the section show only what the change returned.
+    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES], { failLaterPackageGets: "agent.storage_failed" });
     const exhibits = () => section.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Exhibits"]');
     const toggle = exhibits();
     if (!toggle) throw new Error("Exhibits switch missing");
-    const reads = fake.calls.filter((call) => call.operation === "agent.packages.get").length;
     toggle.checked = true;
     toggle.dispatchEvent(new Event("change", { bubbles: true }));
     await flush();
     const sets = fake.calls.filter((call) => call.operation === "agent.packages.set");
     expect(sets.map((call) => call.payload)).toEqual([{ contract: "dev.teamarness.exhibits", enabled: true }]);
-    expect(fake.calls.filter((call) => call.operation === "agent.packages.get").length).toBe(reads + 1);
+    expect(section.querySelector('[data-role="packages-message"]')?.textContent).toBe("");
     expect(exhibits()?.checked).toBe(true);
     expect(exhibits()?.disabled).toBe(false);
 
@@ -628,13 +643,43 @@ describe("Agent Package UI packages", () => {
     controller.dispose();
   });
 
+  it("shows the requested state while a change is in flight", async () => {
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES], { holdPackageSet: held });
+    const switches = () => Array.from(section.querySelectorAll<HTMLInputElement>('input[role="switch"]'));
+    const [toggle] = switches();
+    if (!toggle) throw new Error("Exhibits switch missing");
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(fake.calls.filter((call) => call.operation === "agent.packages.set")).toHaveLength(1);
+    // The pending switch keeps what was asked for; every switch waits for the answer.
+    expect(switches().map((element) => [element.checked, element.disabled])).toEqual([[true, true], [true, true]]);
+
+    release();
+    await flush();
+    expect(switches().map((element) => [element.checked, element.disabled])).toEqual([[true, false], [true, false]]);
+    expect(fake.calls.filter((call) => call.operation === "agent.packages.set")).toHaveLength(1);
+    await cleanup();
+  });
+
   it("returns a refused switch to the stored state", async () => {
-    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES], "agent.storage_failed");
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES], {
+      refusePackageSet: "agent.storage_failed",
+      holdPackageSet: held,
+    });
     const exhibits = () => section.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Exhibits"]');
     const toggle = exhibits();
     if (!toggle) throw new Error("Exhibits switch missing");
     toggle.checked = true;
     toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(true);
+    release();
     await flush();
     expect(fake.calls.filter((call) => call.operation === "agent.packages.set")).toHaveLength(1);
     expect(section.querySelector('[data-role="packages-message"]')?.textContent).toBe("agent.storage_failed");

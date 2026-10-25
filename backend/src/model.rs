@@ -241,7 +241,7 @@ impl ModelClient {
     }
 
     /// Requests one completion offering `tools` (none when empty) and returns the assistant's
-    /// text and tool calls.
+    /// text and tool calls. With no tools offered, only the text is read.
     ///
     /// `api_key` is used for this one request and dropped with it.
     ///
@@ -294,13 +294,16 @@ impl ModelClient {
         let bytes = read_capped(response).await?;
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| ModelFailure::model_error())?;
-        parse_assistant(&value).ok_or_else(ModelFailure::model_error)
+        parse_assistant(&value, !tools.is_empty()).ok_or_else(ModelFailure::model_error)
     }
 }
 
 /// The first choice's message, or `None` when it is unusable: no text and no tool calls, or a
 /// tool call without an id or name or with non-string arguments.
-fn parse_assistant(value: &Value) -> Option<Assistant> {
+///
+/// Without `tools_offered` only the text is read, and any `tool_calls`, well formed or not, are
+/// ignored.
+fn parse_assistant(value: &Value, tools_offered: bool) -> Option<Assistant> {
     let message = value.get("choices")?.as_array()?.first()?.get("message")?;
     let content = match message.get("content") {
         None | Some(Value::Null) => None,
@@ -309,12 +312,12 @@ fn parse_assistant(value: &Value) -> Option<Assistant> {
     .filter(|content| !content.is_empty())
     .map(str::to_owned);
     let tool_calls = match message.get("tool_calls") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(calls) => calls
+        Some(calls) if tools_offered && !calls.is_null() => calls
             .as_array()?
             .iter()
             .map(parse_tool_call)
             .collect::<Option<Vec<_>>>()?,
+        _ => Vec::new(),
     };
     if content.is_none() && tool_calls.is_empty() {
         return None;
@@ -775,6 +778,45 @@ mod tests {
                     &[lookup_tool()],
                     "sk",
                 )
+                .await;
+            request.await.unwrap();
+            assert_eq!(outcome.unwrap_err().code, MODEL_ERROR, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_ignored_when_no_tools_offered() {
+        let client = ModelClient::with_timeout(Duration::from_secs(2)).unwrap();
+        let answered = [
+            r#"{"choices":[{"message":{"content":"ok","tool_calls":[{"id":"c","type":"function","function":{"name":"t","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":" ok ","tool_calls":[{"id":"","function":{"arguments":{}}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":"ok","tool_calls":{"id":"c"}}}]}"#,
+        ];
+        for body in answered {
+            let (base, request) = capturing(body.into()).await;
+            let answer = client
+                .respond(&base, "m", &[ChatMessage::user("hi".into())], &[], "sk")
+                .await;
+            request.await.unwrap();
+            assert_eq!(
+                answer.unwrap(),
+                Assistant {
+                    content: Some("ok".into()),
+                    tool_calls: Vec::new(),
+                },
+                "{body}"
+            );
+        }
+
+        // Without usable text the answer is still a model error, whatever the tool calls say.
+        let unusable = [
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"t","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"message":{"content":"  ","tool_calls":[{"id":"c"}]}}]}"#,
+        ];
+        for body in unusable {
+            let (base, request) = capturing(body.into()).await;
+            let outcome = client
+                .respond(&base, "m", &[ChatMessage::user("hi".into())], &[], "sk")
                 .await;
             request.await.unwrap();
             assert_eq!(outcome.unwrap_err().code, MODEL_ERROR, "{body}");

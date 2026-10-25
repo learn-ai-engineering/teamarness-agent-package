@@ -209,6 +209,14 @@ fn tool_calls(calls: &[(String, String, String)]) -> String {
     .to_string()
 }
 
+/// `200` with an assistant message that has both `text` and these raw `tool_calls`.
+fn text_with_tool_calls(text: &str, tool_calls: &Value) -> Behaviour {
+    let body = json!({"id": "cmpl-1", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": text, "tool_calls": tool_calls,
+    }}]});
+    Behaviour::Status(200, body.to_string())
+}
+
 // ------------------------------------------------------------------
 // Scripted Conversations Provider behind teamarness.package-ports
 // ------------------------------------------------------------------
@@ -2109,33 +2117,26 @@ async fn disabled_package_tools_are_not_offered() {
     set_exhibits(harness, true).await;
     set_exhibits(harness, false).await;
 
-    // Even when the model names an Exhibits tool, it is refused here and never reaches the Host.
-    stub.push(Behaviour::ToolCalls(vec![call(
-        "call-1",
-        "exhibits__exhibit_list",
-        "{}",
-    )]));
-    stub.push(Behaviour::Reply("I cannot list Exhibits.".into()));
+    // Even when the model names an Exhibits tool, no tools were offered, so the call is never
+    // run and never reaches the Host.
+    stub.push(text_with_tool_calls(
+        "I cannot list Exhibits.",
+        &json!([{"id": "call-1", "type": "function", "function": {
+            "name": "exhibits__exhibit_list", "arguments": "{}",
+        }}]),
+    ));
     let answered = chat(harness, "what exhibits are there?").await;
     let requests = stub.requests();
-    assert_eq!(requests.len(), 2);
-    for request in &requests {
-        assert_eq!(offered(&request.body), None, "{}", request.body);
-        assert!(
-            !request.body["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("exhibits__")
-        );
-    }
-    let refusal = last_message(&requests[1].body);
-    assert_eq!(refusal["role"], "tool");
-    assert_eq!(
-        serde_json::from_str::<Value>(refusal["content"].as_str().unwrap()).unwrap(),
-        json!({"error": "agent.tool_unavailable", "retryable": false})
+    assert_eq!(requests.len(), 1);
+    assert_eq!(offered(&requests[0].body), None, "{}", requests[0].body);
+    assert!(
+        !requests[0].body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("exhibits__")
     );
     assert!(conversations.exhibits_calls().is_empty());
-    // An unknown tool did no Package operation, so the answer shows none.
+    // No Package operation ran, so the answer shows none.
     assert_eq!(answered["entries"][1].get("activity"), None, "{answered}");
     assert_eq!(answered["entries"][1]["content"], "I cannot list Exhibits.");
     fixture.harness.shutdown().await.unwrap();
@@ -2483,5 +2484,49 @@ async fn nothing_enabled_large_history_is_still_sent() {
     );
     settle_pass(ports).await;
     assert_eq!(conversations.posts().len(), 1);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_enabled_unsolicited_tool_calls_are_ignored() {
+    // With no tools offered, only an answer's text is read: tool calls the endpoint adds on its
+    // own, well formed or not, never start another model call.
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
+
+    let well_formed = json!([{"id": "call-1", "type": "function", "function": {
+        "name": "exhibits__exhibit_list", "arguments": "{}",
+    }}]);
+    stub.push(text_with_tool_calls("Hello, Steward", &well_formed));
+    let answered = chat(harness, "hello").await;
+    assert_eq!(answered.get("lastError"), None, "{answered}");
+    assert_eq!(
+        answered["entries"][1],
+        json!({"id": 2, "role": "assistant", "content": "Hello, Steward"})
+    );
+    assert_eq!(stub.request_count(), 1);
+    assert_eq!(offered(&stub.requests()[0].body), None);
+
+    let malformed = json!([{"id": "", "function": {"arguments": {}}}]);
+    stub.push(text_with_tool_calls("Hi Bob", &malformed));
+    say(&conversations, ports, BOB_KEY, "@Scout hello").await;
+    wait_until("the reply", || conversations.posts().len() == 1).await;
+    wait_status(harness, "ready", None).await;
+    assert_eq!(
+        conversations.posts()[0],
+        (GENERAL.to_owned(), "Hi Bob".to_owned())
+    );
+    assert_eq!(stub.request_count(), 2);
+    assert_eq!(offered(&stub.requests()[1].body), None);
+    settle_pass(ports).await;
+    assert_eq!(stub.request_count(), 2);
+    assert_eq!(conversations.posts().len(), 1);
+    assert!(conversations.exhibits_calls().is_empty());
     fixture.harness.shutdown().await.unwrap();
 }

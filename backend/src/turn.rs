@@ -228,8 +228,11 @@ impl Turn {
             };
             return;
         }
-        // A batch that would cross the budget runs none of its calls.
-        if self.tool_calls + assistant.tool_calls.len() > self.bounds.tool_calls {
+        // A batch that would cross the budget, or that no later model call could read, runs
+        // none of its calls.
+        if self.model_calls >= self.bounds.model_calls
+            || self.tool_calls + assistant.tool_calls.len() > self.bounds.tool_calls
+        {
             self.phase = Phase::Failed(TURN_LIMIT_EXCEEDED, false);
             return;
         }
@@ -649,16 +652,57 @@ mod tests {
             ..TurnBounds::PRODUCTION
         };
         let outcome = run(&model, &tools, bounds).await;
+        // The third call's batch could never be read, so it does not run.
         assert_eq!(
             outcome,
             TurnOutcome::Failed {
                 code: TURN_LIMIT_EXCEEDED,
                 retryable: false,
-                activity: vec![activity("t__a", true, None); 3],
+                activity: vec![activity("t__a", true, None); 2],
             }
         );
         assert_eq!(model.requests().len(), 3);
-        assert_eq!(tools.names().len(), 3);
+        assert_eq!(tools.names().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn last_model_call_tool_batch_never_runs() {
+        // The only model call asks for tools: none runs, and the turn ends at the limit.
+        let model = FakeModel::new(vec![calls(vec![call("c1", "t__a"), call("c2", "t__b")])]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let bounds = TurnBounds {
+            model_calls: 1,
+            ..TurnBounds::PRODUCTION
+        };
+        let outcome = run(&model, &tools, bounds).await;
+        assert_eq!(outcome, TurnOutcome::failed(TURN_LIMIT_EXCEEDED, false));
+        assert!(tools.names().is_empty());
+        assert_eq!(model.requests().len(), 1);
+
+        // Text beside the last batch does not finish the turn either; earlier calls are kept.
+        let model = FakeModel::new(vec![
+            calls(vec![call("c1", "t__a")]),
+            Scripted::Answer(Ok(Assistant {
+                content: Some("partial".into()),
+                tool_calls: vec![call("c2", "t__b")],
+            })),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let bounds = TurnBounds {
+            model_calls: 2,
+            ..TurnBounds::PRODUCTION
+        };
+        let outcome = run(&model, &tools, bounds).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Failed {
+                code: TURN_LIMIT_EXCEEDED,
+                retryable: false,
+                activity: vec![activity("t__a", true, None)],
+            }
+        );
+        assert_eq!(tools.names(), ["t__a"]);
+        assert_eq!(model.requests().len(), 2);
     }
 
     #[tokio::test]
