@@ -1487,3 +1487,218 @@ async fn uncertain_post_refuses_binding_after_settings_key_and_resume_resets() {
     assert_eq!(stub.request_count(), 1);
     fixture.harness.shutdown().await.unwrap();
 }
+
+/// Polls `agent.chat.get` until `done` holds.
+async fn wait_chat(
+    harness: &mut Harness,
+    what: &str,
+    mut done: impl FnMut(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let chat = harness.request("agent.chat.get", empty()).await.unwrap();
+        assert!(
+            !chat.to_string().contains(SECRET),
+            "the chat carries the key"
+        );
+        if done(&chat) {
+            return chat;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {what}; last {chat}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_answers_the_steward_directly_and_never_posts() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    harness.activate().await.unwrap();
+
+    // Nothing is sent until endpoint, model and key are all stored.
+    assert_eq!(
+        harness.request("agent.chat.get", empty()).await.unwrap(),
+        json!({"entries": [], "pending": false})
+    );
+    let refused = harness
+        .request("agent.chat.send", json!({"content": "hi"}))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "agent.not_configured");
+    assert!(!refused.retryable());
+    harness
+        .request(
+            "agent.settings.set",
+            json!({"settings": {
+                "endpointBaseUrl": stub.base_url,
+                "model": "stub/model-1",
+                "systemPrompt": "Be brief.",
+                "contextMessages": 20,
+            }}),
+        )
+        .await
+        .unwrap();
+    let refused = harness
+        .request("agent.chat.send", json!({"content": "hi"}))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "agent.not_configured");
+    harness
+        .request("agent.key.set", json!({"apiKey": SECRET}))
+        .await
+        .unwrap();
+    let refused = harness
+        .request("agent.chat.send", json!({"content": "  \n "}))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "agent.invalid_message");
+    assert_eq!(stub.request_count(), 0);
+
+    // Without a bound Agent the chat still works; the send answers before the model does and
+    // the reply arrives on the subscription.
+    let mut changes = harness
+        .subscribe("agent.chat.changes", empty())
+        .await
+        .unwrap();
+    assert_eq!(
+        changes.next_event().await.unwrap().unwrap(),
+        json!({"entries": [], "pending": false})
+    );
+    stub.push(Behaviour::Reply("Hello, Steward".into()));
+    let started = harness
+        .request("agent.chat.send", json!({"content": " hello there "}))
+        .await
+        .unwrap();
+    assert_eq!(started["pending"], true);
+    assert_eq!(
+        started["entries"],
+        json!([{"id": 1, "role": "user", "content": "hello there"}])
+    );
+    let answered = loop {
+        let event = changes.next_event().await.unwrap().unwrap();
+        if event["pending"] == false {
+            break event;
+        }
+    };
+    assert_eq!(
+        answered,
+        json!({"entries": [
+            {"id": 1, "role": "user", "content": "hello there"},
+            {"id": 2, "role": "assistant", "content": "Hello, Steward"},
+        ], "pending": false})
+    );
+    let first = stub.requests().pop().unwrap();
+    assert_eq!(first.path, "/chat/completions");
+    assert_eq!(
+        first.authorization.as_deref(),
+        Some(format!("Bearer {SECRET}").as_str())
+    );
+    assert_eq!(first.body["model"], "stub/model-1");
+    let messages = first.body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2);
+    let system = messages[0]["content"].as_str().unwrap();
+    assert!(system.starts_with("You are the Agent,"), "{system}");
+    assert!(system.ends_with("Be brief."), "{system}");
+    assert_eq!(
+        messages[1],
+        json!({"role": "user", "content": "hello there"})
+    );
+
+    // Once bound, the system message names the Agent and earlier turns are context.
+    harness
+        .request("agent.binding.set", json!({"principalId": AGENT_ID}))
+        .await
+        .unwrap();
+    wait_status(harness, "ready", None).await;
+    stub.push(Behaviour::Reply("Second".into()));
+    harness
+        .request("agent.chat.send", json!({"content": "and again"}))
+        .await
+        .unwrap();
+    wait_chat(harness, "the second reply", |chat| {
+        chat["entries"].as_array().unwrap().len() == 4
+    })
+    .await;
+    let second = stub.requests().pop().unwrap();
+    let messages = second.body["messages"].as_array().unwrap();
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are Scout,")
+    );
+    assert_eq!(
+        messages[2],
+        json!({"role": "assistant", "content": "Hello, Steward"})
+    );
+    assert_eq!(messages[3], json!({"role": "user", "content": "and again"}));
+
+    // One turn at a time; a clear drops the turn in flight and its late completion.
+    let release = Arc::new(Notify::new());
+    let requests = stub.request_count();
+    stub.push(Behaviour::Hold(release.clone(), "too late".into()));
+    harness
+        .request("agent.chat.send", json!({"content": "slow one"}))
+        .await
+        .unwrap();
+    // The held completion must have reached the stub, or its Hold would serve a later turn.
+    wait_until("the slow chat request", || {
+        stub.request_count() == requests + 1
+    })
+    .await;
+    let busy = harness
+        .request("agent.chat.send", json!({"content": "another"}))
+        .await
+        .unwrap_err();
+    assert_eq!(busy.code(), "agent.chat_busy");
+    assert!(busy.retryable());
+    let cleared = harness.request("agent.chat.clear", empty()).await.unwrap();
+    assert_eq!(cleared, json!({"entries": [], "pending": false}));
+    release.notify_one();
+    // negative-wait: a dropped completion must never be appended; only a bounded window shows it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        harness.request("agent.chat.get", empty()).await.unwrap(),
+        json!({"entries": [], "pending": false})
+    );
+
+    // Suspend interrupts a turn in flight; the Steward can send again after resume.
+    let release = Arc::new(Notify::new());
+    let requests = stub.request_count();
+    stub.push(Behaviour::Hold(release.clone(), "after suspend".into()));
+    harness
+        .request("agent.chat.send", json!({"content": "before suspend"}))
+        .await
+        .unwrap();
+    wait_until("the held chat request", || {
+        stub.request_count() == requests + 1
+    })
+    .await;
+    harness.suspend().await.unwrap();
+    release.notify_one();
+    harness.recover().await.unwrap();
+    let interrupted = wait_chat(harness, "the interruption", |chat| chat["pending"] == false).await;
+    assert_eq!(
+        interrupted["lastError"],
+        json!({"code": "agent.chat_interrupted", "retryable": true})
+    );
+    assert_eq!(interrupted["entries"].as_array().unwrap().len(), 1);
+    // negative-wait: the cancelled completion must not be appended after resume.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let kept = harness.request("agent.chat.get", empty()).await.unwrap();
+    assert_eq!(kept, interrupted);
+
+    assert!(
+        conversations.posts().is_empty(),
+        "the chat posted to a Channel"
+    );
+    assert_no_secret(ports, data.path());
+    fixture.harness.shutdown().await.unwrap();
+}

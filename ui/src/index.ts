@@ -11,9 +11,9 @@ import {
   type PackageSubscription,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
-import type { AgentContract, Candidate, Settings, Status } from "./contract.generated";
+import type { AgentContract, Candidate, Chat, Settings, Status } from "./contract.generated";
 
-export type { Candidate, Settings, Status };
+export type { Candidate, Chat, Settings, Status };
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -25,6 +25,10 @@ export type AgentUiState = Readonly<{
   busy: boolean;
   error: string | undefined;
   notice: string | undefined;
+  chat: Chat | null;
+  /** A chat request is on its way; the turn itself is `chat.pending`. */
+  chatBusy: boolean;
+  chatError: string | undefined;
 }>;
 
 export type AgentController = Readonly<{
@@ -35,6 +39,9 @@ export type AgentController = Readonly<{
   refreshCandidates(): Promise<void>;
   bind(principalId: string): Promise<void>;
   unbind(): Promise<void>;
+  /** Resolves `true` when the Backend accepted the message. */
+  sendChat(content: string): Promise<boolean>;
+  clearChat(): Promise<void>;
   dispose(): void;
 }>;
 
@@ -57,6 +64,28 @@ export function describeStatus(status: Status | null): string {
   }
 }
 
+/** One display sentence per chat failure code; unknown codes are shown as they are. */
+export function describeChatError(code: string): string {
+  switch (code) {
+    case "agent.not_configured":
+      return "Add the endpoint, model and API key on the Configuration tab first.";
+    case "agent.chat_busy":
+      return "Wait for the current reply before sending another message.";
+    case "agent.invalid_message":
+      return "Messages cannot be empty or contain control characters.";
+    case "agent.chat_interrupted":
+      return "The reply was interrupted. Send the message again.";
+    case "agent.endpoint_unreachable":
+      return "The endpoint could not be reached. Try again.";
+    case "agent.endpoint_rejected":
+      return "The endpoint rejected the request. Check the endpoint, model and API key.";
+    case "agent.model_error":
+      return "The model did not return a usable reply.";
+    default:
+      return code;
+  }
+}
+
 /** The Package's own code, or the Teamarness description, as one display sentence. */
 function describeFailure(error: unknown): string {
   if (packageErrorCode(error) === "agent.invalid_settings" && isPackageRequestError(error)) {
@@ -75,6 +104,7 @@ export function createAgentController(
   const typed = typedPackageClient<AgentContract>(client);
   let disposed = false;
   let subscription: PackageSubscription | null = null;
+  let chatSubscription: PackageSubscription | null = null;
   let state: AgentUiState = {
     status: null,
     settings: null,
@@ -83,6 +113,9 @@ export function createAgentController(
     busy: false,
     error: undefined,
     notice: undefined,
+    chat: null,
+    chatBusy: false,
+    chatError: undefined,
   };
 
   const update = (changes: Partial<AgentUiState>): void => {
@@ -107,6 +140,20 @@ export function createAgentController(
     }
   };
 
+  const chatRequest = async (work: () => Promise<Chat>): Promise<boolean> => {
+    if (disposed) return false;
+    update({ chatBusy: true, chatError: undefined });
+    try {
+      update({ chat: await work(), chatBusy: false });
+      return true;
+    } catch (error) {
+      if (isAbortError(error)) return false;
+      const code = packageErrorCode(error);
+      update({ chatBusy: false, chatError: code ? describeChatError(code) : describePackageError(error) });
+      return false;
+    }
+  };
+
   const loadCandidates = async (): Promise<readonly Candidate[]> =>
     (await typed.request("agent.binding.candidates", {})).agents;
 
@@ -116,10 +163,14 @@ export function createAgentController(
         const settings = await typed.request("agent.settings.get", {});
         const status = await typed.request("agent.status.get", {});
         const candidates = await loadCandidates();
+        const chat = await typed.request("agent.chat.get", {});
         subscription = await typed.subscribe("agent.status.changes", {}, (event) => {
           update({ status: event });
         });
-        return { settings: settings.settings, hasKey: settings.hasKey, status, candidates };
+        chatSubscription = await typed.subscribe("agent.chat.changes", {}, (event) => {
+          update({ chat: event });
+        });
+        return { settings: settings.settings, hasKey: settings.hasKey, status, candidates, chat };
       });
     },
 
@@ -164,11 +215,21 @@ export function createAgentController(
       });
     },
 
+    async sendChat(content: string): Promise<boolean> {
+      return chatRequest(() => typed.request("agent.chat.send", { content }));
+    },
+
+    async clearChat(): Promise<void> {
+      await chatRequest(() => typed.request("agent.chat.clear", {}));
+    },
+
     dispose(): void {
       disposed = true;
-      const open = subscription;
+      for (const open of [subscription, chatSubscription]) {
+        if (open) void open.close().catch(() => undefined);
+      }
       subscription = null;
-      if (open) void open.close().catch(() => undefined);
+      chatSubscription = null;
     },
   });
 }
@@ -177,23 +238,51 @@ export function createAgentController(
 
 const AGENT_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
-  .teamarness-section p, .teamarness-section-title { margin: 0; }
-  .agent-settings { display: grid; gap: 1.25rem; }
-  .agent-settings > section { min-width: 0; }
-  .agent-settings > section > button { align-self: flex-start; }
+  .agent-page { width: max(75%, min(100%, 40rem)); margin-inline: auto; }
+  .agent-page > * + * { margin-top: 1.5rem; }
+  .agent-settings { display: grid; }
+  .agent-group { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2.2fr); gap: 1rem 3rem; padding-block: 2rem; border-top: 1px solid var(--teamarness-color-border); }
+  .agent-group:first-child { border-top: 0; padding-top: .5rem; }
+  .agent-group-title { margin: 0 0 .35rem; font-size: 1rem; font-weight: 600; }
+  .agent-group-intro p { margin: 0; }
+  .agent-group-body { min-width: 0; max-width: 40rem; display: flex; flex-direction: column; gap: 1.1rem; }
+  .agent-group-body > p { margin: 0; }
+  .agent-group-body > button { align-self: flex-start; }
+  @media (max-width: 52rem) { .agent-group { grid-template-columns: 1fr; gap: .75rem; } }
   .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; }
   textarea.teamarness-input { min-height: 6rem; resize: vertical; }
   .agent-picker { position: relative; display: block; }
   .agent-picker-control { appearance: none; -webkit-appearance: none; min-height: 2.65rem; padding-right: 2.5rem; cursor: pointer; }
   .agent-picker::after { content: ''; position: absolute; pointer-events: none; right: 1rem; top: 50%; width: .4rem; height: .4rem; border-right: 2px solid var(--teamarness-color-text-muted); border-bottom: 2px solid var(--teamarness-color-text-muted); transform: translateY(-75%) rotate(45deg); }
-  .status { font-weight: 600; }
+  .status { font-weight: 600; display: flex; align-items: center; gap: .55rem; }
+  .status::before { content: ''; flex: none; width: .55rem; height: .55rem; border-radius: 50%; background: var(--teamarness-color-text-muted); }
   .status[data-state="error"] { color: var(--teamarness-color-danger, #b42318); }
+  .status[data-state="error"]::before { background: var(--teamarness-color-danger, #b42318); }
   .status[data-state="ready"] { color: var(--teamarness-color-accent); }
+  .status[data-state="ready"]::before, .status[data-state="replying"]::before { background: var(--teamarness-color-accent); }
   .message { min-height: 1.2em; margin: 0; }
   .message:empty { min-height: 0; }
   .message[data-kind="error"] { color: var(--teamarness-color-danger, #b42318); }
   .message[data-kind="notice"] { color: var(--teamarness-color-text-muted); }
   button:disabled { opacity: .5; cursor: default; }
+  .agent-tabs { display: flex; gap: .25rem; border-bottom: 1px solid var(--teamarness-color-border); }
+  .agent-tab { appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; padding: .55rem .9rem; color: var(--teamarness-color-text-muted); font: inherit; font-weight: 600; cursor: pointer; }
+  .agent-tab[aria-selected="true"] { color: var(--teamarness-color-text); border-bottom-color: var(--teamarness-color-accent); }
+  .agent-tab:focus-visible { outline: 2px solid var(--teamarness-color-focus); outline-offset: 2px; }
+  .agent-panel[hidden] { display: none; }
+  .agent-page[data-tab="chat"] { display: flex; flex-direction: column; height: 100vh; }
+  .agent-page[data-tab="chat"] > #agent-panel-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .agent-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 1rem; }
+  .chat-log { list-style: none; margin: 0; padding: 0 .25rem 0 0; flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 1.25rem; }
+  .chat-log:empty { display: none; }
+  .chat-form { margin-top: auto; }
+  .chat-entry { max-width: 100%; }
+  .chat-entry[data-role="user"] { align-self: flex-end; max-width: 75%; padding: .6rem .85rem; border-radius: var(--teamarness-radius-panel); background: var(--teamarness-color-panel); }
+  .chat-entry[data-role="assistant"] { align-self: stretch; }
+  .chat-author { display: block; font-size: .8em; font-weight: 600; color: var(--teamarness-color-text-muted); margin-bottom: .2rem; }
+  .chat-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .chat-empty { color: var(--teamarness-color-text-muted); }
+  textarea.chat-input { min-height: 4.5rem; }
 `;
 
 // ─── Mount ───────────────────────────────────────────────────────────────────
@@ -222,6 +311,29 @@ function field(labelText: string, control: HTMLElement, help?: string): HTMLLabe
   return label;
 }
 
+/** A configuration section: heading and description beside its controls, ruled from the next. */
+function group(titleText: string, description: string | null, ...body: HTMLElement[]): HTMLElement {
+  const section = document.createElement("section");
+  section.className = "agent-group";
+  const intro = document.createElement("div");
+  intro.className = "agent-group-intro";
+  const heading = document.createElement("h2");
+  heading.className = "agent-group-title";
+  heading.textContent = titleText;
+  intro.append(heading);
+  if (description) {
+    const help = document.createElement("p");
+    help.className = "teamarness-help";
+    help.textContent = description;
+    intro.append(help);
+  }
+  const content = document.createElement("div");
+  content.className = "agent-group-body";
+  content.append(...body);
+  section.append(intro, content);
+  return section;
+}
+
 function input(name: string, type: string, placeholder?: string): HTMLInputElement {
   const element = document.createElement("input");
   element.className = "teamarness-input";
@@ -246,7 +358,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   }
 
   const page = document.createElement("article");
-  page.className = "teamarness-page teamarness-page--readable";
+  page.className = "teamarness-page agent-page";
   const header = document.createElement("header");
   header.className = "teamarness-page-header";
   const title = document.createElement("h1");
@@ -257,17 +369,50 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   subtitle.textContent = "Run one of your Workspace Agents against an OpenAI-compatible endpoint.";
   header.append(title, subtitle);
 
+  // Tabs
+  const tabList = document.createElement("div");
+  tabList.className = "agent-tabs";
+  tabList.setAttribute("role", "tablist");
+  tabList.setAttribute("aria-label", "Agent sections");
+  const configPanel = document.createElement("div");
+  const chatPanel = document.createElement("div");
+  const tabs = ([["configuration", "Configuration", configPanel], ["chat", "Chat", chatPanel]] as const).map(
+    ([id, text, panel]) => {
+      const tab = document.createElement("button");
+      tab.type = "button";
+      tab.className = "agent-tab";
+      tab.id = `agent-tab-${id}`;
+      tab.dataset.tab = id;
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-controls", `agent-panel-${id}`);
+      tab.textContent = text;
+      panel.id = `agent-panel-${id}`;
+      panel.className = "agent-panel";
+      panel.setAttribute("role", "tabpanel");
+      panel.setAttribute("aria-labelledby", tab.id);
+      tabList.append(tab);
+      return { id, tab, panel };
+    },
+  );
+  const selectTab = (id: string, focus = false): void => {
+    // The chat fills the pane so only its transcript scrolls; configuration scrolls as a page.
+    page.dataset.tab = id;
+    for (const entry of tabs) {
+      const selected = entry.id === id;
+      entry.tab.setAttribute("aria-selected", String(selected));
+      entry.tab.tabIndex = selected ? 0 : -1;
+      entry.panel.hidden = !selected;
+      if (selected && focus) entry.tab.focus();
+    }
+  };
+  selectTab("configuration");
+
   const form = document.createElement("form");
   form.className = "agent-settings";
   form.noValidate = true;
   form.addEventListener("submit", (event) => event.preventDefault());
 
   // Status
-  const statusSection = document.createElement("section");
-  statusSection.className = "teamarness-section teamarness-stack";
-  const statusTitle = document.createElement("h2");
-  statusTitle.className = "teamarness-section-title";
-  statusTitle.textContent = "Status";
   const statusLine = document.createElement("p");
   statusLine.className = "status";
   statusLine.dataset.role = "status";
@@ -276,17 +421,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   message.className = "message";
   message.dataset.role = "message";
   message.setAttribute("role", "status");
-  statusSection.append(statusTitle, statusLine, message);
+  const statusSection = group("Status", "What the Agent is doing in this Workspace.", statusLine, message);
 
   // Agent picker
-  const agentSection = document.createElement("section");
-  agentSection.className = "teamarness-section teamarness-stack";
-  const agentTitle = document.createElement("h2");
-  agentTitle.className = "teamarness-section-title";
-  agentTitle.textContent = "Agent";
-  const agentHelp = document.createElement("p");
-  agentHelp.className = "teamarness-help";
-  agentHelp.textContent = "Only Agents you steward on this Installation are offered.";
   const picker = document.createElement("select");
   picker.className = "teamarness-input agent-picker-control";
   picker.name = "agent";
@@ -299,14 +436,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const unbindButton = button("Clear binding", "unbind", "secondary");
   const refreshButton = button("Refresh", "refresh", "secondary");
   pickerRow.append(bindButton, unbindButton, refreshButton);
-  agentSection.append(agentTitle, agentHelp, field("Workspace Agent", pickerControl), pickerRow);
+  const agentSection = group("Agent", "Only Agents you steward on this Installation are offered.",
+    field("Workspace Agent", pickerControl), pickerRow);
 
   // Endpoint settings
-  const settingsSection = document.createElement("section");
-  settingsSection.className = "teamarness-section teamarness-stack";
-  const settingsTitle = document.createElement("h2");
-  settingsTitle.className = "teamarness-section-title";
-  settingsTitle.textContent = "Model endpoint";
   const endpointInput = input("endpointBaseUrl", "url", "https://openrouter.ai/api/v1");
   const modelInput = input("model", "text", "deepseek/deepseek-chat");
   const promptInput = document.createElement("textarea");
@@ -317,8 +450,9 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   contextInput.max = "64";
   contextInput.step = "1";
   const saveButton = button("Save settings", "save", "primary");
-  settingsSection.append(
-    settingsTitle,
+  const settingsSection = group(
+    "Model endpoint",
+    "The OpenAI-compatible model that answers Channel replies and the chat.",
     field("Endpoint base URL", endpointInput, "An OpenAI-compatible base URL; /chat/completions is appended."),
     field("Model", modelInput),
     field("System prompt", promptInput),
@@ -327,11 +461,6 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   );
 
   // API key
-  const keySection = document.createElement("section");
-  keySection.className = "teamarness-section teamarness-stack";
-  const keyTitle = document.createElement("h2");
-  keyTitle.className = "teamarness-section-title";
-  keyTitle.textContent = "API key";
   const keyState = document.createElement("p");
   keyState.dataset.role = "key-state";
   const keyInput = input("apiKey", "password");
@@ -340,11 +469,49 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const setKeyButton = button("Store key", "set-key", "primary");
   const clearKeyButton = button("Clear key", "clear-key", "secondary");
   keyRow.append(setKeyButton, clearKeyButton);
-  keySection.append(keyTitle, keyState,
+  const keySection = group("API key", "Sent only to the configured endpoint.", keyState,
     field("New API key", keyInput, "Stored in this Package's data directory and never shown again."), keyRow);
 
   form.append(statusSection, agentSection, settingsSection, keySection);
-  page.append(header, form);
+  configPanel.append(form);
+
+  // Chat
+  const chatSection = document.createElement("section");
+  chatSection.className = "agent-chat";
+  chatSection.setAttribute("aria-label", "Chat with the Agent");
+  const chatIntro = document.createElement("p");
+  chatIntro.className = "teamarness-help";
+  chatIntro.textContent = "A private conversation with the configured model. Nothing here is posted to a Channel, and it is kept only until the Package restarts.";
+  const chatEmpty = document.createElement("p");
+  chatEmpty.className = "chat-empty";
+  chatEmpty.dataset.role = "chat-empty";
+  const chatLog = document.createElement("ol");
+  chatLog.className = "chat-log";
+  chatLog.dataset.role = "chat-log";
+  chatLog.setAttribute("role", "log");
+  chatLog.setAttribute("aria-label", "Conversation");
+  const chatMessage = document.createElement("p");
+  chatMessage.className = "message";
+  chatMessage.dataset.role = "chat-message";
+  chatMessage.setAttribute("role", "status");
+  const chatForm = document.createElement("form");
+  chatForm.className = "teamarness-stack chat-form";
+  chatForm.noValidate = true;
+  const chatInput = document.createElement("textarea");
+  chatInput.className = "teamarness-input chat-input";
+  chatInput.name = "chatMessage";
+  chatInput.maxLength = 8192;
+  const chatRow = document.createElement("div");
+  chatRow.className = "row";
+  const sendButton = button("Send", "send-chat", "primary");
+  sendButton.type = "submit";
+  const clearChatButton = button("Clear conversation", "clear-chat", "secondary");
+  chatRow.append(sendButton, clearChatButton);
+  chatForm.append(field("Message", chatInput, "Enter sends; Shift+Enter adds a line."), chatRow);
+  chatSection.append(chatIntro, chatEmpty, chatLog, chatMessage, chatForm);
+  chatPanel.append(chatSection);
+
+  page.append(header, tabList, configPanel, chatPanel);
   context.root.append(page);
 
   let settingsLoaded = false;
@@ -393,6 +560,54 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     saveButton.disabled = busy;
     setKeyButton.disabled = busy;
     clearKeyButton.disabled = busy || !state.hasKey;
+
+    renderChat(state);
+  };
+
+  let renderedEntries = "";
+  const renderChat = (state: AgentUiState): void => {
+    const chat = state.chat;
+    const entries = chat?.entries ?? [];
+    const agentName = state.status?.agent?.name ?? "Agent";
+    const configured = state.status !== null && state.status.state !== "unconfigured";
+    const key = JSON.stringify([agentName, entries.map((entry) => entry.id)]);
+    if (key !== renderedEntries) {
+      renderedEntries = key;
+      chatLog.replaceChildren(...entries.map((entry) => {
+        const item = document.createElement("li");
+        item.className = "chat-entry";
+        item.dataset.role = entry.role;
+        const author = document.createElement("span");
+        author.className = "chat-author";
+        author.textContent = entry.role === "user" ? "You" : agentName;
+        const content = document.createElement("p");
+        content.className = "chat-content";
+        content.textContent = entry.content;
+        item.append(author, content);
+        return item;
+      }));
+      chatLog.scrollTop = chatLog.scrollHeight;
+    }
+    chatEmpty.hidden = entries.length > 0;
+    chatEmpty.textContent = configured
+      ? "No messages yet. Say hello."
+      : "Add the endpoint, model and API key on the Configuration tab before chatting.";
+
+    const pending = chat?.pending ?? false;
+    const failure = state.chatError ?? (chat?.lastError ? describeChatError(chat.lastError.code) : undefined);
+    if (failure) {
+      chatMessage.textContent = failure;
+      chatMessage.dataset.kind = "error";
+    } else if (pending) {
+      chatMessage.textContent = `${agentName} is replying...`;
+      chatMessage.dataset.kind = "notice";
+    } else {
+      chatMessage.textContent = "";
+      delete chatMessage.dataset.kind;
+    }
+    chatLog.setAttribute("aria-busy", String(pending));
+    sendButton.disabled = !configured || pending || state.chatBusy;
+    clearChatButton.disabled = state.chatBusy || (entries.length === 0 && !pending);
   };
 
   const controller = createAgentController(context.client, render);
@@ -413,12 +628,50 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const onBind = (): void => { if (picker.value) void controller.bind(picker.value); };
   const onUnbind = (): void => { void controller.unbind(); };
   const onRefresh = (): void => { void controller.refreshCandidates(); };
+  const showTab = (id: string, focus = false): void => {
+    selectTab(id, focus);
+    // A hidden transcript has no height, so the latest message is scrolled to once shown.
+    if (id === "chat") chatLog.scrollTop = chatLog.scrollHeight;
+  };
+  const onTabClick = (event: MouseEvent): void => {
+    const tab = (event.target as Element | null)?.closest<HTMLElement>("[role=tab]");
+    if (tab?.dataset.tab) showTab(tab.dataset.tab);
+  };
+  const onTabKey = (event: KeyboardEvent): void => {
+    const index = tabs.findIndex((entry) => entry.tab === event.target);
+    if (index < 0) return;
+    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+    const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[tabs.length - 1] : step ? tabs[(index + step + tabs.length) % tabs.length] : undefined;
+    if (!next) return;
+    event.preventDefault();
+    showTab(next.id, true);
+  };
+  const onSendChat = (event: SubmitEvent): void => {
+    event.preventDefault();
+    const content = chatInput.value.trim();
+    if (!content || sendButton.disabled) return;
+    void controller.sendChat(content).then((accepted) => {
+      if (accepted && chatInput.value.trim() === content) chatInput.value = "";
+    });
+  };
+  const onChatKey = (event: KeyboardEvent): void => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      chatForm.requestSubmit();
+    }
+  };
+  const onClearChat = (): void => { void controller.clearChat(); };
   saveButton.addEventListener("click", onSave);
   setKeyButton.addEventListener("click", onSetKey);
   clearKeyButton.addEventListener("click", onClearKey);
   bindButton.addEventListener("click", onBind);
   unbindButton.addEventListener("click", onUnbind);
   refreshButton.addEventListener("click", onRefresh);
+  tabList.addEventListener("click", onTabClick);
+  tabList.addEventListener("keydown", onTabKey);
+  chatForm.addEventListener("submit", onSendChat);
+  chatInput.addEventListener("keydown", onChatKey);
+  clearChatButton.addEventListener("click", onClearChat);
 
   await controller.start();
 
@@ -433,6 +686,11 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     bindButton.removeEventListener("click", onBind);
     unbindButton.removeEventListener("click", onUnbind);
     refreshButton.removeEventListener("click", onRefresh);
+    tabList.removeEventListener("click", onTabClick);
+    tabList.removeEventListener("keydown", onTabKey);
+    chatForm.removeEventListener("submit", onSendChat);
+    chatInput.removeEventListener("keydown", onChatKey);
+    clearChatButton.removeEventListener("click", onClearChat);
     page.remove();
     cleanupStyles();
     cleanupKit();

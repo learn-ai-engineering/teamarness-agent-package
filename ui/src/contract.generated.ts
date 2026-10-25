@@ -19,6 +19,18 @@ export type Candidates = {
   readonly "agents": readonly Candidate[];
 };
 
+export type Chat = {
+  readonly "entries": readonly ChatEntry[];
+  readonly "lastError"?: StatusError;
+  readonly "pending": boolean;
+};
+
+export type ChatEntry = {
+  readonly "content": string;
+  readonly "id": number;
+  readonly "role": "user" | "assistant";
+};
+
 export type Empty = Record<string, never>;
 
 export type KeyView = {
@@ -59,6 +71,11 @@ export type AgentContract = {
     readonly "agent.binding.set": { readonly request: {
         readonly "principalId": PrincipalId;
       }; readonly response: BindingView };
+    readonly "agent.chat.clear": { readonly request: Empty; readonly response: Chat };
+    readonly "agent.chat.get": { readonly request: Empty; readonly response: Chat };
+    readonly "agent.chat.send": { readonly request: {
+        readonly "content": string;
+      }; readonly response: Chat };
     readonly "agent.key.clear": { readonly request: Empty; readonly response: KeyView };
     readonly "agent.key.set": { readonly request: {
         readonly "apiKey": string;
@@ -70,6 +87,7 @@ export type AgentContract = {
     readonly "agent.status.get": { readonly request: Empty; readonly response: Status };
   };
   readonly subscriptions: {
+    readonly "agent.chat.changes": { readonly request: Empty; readonly event: Chat };
     readonly "agent.status.changes": { readonly request: Empty; readonly event: Status };
   };
 };

@@ -33,7 +33,7 @@ Package UI
 
 `ui-contract.json` defines the requests that may cross this path. Treat it as the shared boundary between the UI and Backend. Change the contract before implementing a new request on either side.
 
-The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports capabilities. It has one Backend, one ESM UI entrypoint, a UI contract with status subscription, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
+The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports capabilities. It also offers the Steward a direct, in-memory chat with the configured model on a separate UI tab. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
 
 ## Project map
 

@@ -8,8 +8,8 @@ import {
 } from "@teamarness/package-ui-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 
-import type { Settings, Status } from "./contract.generated";
-import { createAgentController, describeStatus, mount, type AgentUiState } from "./index";
+import type { Chat, Settings, Status } from "./contract.generated";
+import { createAgentController, describeChatError, describeStatus, mount, type AgentUiState } from "./index";
 
 const AGENT_ID = "a".repeat(64);
 const OTHER_ID = "c".repeat(64);
@@ -25,6 +25,7 @@ function fakeBackend(input?: { status?: Status; candidates?: Array<{ principalId
   let hasKey = false;
   let status: Status = input?.status ?? { state: "unconfigured" };
   const candidates = input?.candidates ?? [{ principalId: AGENT_ID, name: "Scout", bound: false }];
+  let chat: Chat = { entries: [], pending: false };
   const fake = createFakePackageClient({
     requests: {
       "agent.settings.get": () => ({ settings, hasKey }),
@@ -64,10 +65,31 @@ function fakeBackend(input?: { status?: Status; candidates?: Array<{ principalId
         return { agent: null };
       },
       "agent.status.get": () => status,
+      "agent.chat.get": () => chat,
+      "agent.chat.send": (payload) => {
+        if (status.state === "unconfigured") {
+          throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.not_configured" } });
+        }
+        if (chat.pending) {
+          throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.chat_busy", retryable: true } });
+        }
+        const content = (payload as { content: string }).content;
+        chat = { entries: [...chat.entries, { id: chat.entries.length + 1, role: "user", content }], pending: true };
+        return chat;
+      },
+      "agent.chat.clear": () => {
+        chat = { entries: [], pending: false };
+        return chat;
+      },
     },
-    subscriptions: { "agent.status.changes": () => undefined },
+    subscriptions: { "agent.status.changes": () => undefined, "agent.chat.changes": () => undefined },
   });
-  return { fake, client: fake.client, secretSeen: () => fake.calls.some((call) => JSON.stringify(call.payload).includes(SECRET)) };
+  /** What the Backend publishes when the model answers the turn in flight. */
+  const reply = async (content: string): Promise<void> => {
+    chat = { entries: [...chat.entries, { id: chat.entries.length + 1, role: "assistant", content }], pending: false };
+    await fake.emit("agent.chat.changes", chat satisfies PackageValue);
+  };
+  return { fake, client: fake.client, reply, secretSeen: () => fake.calls.some((call) => JSON.stringify(call.payload).includes(SECRET)) };
 }
 
 function lastState(states: AgentUiState[]): AgentUiState {
@@ -88,7 +110,10 @@ describe("Agent Package UI controller", () => {
     expect(operations).toContain("agent.status.get");
     expect(operations).toContain("agent.binding.candidates");
     expect(operations).toContain("agent.status.changes");
+    expect(operations).toContain("agent.chat.get");
+    expect(operations).toContain("agent.chat.changes");
     const state = lastState(states);
+    expect(state.chat).toEqual({ entries: [], pending: false });
     expect(state.settings?.contextMessages).toBe(20);
     expect(state.hasKey).toBe(false);
     expect(state.status).toEqual({ state: "unconfigured" });
@@ -145,6 +170,36 @@ describe("Agent Package UI controller", () => {
     controller.dispose();
   });
 
+  it("sends chat messages, follows replies and explains refusals", async () => {
+    const { fake, client, reply } = fakeBackend({ status: { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } } });
+    const states: AgentUiState[] = [];
+    const controller = createAgentController(client, (state) => { states.push(state); });
+    await controller.start();
+
+    expect(await controller.sendChat("hello")).toBe(true);
+    expect(lastState(states).chat).toEqual({ entries: [{ id: 1, role: "user", content: "hello" }], pending: true });
+    expect(await controller.sendChat("again")).toBe(false);
+    expect(lastState(states).chatError).toBe("Wait for the current reply before sending another message.");
+    expect(lastState(states).error).toBeUndefined();
+
+    await reply("Hi there");
+    expect(lastState(states).chat?.entries.at(-1)).toEqual({ id: 2, role: "assistant", content: "Hi there" });
+    expect(lastState(states).chat?.pending).toBe(false);
+
+    await controller.clearChat();
+    expect(lastState(states).chat).toEqual({ entries: [], pending: false });
+    expect(lastState(states).chatError).toBeUndefined();
+    expect(fake.calls.filter((call) => call.operation === "agent.chat.send")).toHaveLength(2);
+    controller.dispose();
+  });
+
+  it("describes chat failures as sentences and passes unknown codes through", () => {
+    expect(describeChatError("agent.not_configured")).toBe("Add the endpoint, model and API key on the Configuration tab first.");
+    expect(describeChatError("agent.endpoint_unreachable")).toBe("The endpoint could not be reached. Try again.");
+    expect(describeChatError("agent.chat_interrupted")).toBe("The reply was interrupted. Send the message again.");
+    expect(describeChatError("agent.something_new")).toBe("agent.something_new");
+  });
+
   it("ignores updates after dispose", async () => {
     const { fake, client } = fakeBackend();
     const states: AgentUiState[] = [];
@@ -189,10 +244,20 @@ describe("Agent Package UI mount", () => {
       expect(picker?.classList.contains("agent-picker-control")).toBe(true);
       expect(picker?.closest("label")?.textContent).toContain("Workspace Agent");
       const css = sheets.get(root.adoptedStyleSheets.at(-1)!) ?? "";
-      expect(css).toMatch(/\.agent-settings\s*\{[^}]*display:\s*grid[^}]*gap:\s*1\.25rem/s);
+      // Sections are ruled groups, not boxed panels.
+      expect(form?.querySelectorAll(".teamarness-section")).toHaveLength(0);
+      expect(Array.from(form?.querySelectorAll(".agent-group-title") ?? []).map((heading) => heading.textContent)).toEqual(
+        ["Status", "Agent", "Model endpoint", "API key"],
+      );
+      expect(css).toMatch(/\.agent-group\s*\{[^}]*display:\s*grid[^}]*border-top:/s);
       expect(css).toMatch(/\.agent-picker-control\s*\{[^}]*appearance:\s*none/s);
       expect(css).toContain("var(--teamarness-color-text)");
       expect(css).not.toContain("display: contents");
+      // Only the transcript scrolls; the chat page is pinned to the pane height.
+      expect(css).toMatch(/\.agent-page\s*\{[^}]*width:\s*max\(75%[^}]*margin-inline:\s*auto/s);
+      expect(css).toMatch(/\.agent-page\[data-tab="chat"\]\s*\{[^}]*height:\s*100vh/s);
+      expect(css).toMatch(/\.chat-log\s*\{[^}]*overflow-y:\s*auto/s);
+      expect(css).toMatch(/\.chat-form\s*\{[^}]*margin-top:\s*auto/s);
     } finally {
       await unmount?.();
       spy.mockRestore();
@@ -207,7 +272,7 @@ describe("Agent Package UI mount", () => {
     const context = createTestMountContext({ root, client, displayName: "Agent" });
 
     const unmount = await mount(context);
-    expect(root.querySelectorAll("form")).toHaveLength(1);
+    expect(root.querySelectorAll("form.agent-settings")).toHaveLength(1);
     expect(root.querySelector("h1")?.textContent).toBe("Agent");
     expect(root.querySelector('[data-role="status"]')?.textContent).toBe(
       "Not configured: add the endpoint, model and API key.",
@@ -246,6 +311,114 @@ describe("Agent Package UI mount", () => {
     await unmount();
     expect(root.childElementCount).toBe(0);
     host.remove();
+  });
+});
+
+describe("Agent Package UI tabs and chat", () => {
+  async function mounted(status?: Status) {
+    const backend = fakeBackend(status ? { status } : undefined);
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
+    const tab = (name: string) => {
+      const found = Array.from(root.querySelectorAll<HTMLButtonElement>("[role=tab]")).find((element) => element.textContent === name);
+      if (!found) throw new Error(`tab ${name} missing`);
+      return found;
+    };
+    const panel = (name: string) => {
+      const found = root.getElementById(tab(name).getAttribute("aria-controls") ?? "");
+      if (!found) throw new Error(`panel ${name} missing`);
+      return found;
+    };
+    const cleanup = async () => {
+      await unmount();
+      host.remove();
+    };
+    return { ...backend, root, tab, panel, cleanup };
+  }
+
+  it("opens on Configuration and switches panels by click and arrow keys", async () => {
+    const { root, tab, panel, cleanup } = await mounted();
+    expect(Array.from(root.querySelectorAll("[role=tab]")).map((element) => element.textContent)).toEqual(["Configuration", "Chat"]);
+    expect(tab("Configuration").getAttribute("aria-selected")).toBe("true");
+    expect(panel("Configuration").hidden).toBe(false);
+    expect(panel("Chat").hidden).toBe(true);
+    expect(panel("Configuration").querySelector("form.agent-settings")).not.toBeNull();
+
+    // One centered page frame for both tabs, so the header never moves between them.
+    const page = root.querySelector<HTMLElement>("article.agent-page");
+    const frame = page?.className;
+    expect(page?.dataset.tab).toBe("configuration");
+    tab("Chat").click();
+    expect(tab("Chat").getAttribute("aria-selected")).toBe("true");
+    expect(page?.dataset.tab).toBe("chat");
+    expect(page?.className).toBe(frame);
+    expect(tab("Configuration").tabIndex).toBe(-1);
+    expect(panel("Chat").hidden).toBe(false);
+    expect(panel("Configuration").hidden).toBe(true);
+
+    tab("Chat").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
+    expect(tab("Configuration").getAttribute("aria-selected")).toBe("true");
+    expect(root.activeElement).toBe(tab("Configuration"));
+    expect(page?.className).toBe(frame);
+    await cleanup();
+  });
+
+  it("asks for configuration before chatting", async () => {
+    const { tab, panel, cleanup } = await mounted();
+    tab("Chat").click();
+    expect(panel("Chat").querySelector('[data-role="chat-empty"]')?.textContent).toBe(
+      "Add the endpoint, model and API key on the Configuration tab before chatting.",
+    );
+    expect(panel("Chat").querySelector<HTMLButtonElement>('button[data-action="send-chat"]')?.disabled).toBe(true);
+    await cleanup();
+  });
+
+  it("sends with Enter, shows the reply under the Agent's name and clears the conversation", async () => {
+    const { fake, reply, panel, tab, cleanup } = await mounted({ state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } });
+    tab("Chat").click();
+    const chat = panel("Chat");
+    const input = chat.querySelector<HTMLTextAreaElement>('textarea[name="chatMessage"]');
+    if (!input) throw new Error("chat input missing");
+    expect(input.closest("label")?.textContent).toContain("Message");
+    expect(chat.querySelector('[data-role="chat-empty"]')?.textContent).toBe("No messages yet. Say hello.");
+
+    // Shift+Enter is a newline, not a send.
+    input.value = "line one";
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", shiftKey: true, bubbles: true }));
+    await flush();
+    expect(fake.calls.some((call) => call.operation === "agent.chat.send")).toBe(false);
+
+    input.value = "  What can you do?  ";
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await flush();
+    const sent = fake.calls.filter((call) => call.operation === "agent.chat.send");
+    expect(sent.map((call) => call.payload)).toEqual([{ content: "What can you do?" }]);
+    expect(input.value).toBe("");
+    expect(chat.querySelector('[data-role="chat-message"]')?.textContent).toBe("Scout is replying...");
+    expect(chat.querySelector<HTMLButtonElement>('button[data-action="send-chat"]')?.disabled).toBe(true);
+
+    await reply("I can answer questions.");
+    const entries = Array.from(chat.querySelectorAll<HTMLElement>(".chat-entry"));
+    expect(entries.map((entry) => [entry.dataset.role, entry.querySelector(".chat-author")?.textContent, entry.querySelector(".chat-content")?.textContent])).toEqual([
+      ["user", "You", "What can you do?"],
+      ["assistant", "Scout", "I can answer questions."],
+    ]);
+    expect(chat.querySelector('[data-role="chat-message"]')?.textContent).toBe("");
+    expect(chat.querySelector<HTMLButtonElement>('button[data-action="send-chat"]')?.disabled).toBe(false);
+
+    await fake.emit("agent.chat.changes", { entries: [], pending: false, lastError: { code: "agent.endpoint_rejected", retryable: false } } satisfies PackageValue);
+    expect(chat.querySelector('[data-role="chat-message"]')?.textContent).toBe(
+      "The endpoint rejected the request. Check the endpoint, model and API key.",
+    );
+
+    await reply("Back again.");
+    chat.querySelector<HTMLButtonElement>('button[data-action="clear-chat"]')?.click();
+    await flush();
+    expect(fake.calls.some((call) => call.operation === "agent.chat.clear")).toBe(true);
+    expect(chat.querySelectorAll(".chat-entry")).toHaveLength(0);
+    await cleanup();
   });
 });
 

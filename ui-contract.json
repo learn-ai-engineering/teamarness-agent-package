@@ -83,6 +83,26 @@
         "agent": { "$ref": "#/$defs/agent" },
         "lastError": { "$ref": "#/$defs/statusError" }
       }
+    },
+    "chatEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "content"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "role": { "type": "string", "enum": ["user", "assistant"] },
+        "content": { "type": "string", "minLength": 1, "maxLength": 16384 }
+      }
+    },
+    "chat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entries", "pending"],
+      "properties": {
+        "entries": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/chatEntry" } },
+        "pending": { "type": "boolean" },
+        "lastError": { "$ref": "#/$defs/statusError" }
+      }
     }
   },
   "requests": {
@@ -132,12 +152,33 @@
     "agent.status.get": {
       "request": { "$ref": "#/$defs/empty" },
       "response": { "$ref": "#/$defs/status" }
+    },
+    "agent.chat.get": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/chat" }
+    },
+    "agent.chat.send": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["content"],
+        "properties": { "content": { "type": "string", "minLength": 1, "maxLength": 8192 } }
+      },
+      "response": { "$ref": "#/$defs/chat" }
+    },
+    "agent.chat.clear": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": { "$ref": "#/$defs/chat" }
     }
   },
   "subscriptions": {
     "agent.status.changes": {
       "request": { "$ref": "#/$defs/empty" },
       "event": { "$ref": "#/$defs/status" }
+    },
+    "agent.chat.changes": {
+      "request": { "$ref": "#/$defs/empty" },
+      "event": { "$ref": "#/$defs/chat" }
     }
   }
 }

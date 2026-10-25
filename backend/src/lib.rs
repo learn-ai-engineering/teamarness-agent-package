@@ -3,8 +3,9 @@
 //! The Agent Package Backend: Package-owned settings and key, the Agent Binding held by Core and
 //! read through `teamarness.agent-binding`, the status its UI shows, and the reply harness
 //! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
-//! family.
+//! family, and the Steward's direct [`chat`] with the same model.
 
+pub mod chat;
 mod dispatch;
 pub mod harness;
 pub mod mention;
@@ -23,10 +24,13 @@ use teamarness_package_sdk::capabilities::agent_binding::{
 use teamarness_package_sdk::capabilities::principals::Principals;
 use teamarness_package_sdk::ports::PortClient;
 use teamarness_package_sdk::{
-    BackendError, CancellationToken, Context, Empty, Router, event_channel,
+    BackendError, CancellationToken, Context, Empty, EventSubscription, Router, event_channel,
 };
+use tokio::sync::watch;
 
+use chat::{ChatCell, ChatView};
 use harness::{HarnessInputs, TaskHandle};
+use model::ModelClient;
 use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
@@ -67,6 +71,8 @@ struct Tasks {
     reconciled: bool,
     /// The reply harness; runs while configuration and binding are both present.
     harness: Option<TaskHandle>,
+    /// The chat turn in flight, if any.
+    chat: Option<TaskHandle>,
 }
 
 /// Everything one activation of the Agent Package owns.
@@ -83,6 +89,16 @@ pub struct AgentActive {
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
     dispatch: Arc<dispatch::DispatchFence>,
+    chat: Arc<ChatCell>,
+}
+
+/// What one chat turn needs from the stored configuration. Holds the key; never logged.
+struct ChatConfig {
+    endpoint_base_url: String,
+    model: String,
+    system_prompt: String,
+    context_messages: usize,
+    api_key: String,
 }
 
 impl AgentActive {
@@ -197,6 +213,83 @@ impl AgentActive {
             tasks.reconciled = false;
         }
         self.stop_harness().await;
+        self.stop_chat().await;
+        self.chat.update(chat::ChatSession::interrupt);
+    }
+
+    async fn stop_chat(&self) {
+        let turn = self.tasks.lock().await.chat.take();
+        if let Some(turn) = turn {
+            turn.stop().await;
+        }
+    }
+
+    /// Reads endpoint, model, prompt and key on the blocking pool; `None` when any is missing.
+    async fn chat_config(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<ChatConfig>, BackendError> {
+        let settings = self.settings.clone();
+        teamarness_package_sdk::blocking(cancellation, move |cancel| {
+            if cancel.is_cancelled() {
+                return Err(storage_failed());
+            }
+            let store = settings.lock().map_err(|_| storage_failed())?;
+            let current = store.settings();
+            if !current.is_complete() {
+                return Ok(None);
+            }
+            let Some(api_key) = store.api_key().map_err(|_| storage_failed())? else {
+                return Ok(None);
+            };
+            Ok(Some(ChatConfig {
+                endpoint_base_url: current.endpoint_base_url.clone(),
+                model: current.model.clone(),
+                system_prompt: current.system_prompt.clone(),
+                context_messages: current.context_messages as usize,
+                api_key,
+            }))
+        })
+        .await
+    }
+
+    /// Records the Steward's message and starts its completion in the background, so the
+    /// request answers before the Host's UI deadline whatever the model takes.
+    async fn start_chat(
+        &self,
+        content: &str,
+        config: ChatConfig,
+    ) -> Result<ChatView, BackendError> {
+        let name = self.status.agent().and_then(|agent| agent.name);
+        let system = chat::system_message(name.as_deref(), &config.system_prompt);
+        let (turn, view) = self
+            .chat
+            .update(|session| session.begin(content, system, config.context_messages));
+        let turn = turn.map_err(|code| error(code, code == chat::CHAT_BUSY))?;
+        let cell = self.chat.clone();
+        let task = TaskHandle::spawn(&self.cancellation, move |cancellation| async move {
+            let outcome = match ModelClient::new() {
+                Ok(client) => tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return,
+                    completion = client.complete(
+                        &config.endpoint_base_url,
+                        &config.model,
+                        &turn.messages,
+                        &config.api_key,
+                    ) => completion,
+                },
+                Err(failure) => Err(failure),
+            };
+            drop(config);
+            cell.update(|session| session.finish(turn.generation, outcome));
+        });
+        // Any earlier task has settled or belongs to a cleared generation.
+        let previous = self.tasks.lock().await.chat.replace(task);
+        if let Some(previous) = previous {
+            previous.stop().await;
+        }
+        Ok(view)
     }
 
     async fn change_binding(&self, principal: Option<String>) -> Result<BindingView, BackendError> {
@@ -336,6 +429,12 @@ struct KeySetRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChatSendRequest {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BindingSetRequest {
     principal_id: String,
 }
@@ -368,6 +467,34 @@ impl From<AgentCandidate> for CandidateView {
 #[serde(rename_all = "camelCase")]
 struct CandidatesView {
     agents: Vec<CandidateView>,
+}
+
+/// Forwards every value a watch channel holds, the current one first, until either side closes.
+fn watch_subscription<T>(mut receiver: watch::Receiver<T>) -> EventSubscription
+where
+    T: Serialize + Clone + Send + Sync + 'static,
+{
+    let (sender, subscription) = event_channel(4);
+    tokio::spawn(async move {
+        loop {
+            let value = receiver.borrow_and_update().clone();
+            let Ok(payload) = serde_json::to_value(value) else {
+                return;
+            };
+            if sender.send(payload).await.is_err() {
+                return;
+            }
+            tokio::select! {
+                changed = receiver.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = sender.closed() => return,
+            }
+        }
+    });
+    subscription
 }
 
 /// The Agent Backend.
@@ -419,11 +546,13 @@ pub fn router() -> Router<AgentActive> {
                 tasks: Arc::new(tokio::sync::Mutex::new(Tasks {
                     roster: None,
                     harness: None,
+                    chat: None,
                     enabled: true,
                     reconciled: false,
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
                 dispatch,
+                chat: Arc::new(ChatCell::default()),
             };
             // Reconcile the startup roster before starting any reply work.
             {
@@ -613,31 +742,45 @@ pub fn router() -> Router<AgentActive> {
             Ok::<Status, BackendError>(context.state().status.current())
         },
     )
+    .request(
+        "agent.chat.get",
+        |context: Context<AgentActive>, _: Empty| async move {
+            Ok::<ChatView, BackendError>(context.state().chat.current())
+        },
+    )
+    .request(
+        "agent.chat.send",
+        |context: Context<AgentActive>, request: ChatSendRequest| async move {
+            let state = context.state().clone();
+            let Some(config) = state.chat_config(context.cancellation()).await? else {
+                return Err(error(chat::NOT_CONFIGURED, false));
+            };
+            state.start_chat(&request.content, config).await
+        },
+    )
+    .request(
+        "agent.chat.clear",
+        |context: Context<AgentActive>, _: Empty| async move {
+            let state = context.state().clone();
+            let ((), view) = state.chat.update(chat::ChatSession::clear);
+            state.stop_chat().await;
+            Ok::<ChatView, BackendError>(view)
+        },
+    )
     .subscription(
         "agent.status.changes",
         |context: Context<AgentActive>, _: Empty| async move {
-            let (sender, subscription) = event_channel(4);
-            let mut receiver = context.state().status.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    let status = receiver.borrow_and_update().clone();
-                    let Ok(payload) = serde_json::to_value(status) else {
-                        return;
-                    };
-                    if sender.send(payload).await.is_err() {
-                        return;
-                    }
-                    tokio::select! {
-                        changed = receiver.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                        }
-                        () = sender.closed() => return,
-                    }
-                }
-            });
-            Ok(subscription)
+            Ok::<EventSubscription, BackendError>(watch_subscription(
+                context.state().status.subscribe(),
+            ))
+        },
+    )
+    .subscription(
+        "agent.chat.changes",
+        |context: Context<AgentActive>, _: Empty| async move {
+            Ok::<EventSubscription, BackendError>(watch_subscription(
+                context.state().chat.subscribe(),
+            ))
         },
     )
 }
