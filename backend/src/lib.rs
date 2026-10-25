@@ -3,13 +3,16 @@
 //! The Agent Package Backend: Package-owned settings and key, the Agent Binding held by Core and
 //! read through `teamarness.agent-binding`, the status its UI shows, and the reply harness
 //! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
-//! family, and the Steward's direct [`chat`] with the same model.
+//! family, the Steward's direct [`chat`] with the same model, and the Steward's Package
+//! enablement ([`packages`]), which [`access`] combines with the [`catalog`] and Host availability.
 
+pub mod access;
 pub mod catalog;
 pub mod chat;
 pub mod harness;
 pub mod mention;
 pub mod model;
+pub mod packages;
 pub mod progress;
 pub mod settings;
 pub mod status;
@@ -30,9 +33,12 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::watch;
 
+use access::{Availability, PackageView};
+use catalog::{BundledCatalog, Catalog};
 use chat::{ChatCell, ChatView};
 use harness::{HarnessInputs, TaskHandle};
 use model::ModelClient;
+use packages::PackagesStore;
 use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
@@ -91,6 +97,10 @@ pub struct AgentActive {
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
     chat: Arc<ChatCell>,
+    /// The Steward's Package enablement, `packages.json`.
+    packages: Arc<Mutex<PackagesStore>>,
+    /// The Provider contracts the Agent knows; [`access`] decides which are usable.
+    catalog: &'static (dyn Catalog + Send + Sync),
 }
 
 /// What one chat turn needs from the stored configuration. Holds the key; never logged.
@@ -307,6 +317,22 @@ impl AgentActive {
         Ok(BindingView { agent: summary })
     }
 
+    /// What the Host reports available now; no Port grant or a Host error means nothing is.
+    async fn availability(&self) -> Availability {
+        match &self.ports {
+            Some(ports) => Availability::from_result(&ports.available().await),
+            None => Availability::none(),
+        }
+    }
+
+    /// The Steward's view of every agent-facing contract. Reads only the in-memory store.
+    fn packages_view(&self, availability: &Availability) -> Result<PackagesView, BackendError> {
+        let store = self.packages.lock().map_err(|_| storage_failed())?;
+        Ok(PackagesView {
+            packages: access::listed(self.catalog, availability, store.enabled()),
+        })
+    }
+
     fn settings_view(&self) -> SettingsView {
         let store = self
             .settings
@@ -418,6 +444,19 @@ struct BindingSetRequest {
     principal_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PackagesSetRequest {
+    contract: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackagesView {
+    packages: Vec<PackageView>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BindingView {
@@ -485,15 +524,16 @@ pub fn router() -> Router<AgentActive> {
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
-            let (store, progress, configured) =
+            let (store, packages, progress, configured) =
                 teamarness_package_sdk::blocking(&cancellation, move |cancel| {
                     if cancel.is_cancelled() {
                         return Err(storage_failed());
                     }
                     let store = SettingsStore::open(&directory).map_err(|_| storage_failed())?;
+                    let packages = PackagesStore::open(&directory).map_err(|_| storage_failed())?;
                     let progress = Progress::open(&directory).map_err(|_| storage_failed())?;
                     let configured = store.is_configured();
-                    Ok((store, progress, configured))
+                    Ok((store, packages, progress, configured))
                 })
                 .await?;
             let binding = AgentBinding::from_initialization(&initialization, capabilities.clone())
@@ -528,6 +568,8 @@ pub fn router() -> Router<AgentActive> {
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
                 chat: Arc::new(ChatCell::default()),
+                packages: Arc::new(Mutex::new(packages)),
+                catalog: BundledCatalog::get(),
             };
             // Reconcile the startup roster before starting any reply work.
             {
@@ -740,6 +782,45 @@ pub fn router() -> Router<AgentActive> {
             let ((), view) = state.chat.update(chat::ChatSession::clear);
             state.stop_chat().await;
             Ok::<ChatView, BackendError>(view)
+        },
+    )
+    .request(
+        "agent.packages.get",
+        |context: Context<AgentActive>, _: Empty| async move {
+            let state = context.state().clone();
+            let availability = state.availability().await;
+            context
+                .blocking(move |_| state.packages_view(&availability))
+                .await
+        },
+    )
+    .request(
+        "agent.packages.set",
+        |context: Context<AgentActive>, request: PackagesSetRequest| async move {
+            let state = context.state().clone();
+            if !access::is_agent_facing(state.catalog, &request.contract) {
+                return Err(error(access::UNKNOWN_PACKAGE, false));
+            }
+            {
+                let state = state.clone();
+                context
+                    .blocking(move |cancel| {
+                        if cancel.is_cancelled() {
+                            return Err(storage_failed());
+                        }
+                        state
+                            .packages
+                            .lock()
+                            .map_err(|_| storage_failed())?
+                            .set(&request.contract, request.enabled)
+                            .map_err(|_| storage_failed())
+                    })
+                    .await?;
+            }
+            let availability = state.availability().await;
+            context
+                .blocking(move |_| state.packages_view(&availability))
+                .await
         },
     )
     .subscription(

@@ -11,9 +11,9 @@ import {
   type PackageSubscription,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
-import type { AgentContract, Candidate, Chat, Settings, Status } from "./contract.generated";
+import type { AgentContract, Candidate, Chat, PackageView, Settings, Status } from "./contract.generated";
 
-export type { Candidate, Chat, Settings, Status };
+export type { Candidate, Chat, PackageView, Settings, Status };
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,11 @@ export type AgentUiState = Readonly<{
   /** A chat request is on its way; the turn itself is `chat.pending`. */
   chatBusy: boolean;
   chatError: string | undefined;
+  /** Agent-facing contracts; `null` until the first read answers. */
+  packages: readonly PackageView[] | null;
+  /** A Packages read or change is on its way. */
+  packagesBusy: boolean;
+  packagesError: string | undefined;
 }>;
 
 export type AgentController = Readonly<{
@@ -42,6 +47,8 @@ export type AgentController = Readonly<{
   /** Resolves `true` when the Backend accepted the message. */
   sendChat(content: string): Promise<boolean>;
   clearChat(): Promise<void>;
+  /** Enables or disables one agent-facing contract, then re-reads the list. */
+  setPackage(contract: string, enabled: boolean): Promise<void>;
   dispose(): void;
 }>;
 
@@ -116,6 +123,9 @@ export function createAgentController(
     chat: null,
     chatBusy: false,
     chatError: undefined,
+    packages: null,
+    packagesBusy: false,
+    packagesError: undefined,
   };
 
   const update = (changes: Partial<AgentUiState>): void => {
@@ -154,6 +164,19 @@ export function createAgentController(
     }
   };
 
+  const packagesRequest = async (work: () => Promise<void>): Promise<void> => {
+    if (disposed) return;
+    update({ packagesBusy: true, packagesError: undefined });
+    try {
+      await work();
+      const read = await typed.request("agent.packages.get", {});
+      update({ packages: read.packages, packagesBusy: false });
+    } catch (error) {
+      if (isAbortError(error)) return;
+      update({ packagesBusy: false, packagesError: describePackageError(error) });
+    }
+  };
+
   const loadCandidates = async (): Promise<readonly Candidate[]> =>
     (await typed.request("agent.binding.candidates", {})).agents;
 
@@ -172,6 +195,8 @@ export function createAgentController(
         });
         return { settings: settings.settings, hasKey: settings.hasKey, status, candidates, chat };
       });
+      // A Packages failure stays in its own section; the rest of the page still works.
+      await packagesRequest(async () => undefined);
     },
 
     async saveSettings(settings: Settings): Promise<void> {
@@ -221,6 +246,12 @@ export function createAgentController(
 
     async clearChat(): Promise<void> {
       await chatRequest(() => typed.request("agent.chat.clear", {}));
+    },
+
+    async setPackage(contract: string, enabled: boolean): Promise<void> {
+      await packagesRequest(async () => {
+        await typed.request("agent.packages.set", { contract, enabled });
+      });
     },
 
     dispose(): void {
@@ -283,6 +314,22 @@ const AGENT_CSS = `
   .chat-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
   .chat-empty { color: var(--teamarness-color-text-muted); }
   textarea.chat-input { min-height: 4.5rem; }
+  .package-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+  .package-list:empty { display: none; }
+  .package-row { display: flex; gap: 1rem; align-items: flex-start; justify-content: space-between; padding-block: .85rem; border-top: 1px solid var(--teamarness-color-border); }
+  .package-row:first-child { border-top: 0; padding-top: 0; }
+  .package-text { min-width: 0; display: flex; flex-direction: column; gap: .2rem; }
+  .package-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem; }
+  .package-name { font-weight: 600; }
+  .package-unavailable { font-size: .8em; font-weight: 600; color: var(--teamarness-color-text-muted); }
+  .package-description { margin: 0; color: var(--teamarness-color-text-muted); overflow-wrap: anywhere; }
+  .package-switch { appearance: none; -webkit-appearance: none; flex: none; position: relative; width: 2.5rem; height: 1.4rem; margin: .1rem 0 0; border-radius: 999px; background: var(--teamarness-color-border); cursor: pointer; transition: background .15s; }
+  .package-switch::before { content: ''; position: absolute; top: .2rem; left: .2rem; width: 1rem; height: 1rem; border-radius: 50%; background: var(--teamarness-color-background); transition: transform .15s; }
+  .package-switch:checked { background: var(--teamarness-color-accent); }
+  .package-switch:checked::before { transform: translateX(1.1rem); }
+  .package-switch:focus-visible { outline: 2px solid var(--teamarness-color-focus); outline-offset: 2px; }
+  .package-switch:disabled { opacity: .5; cursor: default; }
+  .packages-empty { margin: 0; color: var(--teamarness-color-text-muted); }
 `;
 
 // ─── Mount ───────────────────────────────────────────────────────────────────
@@ -472,7 +519,24 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   const keySection = group("API key", "Sent only to the configured endpoint.", keyState,
     field("New API key", keyInput, "Stored in this Package's data directory and never shown again."), keyRow);
 
-  form.append(statusSection, agentSection, settingsSection, keySection);
+  // Packages
+  const packageList = document.createElement("ul");
+  packageList.className = "package-list";
+  packageList.dataset.role = "packages";
+  packageList.setAttribute("aria-label", "Packages");
+  const packagesEmpty = document.createElement("p");
+  packagesEmpty.className = "packages-empty";
+  packagesEmpty.dataset.role = "packages-empty";
+  packagesEmpty.textContent = "No packages offer agent guidance yet.";
+  const packagesMessage = document.createElement("p");
+  packagesMessage.className = "message";
+  packagesMessage.dataset.role = "packages-message";
+  packagesMessage.setAttribute("role", "status");
+  const packagesSection = group("Packages",
+    "Packages whose tools the Agent may use once enabled. A package must be installed in this Workspace to be available.",
+    packageList, packagesMessage);
+
+  form.append(statusSection, agentSection, settingsSection, keySection, packagesSection);
   configPanel.append(form);
 
   // Chat
@@ -561,7 +625,64 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     setKeyButton.disabled = busy;
     clearKeyButton.disabled = busy || !state.hasKey;
 
+    renderPackages(state);
     renderChat(state);
+  };
+
+  let renderedPackages = "";
+  const renderPackages = (state: AgentUiState): void => {
+    const packages = state.packages ?? [];
+    const key = JSON.stringify(packages);
+    if (key !== renderedPackages) {
+      renderedPackages = key;
+      // Keep keyboard focus on the same switch across a re-render.
+      const focused = (context.root.activeElement as HTMLElement | null)?.dataset?.contract;
+      packageList.replaceChildren(...packages.map((entry) => {
+        const row = document.createElement("li");
+        row.className = "package-row";
+        row.dataset.role = "package";
+        const text = document.createElement("div");
+        text.className = "package-text";
+        const heading = document.createElement("div");
+        heading.className = "package-heading";
+        const name = document.createElement("span");
+        name.className = "package-name";
+        name.textContent = entry.name;
+        heading.append(name);
+        if (!entry.available) {
+          const marker = document.createElement("span");
+          marker.className = "package-unavailable";
+          marker.dataset.role = "package-unavailable";
+          marker.textContent = "Unavailable";
+          heading.append(marker);
+        }
+        const description = document.createElement("p");
+        description.className = "package-description";
+        description.textContent = entry.description;
+        text.append(heading, description);
+        const toggle = document.createElement("input");
+        toggle.type = "checkbox";
+        toggle.className = "package-switch";
+        toggle.setAttribute("role", "switch");
+        toggle.setAttribute("aria-label", entry.name);
+        toggle.dataset.contract = entry.contract;
+        toggle.checked = entry.enabled;
+        row.append(text, toggle);
+        return row;
+      }));
+      if (focused) {
+        Array.from(packageList.querySelectorAll<HTMLElement>(".package-switch"))
+          .find((toggle) => toggle.dataset.contract === focused)?.focus();
+      }
+    }
+    for (const toggle of packageList.querySelectorAll<HTMLInputElement>(".package-switch")) {
+      toggle.disabled = state.packagesBusy;
+    }
+    packagesEmpty.remove();
+    if (state.packages !== null && packages.length === 0) packageList.before(packagesEmpty);
+    packagesMessage.textContent = state.packagesError ?? "";
+    if (state.packagesError) packagesMessage.dataset.kind = "error";
+    else delete packagesMessage.dataset.kind;
   };
 
   let renderedEntries = "";
@@ -661,6 +782,11 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     }
   };
   const onClearChat = (): void => { void controller.clearChat(); };
+  const onPackageToggle = (event: Event): void => {
+    const toggle = event.target as HTMLInputElement | null;
+    const contract = toggle?.dataset.contract;
+    if (contract) void controller.setPackage(contract, toggle.checked);
+  };
   saveButton.addEventListener("click", onSave);
   setKeyButton.addEventListener("click", onSetKey);
   clearKeyButton.addEventListener("click", onClearKey);
@@ -672,6 +798,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   chatForm.addEventListener("submit", onSendChat);
   chatInput.addEventListener("keydown", onChatKey);
   clearChatButton.addEventListener("click", onClearChat);
+  packageList.addEventListener("change", onPackageToggle);
 
   await controller.start();
 
@@ -691,6 +818,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     chatForm.removeEventListener("submit", onSendChat);
     chatInput.removeEventListener("keydown", onChatKey);
     clearChatButton.removeEventListener("click", onClearChat);
+    packageList.removeEventListener("change", onPackageToggle);
     page.remove();
     cleanupStyles();
     cleanupKit();

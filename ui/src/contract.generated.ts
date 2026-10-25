@@ -31,6 +31,8 @@ export type ChatEntry = {
   readonly "role": "user" | "assistant";
 };
 
+export type ContractIdentity = string;
+
 export type Empty = Record<string, never>;
 
 export type KeyView = {
@@ -38,6 +40,18 @@ export type KeyView = {
 };
 
 export type Name = string | null;
+
+export type PackageView = {
+  readonly "available": boolean;
+  readonly "contract": ContractIdentity;
+  readonly "description": string;
+  readonly "enabled": boolean;
+  readonly "name": string;
+};
+
+export type Packages = {
+  readonly "packages": readonly PackageView[];
+};
 
 export type PrincipalId = string;
 
@@ -80,6 +94,11 @@ export type AgentContract = {
     readonly "agent.key.set": { readonly request: {
         readonly "apiKey": string;
       }; readonly response: KeyView };
+    readonly "agent.packages.get": { readonly request: Empty; readonly response: Packages };
+    readonly "agent.packages.set": { readonly request: {
+        readonly "contract": ContractIdentity;
+        readonly "enabled": boolean;
+      }; readonly response: Packages };
     readonly "agent.settings.get": { readonly request: Empty; readonly response: SettingsView };
     readonly "agent.settings.set": { readonly request: {
         readonly "settings": Settings;

@@ -170,6 +170,15 @@ async fn start_with_principals(
     bindings: &FakeBindings,
     principals: ScriptedCapability,
 ) -> Fixture {
+    start_with_ports(directory, bindings, principals, ScriptedCapability::new()).await
+}
+
+async fn start_with_ports(
+    directory: &Path,
+    bindings: &FakeBindings,
+    principals: ScriptedCapability,
+    ports: ScriptedCapability,
+) -> Fixture {
     let binding_capability = bindings.capability();
     let harness = HarnessBuilder::new(router().into_backend())
         .package_identity("dev.teamarness.agent")
@@ -178,7 +187,7 @@ async fn start_with_principals(
         .capability("teamarness.workspace-context", ScriptedCapability::new())
         .capability("teamarness.principals", principals.clone())
         .capability("teamarness.agent-binding", binding_capability.clone())
-        .capability("teamarness.package-ports", ScriptedCapability::new())
+        .capability("teamarness.package-ports", ports)
         .start()
         .await;
     Fixture {
@@ -789,4 +798,208 @@ async fn a_failed_binding_change_does_not_block_later_binding_changes() {
     );
     assert!(bindings.bound.lock().unwrap().is_none());
     fixture.harness.shutdown().await.unwrap();
+}
+
+const EXHIBITS: &str = "dev.teamarness.exhibits";
+
+/// A package-ports capability whose `available` answer reports `contracts` as available. Every
+/// declared contract is listed, as the Host lists every contract the manifest declares.
+fn ports_reporting(available: &[&'static str]) -> ScriptedCapability {
+    let available = available.to_vec();
+    ScriptedCapability::new().calls(move |method, _| match method {
+        "available" => Ok(json!({
+            "contracts": manifest()["consumedPorts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|contract| {
+                    let identity = contract["identity"].as_str().unwrap();
+                    json!({
+                        "contract": identity,
+                        "major": contract["major"],
+                        "minor": contract["minMinor"],
+                        "available": available.contains(&identity),
+                        "ports": contract["ports"],
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })),
+        _ => Err(BackendError::new("port_ungranted", false, empty())),
+    })
+}
+
+fn exhibits_view(available: bool, enabled: bool) -> Value {
+    let description = BundledCatalog::get()
+        .contracts()
+        .iter()
+        .find(|contract| contract.identity == EXHIBITS)
+        .unwrap()
+        .description
+        .clone();
+    json!({"packages": [{
+        "contract": EXHIBITS,
+        "name": "Exhibits",
+        "description": description,
+        "available": available,
+        "enabled": enabled,
+    }]})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packages_get_lists_exhibits_only() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    let Fixture { mut harness, .. } = start_with_ports(
+        data.path(),
+        &bindings,
+        principals_capability(),
+        ports_reporting(&["dev.teamarness.conversations", EXHIBITS]),
+    )
+    .await;
+    harness.activate().await.unwrap();
+    let packages = harness
+        .request("agent.packages.get", empty())
+        .await
+        .unwrap();
+    // Conversations and Documents have no runtime.guide, so they are not agent-facing.
+    assert_eq!(packages, exhibits_view(true, false));
+    harness.shutdown().await.unwrap();
+
+    // Exhibits not installed: listed, but unavailable.
+    let Fixture { mut harness, .. } = start_with_ports(
+        data.path(),
+        &bindings,
+        principals_capability(),
+        ports_reporting(&["dev.teamarness.conversations"]),
+    )
+    .await;
+    harness.activate().await.unwrap();
+    let packages = harness
+        .request("agent.packages.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(packages, exhibits_view(false, false));
+    harness.shutdown().await.unwrap();
+
+    // The Host could not answer: every contract is unavailable, and activation still succeeds.
+    let Fixture { mut harness, .. } = start(data.path(), &bindings).await;
+    harness.activate().await.unwrap();
+    let packages = harness
+        .request("agent.packages.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(packages, exhibits_view(false, false));
+    harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packages_set_persists_across_restart_and_suspend_resume() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    let ports = || ports_reporting(&[EXHIBITS]);
+    let Fixture { mut harness, .. } =
+        start_with_ports(data.path(), &bindings, principals_capability(), ports()).await;
+    harness.activate().await.unwrap();
+    let enabled = harness
+        .request(
+            "agent.packages.set",
+            json!({"contract": EXHIBITS, "enabled": true}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enabled, exhibits_view(true, true));
+    let document: Value =
+        serde_json::from_str(&std::fs::read_to_string(data.path().join("packages.json")).unwrap())
+            .unwrap();
+    assert_eq!(document, json!({"schemaVersion": 1, "enabled": [EXHIBITS]}));
+
+    harness.suspend().await.unwrap();
+    harness.recover().await.unwrap();
+    assert_eq!(
+        harness
+            .request("agent.packages.get", empty())
+            .await
+            .unwrap(),
+        exhibits_view(true, true)
+    );
+    harness.shutdown().await.unwrap();
+
+    // A new process generation reads the choice back, then a disable persists too.
+    let Fixture { mut harness, .. } =
+        start_with_ports(data.path(), &bindings, principals_capability(), ports()).await;
+    harness.activate().await.unwrap();
+    assert_eq!(
+        harness
+            .request("agent.packages.get", empty())
+            .await
+            .unwrap(),
+        exhibits_view(true, true)
+    );
+    let disabled = harness
+        .request(
+            "agent.packages.set",
+            json!({"contract": EXHIBITS, "enabled": false}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disabled, exhibits_view(true, false));
+    harness.shutdown().await.unwrap();
+
+    let Fixture { mut harness, .. } =
+        start_with_ports(data.path(), &bindings, principals_capability(), ports()).await;
+    harness.activate().await.unwrap();
+    assert_eq!(
+        harness
+            .request("agent.packages.get", empty())
+            .await
+            .unwrap(),
+        exhibits_view(true, false)
+    );
+    harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn packages_set_rejects_non_agent_facing() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    let Fixture { mut harness, .. } = start_with_ports(
+        data.path(),
+        &bindings,
+        principals_capability(),
+        ports_reporting(&["dev.teamarness.conversations", EXHIBITS]),
+    )
+    .await;
+    harness.activate().await.unwrap();
+    for contract in [
+        "dev.teamarness.conversations",
+        "dev.teamarness.documents",
+        "com.example.unknown",
+    ] {
+        let error = harness
+            .request(
+                "agent.packages.set",
+                json!({"contract": contract, "enabled": true}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "agent.unknown_package", "{contract}");
+        assert!(!error.retryable());
+    }
+    let error = harness
+        .request(
+            "agent.packages.set",
+            json!({"contract": EXHIBITS, "enabled": true, "extra": 1}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "package.invalid_payload");
+    // Nothing was enabled by the refused requests.
+    assert_eq!(
+        harness
+            .request("agent.packages.get", empty())
+            .await
+            .unwrap(),
+        exhibits_view(true, false)
+    );
+    harness.shutdown().await.unwrap();
 }

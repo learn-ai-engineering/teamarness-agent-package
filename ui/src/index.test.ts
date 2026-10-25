@@ -8,7 +8,7 @@ import {
 } from "@teamarness/package-ui-sdk/testing";
 import { describe, expect, it, vi } from "vitest";
 
-import type { Chat, Settings, Status } from "./contract.generated";
+import type { Chat, PackageView, Settings, Status } from "./contract.generated";
 import { createAgentController, describeChatError, describeStatus, mount, type AgentUiState } from "./index";
 
 const AGENT_ID = "a".repeat(64);
@@ -20,12 +20,17 @@ function defaults(): Settings {
 }
 
 /** A fake Backend with the same state machine the real one has, enough for the UI to be driven. */
-function fakeBackend(input?: { status?: Status; candidates?: Array<{ principalId: string; name: string | null; bound: boolean }> }) {
+function fakeBackend(input?: {
+  status?: Status;
+  candidates?: Array<{ principalId: string; name: string | null; bound: boolean }>;
+  packages?: PackageView[];
+}) {
   let settings = defaults();
   let hasKey = false;
   let status: Status = input?.status ?? { state: "unconfigured" };
   const candidates = input?.candidates ?? [{ principalId: AGENT_ID, name: "Scout", bound: false }];
   let chat: Chat = { entries: [], pending: false };
+  let packages: PackageView[] = input?.packages ?? [];
   const fake = createFakePackageClient({
     requests: {
       "agent.settings.get": () => ({ settings, hasKey }),
@@ -80,6 +85,15 @@ function fakeBackend(input?: { status?: Status; candidates?: Array<{ principalId
       "agent.chat.clear": () => {
         chat = { entries: [], pending: false };
         return chat;
+      },
+      "agent.packages.get": () => ({ packages }),
+      "agent.packages.set": (payload) => {
+        const { contract, enabled } = payload as { contract: string; enabled: boolean };
+        if (!packages.some((entry) => entry.contract === contract)) {
+          throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.unknown_package" } });
+        }
+        packages = packages.map((entry) => (entry.contract === contract ? { ...entry, enabled } : entry));
+        return { packages };
       },
     },
     subscriptions: { "agent.status.changes": () => undefined, "agent.chat.changes": () => undefined },
@@ -238,7 +252,7 @@ describe("Agent Package UI mount", () => {
     try {
       unmount = await mount(createTestMountContext({ root, client }));
       const form = root.querySelector("form.agent-settings");
-      expect(form?.querySelectorAll(":scope > section")).toHaveLength(4);
+      expect(form?.querySelectorAll(":scope > section")).toHaveLength(5);
       const picker = form?.querySelector<HTMLSelectElement>('select[name="agent"]');
       expect(picker?.closest(".agent-picker")).not.toBeNull();
       expect(picker?.classList.contains("agent-picker-control")).toBe(true);
@@ -247,7 +261,7 @@ describe("Agent Package UI mount", () => {
       // Sections are ruled groups, not boxed panels.
       expect(form?.querySelectorAll(".teamarness-section")).toHaveLength(0);
       expect(Array.from(form?.querySelectorAll(".agent-group-title") ?? []).map((heading) => heading.textContent)).toEqual(
-        ["Status", "Agent", "Model endpoint", "API key"],
+        ["Status", "Agent", "Model endpoint", "API key", "Packages"],
       );
       expect(css).toMatch(/\.agent-group\s*\{[^}]*display:\s*grid[^}]*border-top:/s);
       expect(css).toMatch(/\.agent-picker-control\s*\{[^}]*appearance:\s*none/s);
@@ -418,6 +432,107 @@ describe("Agent Package UI tabs and chat", () => {
     await flush();
     expect(fake.calls.some((call) => call.operation === "agent.chat.clear")).toBe(true);
     expect(chat.querySelectorAll(".chat-entry")).toHaveLength(0);
+    await cleanup();
+  });
+});
+
+describe("Agent Package UI packages", () => {
+  const EXHIBITS: PackageView = {
+    contract: "dev.teamarness.exhibits",
+    name: "Exhibits",
+    description: "Author Exhibits. Call runtime.guide first.",
+    available: false,
+    enabled: false,
+  };
+  const NOTES: PackageView = {
+    contract: "com.example.notes",
+    name: "Notes",
+    description: "Notes for the Workspace.",
+    available: true,
+    enabled: true,
+  };
+
+  async function mountedWith(packages: PackageView[]) {
+    const backend = fakeBackend({ packages });
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
+    const section = Array.from(root.querySelectorAll<HTMLElement>("section.agent-group")).find(
+      (element) => element.querySelector(".agent-group-title")?.textContent === "Packages",
+    );
+    if (!section) throw new Error("Packages section missing");
+    const cleanup = async () => {
+      await unmount();
+      host.remove();
+    };
+    return { ...backend, root, section, cleanup };
+  }
+
+  it("lists one row per package with an unavailable marker and a named switch", async () => {
+    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES]);
+    expect(fake.calls.some((call) => call.operation === "agent.packages.get")).toBe(true);
+    // Rows are ruled list items, not boxed panels.
+    expect(section.querySelectorAll(".teamarness-section")).toHaveLength(0);
+    const rows = Array.from(section.querySelectorAll<HTMLElement>('[data-role="package"]'));
+    expect(rows.map((row) => [
+      row.querySelector(".package-name")?.textContent,
+      row.querySelector(".package-description")?.textContent,
+      row.querySelector('[data-role="package-unavailable"]')?.textContent ?? null,
+    ])).toEqual([
+      ["Exhibits", "Author Exhibits. Call runtime.guide first.", "Unavailable"],
+      ["Notes", "Notes for the Workspace.", null],
+    ]);
+    const switches = Array.from(section.querySelectorAll<HTMLInputElement>('input[role="switch"]'));
+    expect(switches.map((element) => [element.type, element.getAttribute("aria-label"), element.checked])).toEqual([
+      ["checkbox", "Exhibits", false],
+      ["checkbox", "Notes", true],
+    ]);
+    expect(section.querySelector('[data-role="packages-empty"]')).toBeNull();
+    await cleanup();
+  });
+
+  it("toggling sends agent.packages.set, re-reads and re-renders", async () => {
+    const { fake, section, cleanup } = await mountedWith([EXHIBITS, NOTES]);
+    const exhibits = () => section.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Exhibits"]');
+    const toggle = exhibits();
+    if (!toggle) throw new Error("Exhibits switch missing");
+    const reads = fake.calls.filter((call) => call.operation === "agent.packages.get").length;
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    const sets = fake.calls.filter((call) => call.operation === "agent.packages.set");
+    expect(sets.map((call) => call.payload)).toEqual([{ contract: "dev.teamarness.exhibits", enabled: true }]);
+    expect(fake.calls.filter((call) => call.operation === "agent.packages.get").length).toBe(reads + 1);
+    expect(exhibits()?.checked).toBe(true);
+    expect(exhibits()?.disabled).toBe(false);
+
+    const notes = section.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Notes"]');
+    if (!notes) throw new Error("Notes switch missing");
+    notes.checked = false;
+    notes.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(section.querySelector<HTMLInputElement>('input[role="switch"][aria-label="Notes"]')?.checked).toBe(false);
+    await cleanup();
+  });
+
+  it("shows a refused change as a Package error and keeps the last view", async () => {
+    const { client } = fakeBackend({ packages: [EXHIBITS] });
+    const states: AgentUiState[] = [];
+    const controller = createAgentController(client, (state) => { states.push(state); });
+    await controller.start();
+    expect(lastState(states).packages).toEqual([EXHIBITS]);
+    await controller.setPackage("com.example.gone", true);
+    expect(lastState(states).packagesError).toBe("agent.unknown_package");
+    expect(lastState(states).packages).toEqual([EXHIBITS]);
+    expect(lastState(states).packagesBusy).toBe(false);
+    controller.dispose();
+  });
+
+  it("renders the empty state", async () => {
+    const { section, cleanup } = await mountedWith([]);
+    expect(section.querySelectorAll('[data-role="package"]')).toHaveLength(0);
+    expect(section.querySelector('[data-role="packages-empty"]')?.textContent).toBe("No packages offer agent guidance yet.");
     await cleanup();
   });
 });
