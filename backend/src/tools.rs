@@ -192,6 +192,34 @@ impl PortCaller for PortClient {
     }
 }
 
+/// A turn without a Port grant has nothing usable, so its tool set never dispatches; `None`
+/// refuses anything that would.
+impl<P: PortCaller> PortCaller for Option<P> {
+    async fn query(
+        &self,
+        contract: &str,
+        port: &str,
+        request: Value,
+    ) -> Result<Value, BackendError> {
+        match self {
+            Some(ports) => ports.query(contract, port, request).await,
+            None => Err(BackendError::new(TOOL_UNAVAILABLE, false, json!({}))),
+        }
+    }
+
+    async fn command(
+        &self,
+        contract: &str,
+        port: &str,
+        request: Value,
+    ) -> Result<Value, BackendError> {
+        match self {
+            Some(ports) => ports.command(contract, port, request).await,
+            None => Err(BackendError::new(TOOL_UNAVAILABLE, false, json!({}))),
+        }
+    }
+}
+
 struct PortTool {
     contract: String,
     alias: String,

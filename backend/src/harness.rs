@@ -3,6 +3,10 @@
 //! `messages.changed` only wakes catch-up. Startup, reconnection and locally pending work use
 //! `message.changes` after the acknowledged revision. Each Channel has one reply in flight;
 //! its trigger is persisted before the model/post attempt and is never retried afterward.
+//!
+//! A reply is one bounded [`turn`](crate::turn) over the tools of the Packages usable now. The
+//! model is never offered `message.post`: the harness posts the turn's final text itself,
+//! exactly once, and a turn that fails posts nothing.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -16,12 +20,17 @@ use teamarness_package_sdk::capabilities::principals::{Principal, PrincipalKind,
 use teamarness_package_sdk::ports::PortClient;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::access;
+use crate::catalog::Catalog;
 use crate::mention::mentions;
-use crate::model::{ChatMessage, ModelClient, ModelFailure};
+use crate::model::{ChatMessage, ConfiguredModel, ModelClient};
+use crate::packages::PackagesStore;
 use crate::progress::{Cursor, Progress};
 use crate::settings::SettingsStore;
+use crate::skills;
 use crate::status::StatusCell;
-use crate::tools::ToolContext;
+use crate::tools::{ToolContext, Toolset};
+use crate::turn::{self, ToolExecutor, TurnBounds, TurnOutcome};
 
 pub const CONVERSATIONS_CONTRACT: &str = "dev.teamarness.conversations";
 pub const POST_FAILED: &str = "agent.post_failed";
@@ -44,6 +53,10 @@ pub struct HarnessInputs {
     pub status: Arc<StatusCell>,
     /// Shared across suspend/resume so blocking writes have one serialized owner.
     pub progress: Arc<Mutex<Progress>>,
+    /// The Steward's Package enablement, read when each reply starts.
+    pub packages: Arc<Mutex<PackagesStore>>,
+    /// The Provider contracts the Agent knows.
+    pub catalog: &'static (dyn Catalog + Send + Sync),
 }
 
 pub struct TaskHandle {
@@ -459,18 +472,11 @@ impl Loop {
                         }
                     };
                     if principal.is_some_and(|principal| principal.kind == PrincipalKind::Person) {
-                        let messages = match self
-                            .context(
-                                agent,
-                                channel,
-                                &message,
-                                context_messages,
-                                system_prompt,
-                                lookups,
-                            )
+                        let history = match self
+                            .context(agent, channel, &message, context_messages, lookups)
                             .await
                         {
-                            Ok(messages) => messages,
+                            Ok(history) => history,
                             Err(()) => {
                                 if self.persist(channel, &cursor).await {
                                     self.schedule(RETRY);
@@ -480,7 +486,11 @@ impl Loop {
                         };
                         cursor.after = revision(&event.revision).expect("validated revision");
                         if self.persist(channel, &cursor).await && !self.work.is_cancelled() {
-                            self.spawn_reply(channel.to_owned(), messages);
+                            let system = Prompt {
+                                agent: agent.clone(),
+                                system_prompt: system_prompt.to_owned(),
+                            };
+                            self.spawn_reply(channel.to_owned(), system, history);
                         }
                         return;
                     }
@@ -499,13 +509,13 @@ impl Loop {
         self.schedule(Duration::ZERO);
     }
 
+    /// The labelled Channel history a reply answers, oldest first, ending with the trigger.
     async fn context(
         &self,
         agent: &BoundAgent,
         channel: &str,
         trigger: &Message,
         limit: usize,
-        system_prompt: &str,
         lookups: &mut HashMap<String, Option<Principal>>,
     ) -> Result<Vec<ChatMessage>, ()> {
         let mut prior = if limit == 0 {
@@ -523,11 +533,7 @@ impl Loop {
                 .collect::<Result<Vec<_>, _>>()?
         };
         prior.reverse();
-        let mut messages = vec![ChatMessage::system(system_message(
-            agent,
-            system_prompt,
-            &ToolContext::default(),
-        ))];
+        let mut messages = Vec::with_capacity(prior.len() + 1);
         for row in prior.iter().chain(std::iter::once(trigger)) {
             if row.author == agent.identity {
                 messages.push(ChatMessage::assistant(row.markdown.clone()));
@@ -560,7 +566,7 @@ impl Loop {
         Ok(found)
     }
 
-    fn spawn_reply(&mut self, channel: String, messages: Vec<ChatMessage>) {
+    fn spawn_reply(&mut self, channel: String, prompt: Prompt, history: Vec<ChatMessage>) {
         let slot = self.slots.entry(channel.clone()).or_default();
         slot.in_flight = true;
         slot.pending = true;
@@ -568,11 +574,10 @@ impl Loop {
             self.inputs.status.set_replying();
         }
         let client = self.client.clone();
-        let ports = self.inputs.ports.clone();
-        let settings = self.inputs.settings.clone();
+        let inputs = self.inputs.clone();
         let cancellation = self.work.clone();
         self.replies.spawn(async move {
-            let outcome = reply(&client, &ports, settings, &channel, messages, &cancellation).await;
+            let outcome = reply(&client, &inputs, &channel, prompt, history, &cancellation).await;
             (channel, outcome)
         });
     }
@@ -648,40 +653,74 @@ fn label(principal: Option<&Principal>, author: &str) -> String {
     }
 }
 
+/// What a reply's system message is built from once its tools are known.
+struct Prompt {
+    agent: BoundAgent,
+    system_prompt: String,
+}
+
 async fn reply(
     client: &ModelClient,
-    ports: &PortClient,
-    settings: Arc<Mutex<SettingsStore>>,
+    inputs: &HarnessInputs,
     channel: &str,
-    messages: Vec<ChatMessage>,
+    prompt: Prompt,
+    history: Vec<ChatMessage>,
     cancellation: &CancellationToken,
 ) -> ReplyOutcome {
+    let settings = inputs.settings.clone();
+    let packages = inputs.packages.clone();
     let configured = teamarness_package_sdk::blocking(cancellation, move |cancel| {
         let store = settings.lock().map_err(|_| crate::storage_failed())?;
         if cancel.is_cancelled() {
             return Err(crate::storage_failed());
         }
+        let enabled = packages
+            .lock()
+            .map_err(|_| crate::storage_failed())?
+            .enabled()
+            .to_vec();
         Ok((
             store.settings().endpoint_base_url.clone(),
             store.settings().model.clone(),
             store.api_key().map_err(|_| crate::storage_failed())?,
+            enabled,
         ))
     })
     .await;
-    let (endpoint, model, key) = match configured {
-        Ok((endpoint, model, Some(key))) => (endpoint, model, key),
+    let (endpoint, model, key, enabled) = match configured {
+        Ok((endpoint, model, Some(key), enabled)) => (endpoint, model, key, enabled),
         Err(_) if cancellation.is_cancelled() => return ReplyOutcome::Cancelled,
         _ => return ReplyOutcome::Failed(crate::model::ENDPOINT_REJECTED, false),
     };
-    let completion = tokio::select! {
+    // `message.post` is withheld here, so the model can never post on its own.
+    let usable = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        completion = client.complete(&endpoint, &model, &messages, &key) => completion,
+        usable = access::usable_now(inputs.catalog, Some(&inputs.ports), &enabled) => usable,
     };
-    drop(key);
-    let markdown = match completion {
-        Ok(text) => truncate_chars(text, MAX_REPLY_CHARS),
-        Err(ModelFailure { code, retryable }) => return ReplyOutcome::Failed(code, retryable),
+    // The bundled catalog always loads; a tool set that cannot be built is reported, never a
+    // panic.
+    let Ok(toolset) = Toolset::for_turn(&usable, inputs.ports.clone(), skills::bundled()) else {
+        return ReplyOutcome::Failed(turn::TOOL_UNAVAILABLE, false);
+    };
+    let system = system_message(
+        &prompt.agent,
+        &prompt.system_prompt,
+        &ToolContext::for_turn(&usable, skills::bundled()),
+    );
+    let model = ConfiguredModel::new(client.clone(), endpoint, model, key);
+    let turn = turn::Turn::new(
+        system,
+        history,
+        toolset.definitions().to_vec(),
+        TurnBounds::PRODUCTION,
+    );
+    let outcome = turn::drive(turn, &model, &toolset, cancellation).await;
+    drop(model);
+    let markdown = match outcome {
+        TurnOutcome::Done(result) => truncate_chars(result.text, MAX_REPLY_CHARS),
+        TurnOutcome::Failed(code, retryable) => return ReplyOutcome::Failed(code, retryable),
+        TurnOutcome::Cancelled => return ReplyOutcome::Cancelled,
     };
     if markdown.trim().is_empty() {
         return ReplyOutcome::Failed(crate::model::MODEL_ERROR, false);
@@ -695,7 +734,7 @@ async fn reply(
     let post = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        post = ports.command(
+        post = inputs.ports.command(
             CONVERSATIONS_CONTRACT,
             "message.post",
             json!({"channelId":channel,"markdown":markdown}),

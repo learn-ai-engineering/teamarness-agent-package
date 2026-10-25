@@ -243,6 +243,20 @@ fn router_matches_the_ui_contract() {
     );
 }
 
+#[test]
+fn chat_activity_bound_matches_the_contract() {
+    let contract: Value = serde_json::from_str(include_str!("../../ui-contract.json")).unwrap();
+    let activity = &contract["$defs"]["chatEntry"]["properties"]["activity"];
+    assert_eq!(
+        activity["maxItems"],
+        json!(teamarness_agent_package::chat::MAX_ACTIVITY)
+    );
+    assert_eq!(
+        contract["$defs"]["activity"]["additionalProperties"],
+        json!(false)
+    );
+}
+
 fn manifest() -> Value {
     serde_json::from_str(include_str!("../../teamarness.package.json")).expect("manifest is JSON")
 }

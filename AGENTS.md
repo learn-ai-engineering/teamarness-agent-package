@@ -33,7 +33,9 @@ Package UI
 
 `ui-contract.json` defines the requests that may cross this path. Treat it as the shared boundary between the UI and Backend. Change the contract before implementing a new request on either side.
 
-The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports capabilities. It also offers the Steward a direct, in-memory chat with the configured model on a separate UI tab. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
+The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports capabilities, and consumes Documents 1.1 and Exhibits 1.0 as optional contracts. It also offers the Steward a direct, in-memory chat with the configured model on a separate UI tab. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
+
+Chat and reply turns can call the tools of enabled Packages. A turn is a bounded loop (`backend/src/turn.rs`) between the model and a tool set (`backend/src/tools.rs`): the usable contracts' ports plus the Agent's compiled-in skills. `access::usable` is the only place that decides which contracts are usable. A contract is agent-facing only when it has a `runtime.guide` query; today only Exhibits has one. The Steward enables Packages in the Packages section on Configuration, stored in `packages.json`. The model is never offered `message.post`; the harness posts each reply's final text once. A dispatched command is never re-sent. There is no dispatch fence: a post already dispatched when the binding changes may be attributed to the new Agent. README.md lists the turn bounds and the `agent.*` codes.
 
 ## Project map
 
@@ -42,6 +44,14 @@ The Agent configures an OpenAI-compatible model endpoint and replies to addresse
 | `teamarness.package.json` | Declares Package identity, compatibility, Backend artifacts, UI artifacts, the UI contract, assets, and required capabilities. |
 | `ui-contract.json` | Contains closed JSON schemas for every UI request, response, subscription request, and event. |
 | `backend/src/lib.rs` | Owns domain behavior, lifecycle handling, validation, and Package data. |
+| `backend/src/turn.rs` | The sans-I/O turn engine and its bounds (`TurnBounds`) and stable codes. |
+| `backend/src/model.rs` | The OpenAI-compatible model client, with tool definitions and tool calls. |
+| `backend/src/tools.rs` | The generic port tool executor, `skill_read`, and the system-message tool context. |
+| `backend/src/catalog.rs` | The `Catalog` seam and the bundled Provider contracts. |
+| `backend/src/access.rs` | Decides which contracts are listed and usable. |
+| `backend/src/packages.rs` | The Steward's Package enablement, `packages.json` (schema v1). |
+| `backend/src/skills.rs` and `backend/skills/` | The Agent's compiled-in skills. |
+| `backend/catalog/` | Verbatim Provider `ports.json` copies and `provenance.json`. Refresh with `node scripts/refresh-catalog.mjs --from <teamarness-checkout>`; never edit by hand. |
 | `backend/src/main.rs` | Starts the Backend through the vendored SDK. Keep it thin. |
 | `backend/tests/` | Exercises Backend behavior through the SDK test harness, with no protocol frames. |
 | `ui/src/index.ts` | Mounts the Package UI and communicates through the supplied `PackageClient`. |
@@ -51,6 +61,8 @@ The Agent configures an OpenAI-compatible model endpoint and replies to addresse
 | `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes into `dist/`. |
 | `scripts/validate-dist.mjs` | Applies Package Admission's rules to `dist/` and smoke-launches the Backend. |
 | `scripts/verify-vendor.mjs` | Fails when a vendored SDK file no longer matches recorded provenance. |
+| `scripts/verify-catalog.mjs` | Fails when a bundled catalog file no longer matches `backend/catalog/provenance.json` (`npm run check:catalog`). |
+| `scripts/refresh-catalog.mjs` | Copies Provider `ports.json` files from a Teamarness checkout and rewrites catalog provenance. |
 | `vendor/teamarness/` | Contains the generated copies of the Package Process Protocol and SDK source used by this project. |
 | `teamarness-authoring.json` | Records template, protocol, UI host, SDK provenance, and request namespace information. |
 | `Cargo.lock` and `package-lock.json` | Lock this project's Rust and JavaScript dependency graphs. Commit both. |
@@ -148,7 +160,7 @@ Package source, trust, Workspace enablement, synchronization, sharing, networkin
 
 Do not edit `dist/` after assembly. Any byte change makes the manifest declaration stale.
 
-The foundation assembler copies one Backend executable, `ui/dist/index.js`, and `ui-contract.json`. The manifest declares no assets. Keep the UI inside the single ESM bundle unless the product needs a different artifact shape.
+The foundation assembler copies one Backend executable, `ui/dist/index.js`, and `ui-contract.json`. The manifest declares no assets. The catalog and skills are compiled into the Backend, not shipped as files. Keep the UI inside the single ESM bundle unless the product needs a different artifact shape.
 
 If you add UI assets, another Backend, or another target platform, update all of the following together:
 

@@ -91,7 +91,19 @@
       "properties": {
         "id": { "type": "integer", "minimum": 1 },
         "role": { "type": "string", "enum": ["user", "assistant"] },
-        "content": { "type": "string", "minLength": 1, "maxLength": 16384 }
+        "content": { "type": "string", "minLength": 1, "maxLength": 16384 },
+        "activity": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "$ref": "#/$defs/activity" } }
+      }
+    },
+    "activity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "port", "ok"],
+      "properties": {
+        "package": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "port": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "ok": { "type": "boolean" },
+        "code": { "type": "string", "minLength": 1, "maxLength": 128 }
       }
     },
     "packageView": {

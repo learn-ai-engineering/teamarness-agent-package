@@ -11,7 +11,7 @@ npm ci
 npm run build
 ```
 
-Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance.
+Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies the bundled Provider contracts; both run as part of `npm test`.
 
 ## Register and configure
 
@@ -21,9 +21,46 @@ Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests an
 4. In a Workspace, choose an Agent you steward on this Installation, set its completion endpoint/model/instructions, and store its API key in the Agent UI.
 5. Open the **Chat** tab to talk to the configured model directly. The chat needs the endpoint, model and key but no binding; it is never posted to a Channel. The Backend keeps the transcript in memory only (up to 64 entries); a Backend restart clears it. `agent.chat.send` returns at once and the reply arrives through `agent.chat.changes`, because a completion can outlast the Host's 30 s UI request deadline.
 
+6. Optionally, in the **Packages** section of the Configuration tab, enable the Packages the Agent may use. See [Package tools](#package-tools).
+
 Rebuild and restart after code changes; no hot reload. Each Installation has separate configuration. Personal installation does not share keys or grant extra Workspace authority. The Backend has the current OS user's native authority and sends Channel context to the configured model endpoint.
 
 Changing only the source from bundled to local preserves the existing data-directory identity. Keep `dev.teamarness.agent` unchanged and leave the existing profile data in place. Do not copy/read/reset keys or application databases to perform this extraction.
+
+## Package tools
+
+The chat and Channel replies can use other installed Packages through Package Ports. Each turn offers the model the tools of the Packages that are usable now, plus the Agent's own compiled-in skills.
+
+- **Which Packages are listed.** A Provider contract is agent-facing only when it has a `runtime.guide` query. The **Packages** section lists every agent-facing contract the Agent knows, whether the Host reports it available, and a switch. Today only Exhibits has a guide, so only Exhibits is listed. Documents and Conversations are listed once `package-alignment` publishes their guides and the catalog is refreshed.
+- **Enablement.** The switch state is stored in `packages.json` (`{"schemaVersion": 1, "enabled": [identity]}`) in the Package Data Directory. A missing file means nothing is enabled. A Package is usable only when it is agent-facing, available and enabled. Documents and Exhibits are optional in the manifest, so the Agent installs and runs without them; a missing Package shows as **Unavailable**.
+- **What the model sees.** The system message has one line per usable Package, naming its guide tool (`<alias>__runtime_guide`), and one line per skill. The model reads a guide or a skill (`skill_read`) only on request. Tool output is data, not instructions. With nothing enabled, no tools are sent and the request is the same as before tools existed.
+- **What the Steward sees.** A chat answer that used Package operations shows a muted line such as "Used Exhibits: runtime.guide, exhibit.list". A failed call shows its code. Only the final text is kept as chat history.
+- **Replies.** The model is never offered `message.post`. The harness posts the final text of a reply turn exactly once. A turn that fails posts nothing and sets the status error. The trigger is persisted before the attempt and never retried.
+- **Calls.** Tool arguments are validated against the port's request schema before anything is sent. A disabled or unknown tool is refused locally, without reaching the Host. A Provider error reaches the model with its stable code, so it can recover in the same turn. A command is never re-sent; an unknown outcome is reported to the model as unknown.
+
+### Turn bounds and codes
+
+Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 characters per tool result, 96 KiB of messages and 180 seconds. These stable codes can appear:
+
+| Code | Meaning |
+|---|---|
+| `agent.turn_limit_exceeded` | A turn bound was exceeded. The turn ends; the chat or the status shows the code, and a reply posts nothing. |
+| `agent.tool_result_too_large` | One tool result was over the cap. The model sees this code instead of the result. |
+| `agent.tool_arguments_invalid` | The arguments are not JSON or fail the port's request schema. Not sent. |
+| `agent.tool_outcome_unknown` | A command was sent, but its outcome is unknown. Never re-sent. |
+| `agent.tool_unavailable` | The tool is unknown or not usable now. Also ends a turn whose tool set cannot be built. |
+| `agent.unknown_package` | The UI asked to enable a contract that is not agent-facing. |
+
+### Refresh the bundled catalog
+
+`backend/catalog/` holds verbatim copies of Provider `ports.json` files, and `backend/catalog/provenance.json` records their Teamarness revision and digests. To refresh them from a Teamarness checkout:
+
+```sh
+node scripts/refresh-catalog.mjs --from <teamarness-checkout>
+npm run check:catalog
+```
+
+Then update the version ranges in `teamarness.package.json`. The `manifest_and_catalog_agree` test fails until the manifest and the catalog declare the same contracts, versions and ports.
 
 ## Optional Teamarness integration qualification
 
@@ -55,4 +92,4 @@ The `agent-package` workstream records the passing consolidated review and valid
 
 The developer observed real-endpoint replies, Personal Package discovery, retained configuration after restart, and an offline-addressed reply visible at first inspection after the Steward returned. This is limited manual evidence, not exhaustive desktop coverage or measured latency. It was not repeated after the Host merge. Local verification does not authorize source push, remote creation, or publication.
 
-Key-at-rest protection beyond file mode `0600`, streaming, tools, Documents participation, scheduled posts, supported SDK publication, and stronger Package isolation need separate Scopes. The Teamarness roadmap owns those follow-ups. Incoming Teamarness Documents limitations and its record-log JSON authoring-schema mismatch remain separate upstream debt, not cleared by Agent qualification.
+Key-at-rest protection beyond file mode `0600`, streaming, Documents participation (pending its `runtime.guide`), file uploads through Package tools, scheduled posts, supported SDK publication, and stronger Package isolation need separate Scopes. The Teamarness roadmap owns those follow-ups. Incoming Teamarness Documents limitations and its record-log JSON authoring-schema mismatch remain separate upstream debt, not cleared by Agent qualification.

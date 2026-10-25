@@ -211,6 +211,7 @@ describe("Agent Package UI controller", () => {
     expect(describeChatError("agent.not_configured")).toBe("Add the endpoint, model and API key on the Configuration tab first.");
     expect(describeChatError("agent.endpoint_unreachable")).toBe("The endpoint could not be reached. Try again.");
     expect(describeChatError("agent.chat_interrupted")).toBe("The reply was interrupted. Send the message again.");
+    expect(describeChatError("agent.turn_limit_exceeded")).toBe("The reply needed more steps than one turn allows. Ask for something smaller.");
     expect(describeChatError("agent.something_new")).toBe("agent.something_new");
   });
 
@@ -432,6 +433,74 @@ describe("Agent Package UI tabs and chat", () => {
     await flush();
     expect(fake.calls.some((call) => call.operation === "agent.chat.clear")).toBe(true);
     expect(chat.querySelectorAll(".chat-entry")).toHaveLength(0);
+    await cleanup();
+  });
+});
+
+describe("Agent Package UI chat activity", () => {
+  async function chatWith(entries: Chat["entries"]) {
+    const backend = fakeBackend({ status: { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } } });
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
+    await backend.fake.emit("agent.chat.changes", { entries, pending: false } satisfies PackageValue);
+    const items = Array.from(root.querySelectorAll<HTMLElement>(".chat-entry"));
+    const cleanup = async () => {
+      await unmount();
+      host.remove();
+    };
+    return { items, cleanup };
+  }
+
+  it("shows the Package operations an answer used, grouped by package", async () => {
+    const { items, cleanup } = await chatWith([
+      { id: 1, role: "user", content: "What exhibits are there?" },
+      {
+        id: 2,
+        role: "assistant",
+        content: "One: Q3 review.",
+        activity: [
+          { package: "exhibits", port: "runtime.guide", ok: true },
+          { package: "agent", port: "skill_read", ok: true },
+          { package: "exhibits", port: "exhibit.list", ok: true },
+        ],
+      },
+    ]);
+    const line = items[1]?.querySelector<HTMLElement>('[data-role="chat-activity"]');
+    expect(line?.textContent).toBe("Used Exhibits: runtime.guide, exhibit.list; Agent: skill_read");
+    // Plain text after the answer, read by screen readers in order.
+    expect(line?.getAttribute("aria-hidden")).toBeNull();
+    expect(line?.previousElementSibling?.className).toBe("chat-content");
+    expect(line?.classList.contains("teamarness-section")).toBe(false);
+    await cleanup();
+  });
+
+  it("shows no activity line for an answer without activity", async () => {
+    const { items, cleanup } = await chatWith([
+      { id: 1, role: "user", content: "Hello" },
+      { id: 2, role: "assistant", content: "Hi." },
+    ]);
+    expect(items).toHaveLength(2);
+    for (const item of items) expect(item.querySelector('[data-role="chat-activity"]')).toBeNull();
+    await cleanup();
+  });
+
+  it("shows the code of a failed call", async () => {
+    const { items, cleanup } = await chatWith([
+      {
+        id: 1,
+        role: "assistant",
+        content: "That type is not allowed.",
+        activity: [
+          { package: "exhibits", port: "draft.update", ok: false, code: "exhibits.type_refused" },
+          { package: "exhibits", port: "exhibit.list", ok: true },
+        ],
+      },
+    ]);
+    expect(items[0]?.querySelector('[data-role="chat-activity"]')?.textContent).toBe(
+      "Used Exhibits: draft.update (failed: exhibits.type_refused), exhibit.list",
+    );
     await cleanup();
   });
 });

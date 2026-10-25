@@ -12,9 +12,10 @@ use std::sync::Mutex;
 use serde::Serialize;
 use tokio::sync::watch;
 
-use crate::model::{ChatMessage, ModelFailure};
+use crate::model::ChatMessage;
 use crate::status::StatusError;
 use crate::tools::ToolContext;
+use crate::turn::{Activity, TurnOutcome};
 
 /// The contract bound on one message the Steward sends.
 pub const MAX_INPUT_CHARS: usize = 8192;
@@ -24,6 +25,10 @@ pub const MAX_ENTRY_CHARS: usize = 16_384;
 pub const MAX_ENTRIES: usize = 64;
 /// Keeps every view well inside one protocol frame, whatever the content escapes to.
 pub const MAX_TRANSCRIPT_CHARS: usize = 65_536;
+/// The contract bound on one entry's activity. A turn's tool-call budget is never larger, so a
+/// turn's activity always fits whole.
+pub const MAX_ACTIVITY: usize = 16;
+const _: () = assert!(crate::turn::TurnBounds::PRODUCTION.tool_calls <= MAX_ACTIVITY);
 
 /// A turn is already in flight; sending again after it settles may succeed.
 pub const CHAT_BUSY: &str = "agent.chat_busy";
@@ -47,6 +52,9 @@ pub struct ChatEntry {
     pub id: u64,
     pub role: ChatRole,
     pub content: String,
+    /// The Package operations the answer used, in order; absent when it used none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Vec<Activity>>,
 }
 
 /// The exact UI-contract `chat` shape.
@@ -64,6 +72,19 @@ pub struct ChatView {
 pub struct Turn {
     pub generation: u64,
     pub messages: Vec<ChatMessage>,
+}
+
+impl Turn {
+    /// The system text and the history after it, as [`crate::turn::Turn::new`] takes them.
+    #[must_use]
+    pub fn into_parts(self) -> (String, Vec<ChatMessage>) {
+        let mut messages = self.messages.into_iter();
+        let system = match messages.next() {
+            Some(ChatMessage::System { content }) => content,
+            _ => String::new(),
+        };
+        (system, messages.collect())
+    }
 }
 
 /// The transcript and its single in-flight turn. Pure; [`ChatCell`] publishes it.
@@ -110,7 +131,7 @@ impl ChatSession {
         if self.pending {
             return Err(CHAT_BUSY);
         }
-        self.push(ChatRole::User, content.to_owned());
+        self.push(ChatRole::User, content.to_owned(), None);
         self.pending = true;
         self.last_error = None;
         self.generation += 1;
@@ -132,22 +153,28 @@ impl ChatSession {
         })
     }
 
-    /// Settles the turn `generation` started. Returns whether it was still the current turn.
-    pub fn finish(&mut self, generation: u64, outcome: Result<String, ModelFailure>) -> bool {
+    /// Settles the turn `generation` started with how its turn ended. Returns whether it was
+    /// still the current turn.
+    ///
+    /// Only the final text is kept, with the turn's activity beside it; the tool exchange itself
+    /// never becomes history for later turns.
+    pub fn finish(&mut self, generation: u64, outcome: TurnOutcome) -> bool {
         if !self.pending || generation != self.generation {
             return false;
         }
         self.pending = false;
         match outcome {
-            Ok(text) => {
-                let text = truncate_chars(text.trim(), MAX_ENTRY_CHARS);
+            TurnOutcome::Done(result) => {
+                let text = truncate_chars(result.text.trim(), MAX_ENTRY_CHARS);
                 if text.is_empty() {
                     self.fail(crate::model::MODEL_ERROR, false);
                 } else {
-                    self.push(ChatRole::Assistant, text);
+                    let activity = (!result.activity.is_empty()).then_some(result.activity);
+                    self.push(ChatRole::Assistant, text, activity);
                 }
             }
-            Err(failure) => self.fail(failure.code, failure.retryable),
+            TurnOutcome::Failed(code, retryable) => self.fail(code, retryable),
+            TurnOutcome::Cancelled => self.fail(CHAT_INTERRUPTED, true),
         }
         true
     }
@@ -176,23 +203,20 @@ impl ChatSession {
         });
     }
 
-    fn push(&mut self, role: ChatRole, content: String) {
+    fn push(&mut self, role: ChatRole, content: String, activity: Option<Vec<Activity>>) {
         self.next_id += 1;
         self.entries.push_back(ChatEntry {
             id: self.next_id,
             role,
             content,
+            activity,
         });
-        let mut total: usize = self
-            .entries
-            .iter()
-            .map(|entry| entry.content.chars().count())
-            .sum();
+        let mut total: usize = self.entries.iter().map(weight).sum();
         while self.entries.len() > MAX_ENTRIES || total > MAX_TRANSCRIPT_CHARS {
             let Some(oldest) = self.entries.pop_front() else {
                 break;
             };
-            total -= oldest.content.chars().count();
+            total -= weight(&oldest);
         }
     }
 }
@@ -219,6 +243,21 @@ pub fn system_message(
     }
     tools.append_to(&mut text);
     text
+}
+
+/// What one entry counts against [`MAX_TRANSCRIPT_CHARS`]: its text and its activity labels.
+fn weight(entry: &ChatEntry) -> usize {
+    let activity: usize = entry
+        .activity
+        .iter()
+        .flatten()
+        .map(|item| {
+            item.package.chars().count()
+                + item.port.chars().count()
+                + item.code.as_deref().map_or(0, |code| code.chars().count())
+        })
+        .sum();
+    entry.content.chars().count() + activity
 }
 
 fn truncate_chars(text: &str, limit: usize) -> String {
@@ -284,6 +323,13 @@ impl ChatCell {
 mod tests {
     use super::*;
 
+    fn done(text: String) -> TurnOutcome {
+        TurnOutcome::Done(crate::turn::TurnResult {
+            text,
+            activity: Vec::new(),
+        })
+    }
+
     fn begin(session: &mut ChatSession, content: &str, context: usize) -> Turn {
         session.begin(content, "system".into(), context).unwrap()
     }
@@ -299,7 +345,7 @@ mod tests {
                 ChatMessage::user("one".into())
             ]
         );
-        assert!(session.finish(first.generation, Ok(" first reply ".into())));
+        assert!(session.finish(first.generation, done(" first reply ".into())));
         let second = begin(&mut session, "two", 20);
         assert_eq!(
             second.messages,
@@ -310,7 +356,7 @@ mod tests {
                 ChatMessage::user("two".into()),
             ]
         );
-        session.finish(second.generation, Ok("second".into()));
+        session.finish(second.generation, done("second".into()));
 
         // A smaller context sees fewer earlier entries; zero sees only the new message.
         let narrow = begin(&mut session, "three", 1);
@@ -322,7 +368,7 @@ mod tests {
                 ChatMessage::user("three".into()),
             ]
         );
-        session.finish(narrow.generation, Ok("third".into()));
+        session.finish(narrow.generation, done("third".into()));
         let none = begin(&mut session, "four", 0);
         assert_eq!(
             none.messages,
@@ -372,11 +418,8 @@ mod tests {
     fn failures_are_recorded_and_the_next_send_clears_them() {
         let mut session = ChatSession::default();
         let turn = begin(&mut session, "hi", 4);
-        let failure = ModelFailure {
-            code: crate::model::ENDPOINT_UNREACHABLE,
-            retryable: true,
-        };
-        assert!(session.finish(turn.generation, Err(failure)));
+        let failure = TurnOutcome::Failed(crate::model::ENDPOINT_UNREACHABLE, true);
+        assert!(session.finish(turn.generation, failure));
         let view = session.view();
         assert!(!view.pending);
         assert_eq!(view.entries.len(), 1);
@@ -389,7 +432,7 @@ mod tests {
         );
         let retry = begin(&mut session, "hi again", 4);
         assert_eq!(session.view().last_error, None);
-        assert!(session.finish(retry.generation, Ok("   ".into())));
+        assert!(session.finish(retry.generation, done("   ".into())));
         assert_eq!(
             session.view().last_error.unwrap().code,
             crate::model::MODEL_ERROR
@@ -401,7 +444,7 @@ mod tests {
         let mut session = ChatSession::default();
         let cleared = begin(&mut session, "one", 4);
         session.clear();
-        assert!(!session.finish(cleared.generation, Ok("late".into())));
+        assert!(!session.finish(cleared.generation, done("late".into())));
         assert_eq!(session.view(), ChatSession::default().view());
 
         let interrupted = begin(&mut session, "two", 4);
@@ -409,12 +452,12 @@ mod tests {
         let view = session.view();
         assert!(!view.pending);
         assert_eq!(view.last_error.unwrap().code, CHAT_INTERRUPTED);
-        assert!(!session.finish(interrupted.generation, Ok("late".into())));
+        assert!(!session.finish(interrupted.generation, done("late".into())));
         assert_eq!(session.view().entries.len(), 1);
 
         // A new turn after an interruption settles normally.
         let next = begin(&mut session, "three", 4);
-        assert!(session.finish(next.generation, Ok("answer".into())));
+        assert!(session.finish(next.generation, done("answer".into())));
         assert_eq!(session.view().entries.last().unwrap().content, "answer");
     }
 
@@ -423,7 +466,7 @@ mod tests {
         let mut session = ChatSession::default();
         for index in 0..MAX_ENTRIES {
             let turn = begin(&mut session, &format!("message {index}"), 0);
-            session.finish(turn.generation, Ok(format!("reply {index}")));
+            session.finish(turn.generation, done(format!("reply {index}")));
         }
         let view = session.view();
         assert_eq!(view.entries.len(), MAX_ENTRIES);
@@ -439,7 +482,7 @@ mod tests {
         let mut session = ChatSession::default();
         for _ in 0..8 {
             let turn = begin(&mut session, &"u".repeat(MAX_INPUT_CHARS), 0);
-            session.finish(turn.generation, Ok("r".repeat(MAX_ENTRY_CHARS + 10)));
+            session.finish(turn.generation, done("r".repeat(MAX_ENTRY_CHARS + 10)));
         }
         let view = session.view();
         let total: usize = view
@@ -559,6 +602,82 @@ mod tests {
         assert!(!text.contains(&guide.description));
         assert!(!text.contains(&skills[0].body));
         assert!(!text.contains("Upload files in chunks"));
+    }
+
+    #[test]
+    fn an_answer_keeps_its_activity_and_only_its_text_becomes_history() {
+        use crate::turn::{Activity, TurnResult};
+
+        let mut session = ChatSession::default();
+        let turn = begin(&mut session, "what exhibits are there?", 4);
+        let (system, history) = turn.clone().into_parts();
+        assert_eq!(system, "system");
+        assert_eq!(history, turn.messages[1..]);
+        let activity = vec![
+            Activity {
+                package: "exhibits".into(),
+                port: "runtime.guide".into(),
+                ok: true,
+                code: None,
+            },
+            Activity {
+                package: "exhibits".into(),
+                port: "draft.update".into(),
+                ok: false,
+                code: Some("exhibits.type_refused".into()),
+            },
+        ];
+        assert!(session.finish(
+            turn.generation,
+            TurnOutcome::Done(TurnResult {
+                text: "One Exhibit.".into(),
+                activity: activity.clone(),
+            })
+        ));
+        let entry = session.view().entries[1].clone();
+        assert_eq!(entry.activity, Some(activity));
+        assert_eq!(
+            serde_json::to_value(&entry).unwrap()["activity"][1],
+            serde_json::json!({
+                "package": "exhibits", "port": "draft.update", "ok": false,
+                "code": "exhibits.type_refused",
+            })
+        );
+        // No activity is no field at all; the Steward's entries never carry one.
+        let next = begin(&mut session, "thanks", 4);
+        assert_eq!(
+            next.messages[1..],
+            [
+                ChatMessage::user("what exhibits are there?".into()),
+                ChatMessage::assistant("One Exhibit.".into()),
+                ChatMessage::user("thanks".into()),
+            ]
+        );
+        session.finish(next.generation, done("Welcome.".into()));
+        let view = serde_json::to_value(session.view()).unwrap();
+        assert_eq!(view["entries"][0].get("activity"), None);
+        assert_eq!(view["entries"][3].get("activity"), None);
+    }
+
+    #[test]
+    fn turn_failures_and_cancellation_are_chat_failures() {
+        let mut session = ChatSession::default();
+        let turn = begin(&mut session, "hi", 4);
+        assert!(session.finish(
+            turn.generation,
+            TurnOutcome::Failed(crate::turn::TURN_LIMIT_EXCEEDED, false)
+        ));
+        assert_eq!(
+            session.view().last_error,
+            Some(StatusError {
+                code: crate::turn::TURN_LIMIT_EXCEEDED.into(),
+                retryable: false
+            })
+        );
+        assert_eq!(session.view().entries.len(), 1);
+        let turn = begin(&mut session, "again", 4);
+        assert!(session.finish(turn.generation, TurnOutcome::Cancelled));
+        assert_eq!(session.view().last_error.unwrap().code, CHAT_INTERRUPTED);
     }
 
     #[test]

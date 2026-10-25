@@ -39,11 +39,12 @@ use access::{Availability, PackageView};
 use catalog::{BundledCatalog, Catalog};
 use chat::{ChatCell, ChatView};
 use harness::{HarnessInputs, TaskHandle};
-use model::ModelClient;
+use model::{ConfiguredModel, ModelClient};
 use packages::PackagesStore;
 use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
+use turn::ToolExecutor;
 
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, json!({}))
@@ -112,6 +113,8 @@ struct ChatConfig {
     system_prompt: String,
     context_messages: usize,
     api_key: String,
+    /// The Steward's enabled Packages when the turn starts.
+    enabled: Vec<String>,
 }
 
 impl AgentActive {
@@ -173,6 +176,8 @@ impl AgentActive {
             settings: self.settings.clone(),
             status: self.status.clone(),
             progress: self.progress.clone(),
+            packages: self.packages.clone(),
+            catalog: self.catalog,
         })
     }
 
@@ -237,6 +242,7 @@ impl AgentActive {
         cancellation: &CancellationToken,
     ) -> Result<Option<ChatConfig>, BackendError> {
         let settings = self.settings.clone();
+        let packages = self.packages.clone();
         teamarness_package_sdk::blocking(cancellation, move |cancel| {
             if cancel.is_cancelled() {
                 return Err(storage_failed());
@@ -249,51 +255,79 @@ impl AgentActive {
             let Some(api_key) = store.api_key().map_err(|_| storage_failed())? else {
                 return Ok(None);
             };
+            let enabled = packages
+                .lock()
+                .map_err(|_| storage_failed())?
+                .enabled()
+                .to_vec();
             Ok(Some(ChatConfig {
                 endpoint_base_url: current.endpoint_base_url.clone(),
                 model: current.model.clone(),
                 system_prompt: current.system_prompt.clone(),
                 context_messages: current.context_messages as usize,
                 api_key,
+                enabled,
             }))
         })
         .await
     }
 
-    /// Records the Steward's message and starts its completion in the background, so the
-    /// request answers before the Host's UI deadline whatever the model takes.
+    /// Records the Steward's message and starts its turn in the background, so the request
+    /// answers before the Host's UI deadline whatever the model takes.
+    ///
+    /// The turn offers the tools of the Packages usable now. Availability is read before
+    /// anything is recorded, and only when a Package is enabled; the Host's deadline bounds it,
+    /// as it does for `agent.packages.get`.
     async fn start_chat(
         &self,
         content: &str,
         config: ChatConfig,
     ) -> Result<ChatView, BackendError> {
+        let usable = access::usable_now(self.catalog, self.ports.as_ref(), &config.enabled).await;
         let name = self.status.agent().and_then(|agent| agent.name);
         let system = chat::system_message(
             name.as_deref(),
             &config.system_prompt,
-            &tools::ToolContext::default(),
+            &tools::ToolContext::for_turn(&usable, skills::bundled()),
         );
         let (turn, view) = self
             .chat
             .update(|session| session.begin(content, system, config.context_messages));
         let turn = turn.map_err(|code| error(code, code == chat::CHAT_BUSY))?;
         let cell = self.chat.clone();
+        let ports = self.ports.clone();
         let task = TaskHandle::spawn(&self.cancellation, move |cancellation| async move {
-            let outcome = match ModelClient::new() {
-                Ok(client) => tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => return,
-                    completion = client.complete(
-                        &config.endpoint_base_url,
-                        &config.model,
-                        &turn.messages,
-                        &config.api_key,
-                    ) => completion,
-                },
-                Err(failure) => Err(failure),
+            let generation = turn.generation;
+            let (system, history) = turn.into_parts();
+            let outcome = match (
+                ModelClient::new(),
+                tools::Toolset::for_turn(&usable, ports, skills::bundled()),
+            ) {
+                (Ok(client), Ok(toolset)) => {
+                    let ChatConfig {
+                        endpoint_base_url,
+                        model,
+                        api_key,
+                        ..
+                    } = config;
+                    let model = ConfiguredModel::new(client, endpoint_base_url, model, api_key);
+                    let turn = turn::Turn::new(
+                        system,
+                        history,
+                        toolset.definitions().to_vec(),
+                        turn::TurnBounds::PRODUCTION,
+                    );
+                    turn::drive(turn, &model, &toolset, &cancellation).await
+                }
+                (Err(failure), _) => turn::TurnOutcome::Failed(failure.code, failure.retryable),
+                // The bundled catalog always loads; a tool set that cannot be built is reported,
+                // never a panic.
+                (_, Err(_)) => turn::TurnOutcome::Failed(turn::TOOL_UNAVAILABLE, false),
             };
-            drop(config);
-            cell.update(|session| session.finish(turn.generation, outcome));
+            if outcome == turn::TurnOutcome::Cancelled {
+                return;
+            }
+            cell.update(|session| session.finish(generation, outcome));
         });
         // Any earlier task has settled or belongs to a cleared generation.
         let previous = self.tasks.lock().await.chat.replace(task);

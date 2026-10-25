@@ -29,6 +29,7 @@ const GENERAL: &str = "00000000000000000000000000000000";
 const SIDE: &str = "10000000000000000000000000000001";
 const SECRET: &str = "sk-or-v1-SENTINEL-NEVER-SHOWN-0123456789";
 const DEADLINE: Duration = Duration::from_secs(15);
+const EXHIBITS: &str = "dev.teamarness.exhibits";
 
 fn empty() -> Value {
     json!({})
@@ -48,6 +49,13 @@ enum Behaviour {
     Hold(Arc<Notify>, String),
     /// Close the connection without answering.
     Drop,
+    /// `200` with an assistant message that calls these tools, as `(id, name, arguments)`.
+    ToolCalls(Vec<(String, String, String)>),
+}
+
+/// One scripted tool call, as [`Behaviour::ToolCalls`] takes it.
+fn call(id: &str, name: &str, arguments: &str) -> (String, String, String) {
+    (id.into(), name.into(), arguments.into())
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +170,7 @@ async fn serve(
     let (status, body) = match behaviour {
         Behaviour::Drop => return,
         Behaviour::Reply(text) => (200, completion(&text)),
+        Behaviour::ToolCalls(calls) => (200, tool_calls(&calls)),
         Behaviour::Status(status, body) => (status, body),
         Behaviour::Hold(release, text) => {
             release.notified().await;
@@ -185,6 +194,19 @@ async fn serve(
 fn completion(text: &str) -> String {
     json!({"id": "cmpl-1", "choices": [{"index": 0, "message": {"role": "assistant", "content": text}}]})
         .to_string()
+}
+
+fn tool_calls(calls: &[(String, String, String)]) -> String {
+    let calls: Vec<Value> = calls
+        .iter()
+        .map(|(id, name, arguments)| {
+            json!({"id": id, "type": "function", "function": {"name": name, "arguments": arguments}})
+        })
+        .collect();
+    json!({"id": "cmpl-1", "choices": [{"index": 0, "message": {
+        "role": "assistant", "content": null, "tool_calls": calls,
+    }}]})
+    .to_string()
 }
 
 // ------------------------------------------------------------------
@@ -226,6 +248,10 @@ struct ConversationsState {
     /// `(channelId, markdown)` of every `message.post` the harness issued, accepted or not.
     posts: Vec<(String, String)>,
     post_mode: Option<PostMode>,
+    /// `(port, kind, request)` of every Exhibits invoke the Agent issued.
+    exhibits_calls: Vec<(String, String, Value)>,
+    /// One-shot Provider errors, by Exhibits port.
+    exhibits_errors: HashMap<String, VecDeque<&'static str>>,
 }
 
 #[derive(Clone, Default)]
@@ -312,9 +338,62 @@ impl FakeConversations {
         self.state.lock().unwrap().posts.clone()
     }
 
+    fn exhibits_calls(&self) -> Vec<(String, String, Value)> {
+        self.state.lock().unwrap().exhibits_calls.clone()
+    }
+
+    /// The next Exhibits call to `port` fails with this Provider `code`.
+    fn fail_exhibits_once(&self, port: &str, code: &'static str) {
+        self.state
+            .lock()
+            .unwrap()
+            .exhibits_errors
+            .entry(port.into())
+            .or_default()
+            .push_back(code);
+    }
+
+    /// The scripted Exhibits Provider: its guide, one Exhibit, and any scripted error.
+    fn exhibits(&self, port: &str, kind: &str, request: &Value) -> Result<Value, BackendError> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .exhibits_calls
+            .push((port.into(), kind.into(), request.clone()));
+        if let Some(code) = state
+            .exhibits_errors
+            .get_mut(port)
+            .and_then(VecDeque::pop_front)
+        {
+            return Err(BackendError::new(code, false, empty()));
+        }
+        match port {
+            "runtime.guide" => Ok(json!({"guide": "List Exhibits with exhibit.list."})),
+            "exhibit.list" => {
+                Ok(json!({"exhibits": [{"exhibitId": "q3-review", "title": "Q3 review"}]}))
+            }
+            _ => Err(BackendError::new("exhibits.not_found", false, empty())),
+        }
+    }
+
     fn capability(&self) -> ScriptedCapability {
         let fake = self.clone();
         ScriptedCapability::new().calls(move |method, payload| {
+            // The Host lists every contract the manifest declares; Exhibits is installed here,
+            // Documents is not.
+            if method == "available" {
+                return Ok(json!({"contracts": [
+                    {"contract": "dev.teamarness.conversations", "major": 1, "minor": 2, "available": true, "ports": []},
+                    {"contract": "dev.teamarness.documents", "major": 1, "minor": 1, "available": false, "ports": []},
+                    {"contract": EXHIBITS, "major": 1, "minor": 0, "available": true, "ports": []},
+                ]}));
+            }
+            if method == "invoke" && payload["contract"] == EXHIBITS {
+                return fake.exhibits(
+                    payload["port"].as_str().unwrap_or_default(),
+                    payload["kind"].as_str().unwrap_or_default(),
+                    &payload["request"],
+                );
+            }
             if method != "invoke" {
                 return Err(BackendError::new(
                     "capability_request_invalid",
@@ -1720,5 +1799,601 @@ async fn chat_answers_the_steward_directly_and_never_posts() {
         "the chat posted to a Channel"
     );
     assert_no_secret(ports, data.path());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+// ------------------------------------------------------------------
+// Package tools in chat and replies
+// ------------------------------------------------------------------
+
+/// Stores endpoint, model, prompt and key, without binding an Agent.
+async fn configure(harness: &mut Harness, stub: &StubEndpoint) {
+    harness
+        .request(
+            "agent.settings.set",
+            json!({"settings": {
+                "endpointBaseUrl": stub.base_url,
+                "model": "stub/model-1",
+                "systemPrompt": "Be brief.",
+                "contextMessages": 20,
+            }}),
+        )
+        .await
+        .unwrap();
+    harness
+        .request("agent.key.set", json!({"apiKey": SECRET}))
+        .await
+        .unwrap();
+}
+
+async fn set_exhibits(harness: &mut Harness, enabled: bool) {
+    let view = harness
+        .request(
+            "agent.packages.set",
+            json!({"contract": EXHIBITS, "enabled": enabled}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view["packages"][0]["enabled"], enabled, "{view}");
+    assert_eq!(view["packages"][0]["available"], true, "{view}");
+}
+
+/// Sends one chat message and waits for its turn to settle.
+async fn chat(harness: &mut Harness, content: &str) -> Value {
+    let before = harness.request("agent.chat.get", empty()).await.unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .len();
+    harness
+        .request("agent.chat.send", json!({"content": content}))
+        .await
+        .unwrap();
+    wait_chat(harness, "the chat turn", |chat| {
+        chat["pending"] == false && chat["entries"].as_array().unwrap().len() > before
+    })
+    .await
+}
+
+/// The names of the tools a model request offered; `None` when it has no `tools` field.
+fn offered(body: &Value) -> Option<Vec<String>> {
+    body.get("tools").map(|tools| {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| {
+                assert_eq!(tool["type"], "function");
+                tool["function"]["name"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    })
+}
+
+fn last_message(body: &Value) -> Value {
+    body["messages"].as_array().unwrap().last().unwrap().clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_uses_an_enabled_package_and_records_activity() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let harness = &mut fixture.harness;
+    harness.activate().await.unwrap();
+    configure(harness, &stub).await;
+    set_exhibits(harness, true).await;
+
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "exhibits__exhibit_list",
+        "{}",
+    )]));
+    stub.push(Behaviour::Reply("There is one Exhibit: Q3 review.".into()));
+    let answered = chat(harness, "what exhibits are there?").await;
+    assert_eq!(answered.get("lastError"), None, "{answered}");
+    assert_eq!(
+        answered["entries"][1],
+        json!({
+            "id": 2, "role": "assistant", "content": "There is one Exhibit: Q3 review.",
+            "activity": [{"package": "exhibits", "port": "exhibit.list", "ok": true}],
+        })
+    );
+    // The Steward's own entry carries no activity.
+    assert_eq!(answered["entries"][0].get("activity"), None);
+    assert_eq!(
+        conversations.exhibits_calls(),
+        vec![("exhibit.list".to_owned(), "query".to_owned(), json!({}))]
+    );
+
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    let tools = offered(&requests[0].body).expect("tools are offered");
+    for name in [
+        "exhibits__runtime_guide",
+        "exhibits__exhibit_list",
+        "skill_read",
+    ] {
+        assert!(tools.contains(&name.to_owned()), "{tools:?}");
+    }
+    assert!(
+        tools
+            .iter()
+            .all(|name| !name.starts_with("conversations__")),
+        "{tools:?}"
+    );
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("`exhibits__runtime_guide`"), "{system}");
+    assert!(system.contains("- teamarness-packages: "), "{system}");
+    // The second model request carries the call and its result.
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "{messages:?}");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert_eq!(messages[2]["tool_calls"][0]["id"], "call-1");
+    assert_eq!(messages[3]["role"], "tool");
+    assert_eq!(messages[3]["tool_call_id"], "call-1");
+    let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["exhibits"][0]["title"], "Q3 review");
+
+    // Only final text is kept as history: the next turn sees no tool exchange.
+    stub.push(Behaviour::Reply("You're welcome.".into()));
+    chat(harness, "thanks").await;
+    let third = stub.requests().pop().unwrap();
+    let messages = third.body["messages"].as_array().unwrap();
+    assert_eq!(
+        messages[1..],
+        [
+            json!({"role": "user", "content": "what exhibits are there?"}),
+            json!({"role": "assistant", "content": "There is one Exhibit: Q3 review."}),
+            json!({"role": "user", "content": "thanks"}),
+        ]
+    );
+    assert!(conversations.posts().is_empty());
+    assert_no_secret(&fixture.ports, data.path());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+/// `(contract, port, kind, request)` of one recorded Port call.
+type PortCall = (String, String, String, Value);
+
+/// A Port caller that records every call and answers `document.list` with one Document.
+#[derive(Clone, Default)]
+struct RecordingPorts {
+    calls: Arc<Mutex<Vec<PortCall>>>,
+}
+
+impl teamarness_agent_package::tools::PortCaller for RecordingPorts {
+    fn query(
+        &self,
+        contract: &str,
+        port: &str,
+        request: Value,
+    ) -> impl Future<Output = Result<Value, BackendError>> + Send {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((contract.into(), port.into(), "query".into(), request));
+        let answer = if port == "document.list" {
+            Ok(json!({"documents": [{"documentId": "doc-1", "title": "Roadmap"}]}))
+        } else {
+            Err(BackendError::new("documents.not_found", false, empty()))
+        };
+        std::future::ready(answer)
+    }
+
+    fn command(
+        &self,
+        contract: &str,
+        port: &str,
+        request: Value,
+    ) -> impl Future<Output = Result<Value, BackendError>> + Send {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((contract.into(), port.into(), "command".into(), request));
+        std::future::ready(Err(BackendError::new("documents.refused", false, empty())))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_with_fixture_documents_contract_uses_document_list() {
+    use teamarness_agent_package::access::{self, Availability};
+    use teamarness_agent_package::catalog::parse_document;
+    use teamarness_agent_package::chat::{self, ChatSession};
+    use teamarness_agent_package::model::{ConfiguredModel, ModelClient};
+    use teamarness_agent_package::skills;
+    use teamarness_agent_package::tools::{ToolContext, Toolset};
+    use teamarness_agent_package::turn::{self, ToolExecutor, Turn, TurnBounds, TurnOutcome};
+
+    const DOCUMENTS: &str = "dev.teamarness.documents";
+    // The bundled Documents contract, plus the guide `package-alignment` will publish.
+    let mut document: Value =
+        serde_json::from_str(include_str!("../catalog/documents.ports.json")).unwrap();
+    let contract = document["contracts"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|contract| contract["identity"] == DOCUMENTS)
+        .unwrap();
+    contract["ports"].as_array_mut().unwrap().push(json!({
+        "name": "runtime.guide", "kind": "query", "description": "How to use Documents.",
+        "request": {"type": "object", "additionalProperties": false},
+        "response": {"type": "object"},
+    }));
+    let catalog = parse_document(&document.to_string()).unwrap();
+    let availability = Availability::parse(&json!({"contracts": [
+        {"contract": DOCUMENTS, "major": 1, "minor": 1, "available": true, "ports": []},
+    ]}));
+    let usable = access::usable(&catalog, &availability, &[DOCUMENTS.to_owned()]);
+    assert_eq!(usable.len(), 1);
+
+    let ports = RecordingPorts::default();
+    let tools = Toolset::for_turn(&usable, ports.clone(), skills::bundled()).unwrap();
+    let mut session = ChatSession::default();
+    let system = chat::system_message(
+        None,
+        "Be brief.",
+        &ToolContext::for_turn(&usable, skills::bundled()),
+    );
+    let started = session
+        .begin("what documents are in this Workspace?", system, 20)
+        .unwrap();
+    let generation = started.generation;
+    let (system, history) = started.into_parts();
+    assert!(system.contains("`documents__runtime_guide`"), "{system}");
+
+    let stub = StubEndpoint::start().await;
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "documents__document_list",
+        r#"{"limit": 10}"#,
+    )]));
+    stub.push(Behaviour::Reply("One Document: Roadmap.".into()));
+    let model = ConfiguredModel::new(
+        ModelClient::new().unwrap(),
+        stub.base_url.clone(),
+        "stub/model-1".into(),
+        SECRET.into(),
+    );
+    let outcome = turn::drive(
+        Turn::new(
+            system,
+            history,
+            tools.definitions().to_vec(),
+            TurnBounds::PRODUCTION,
+        ),
+        &model,
+        &tools,
+        &teamarness_package_sdk::CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(&outcome, TurnOutcome::Done(result) if result.text == "One Document: Roadmap.")
+    );
+    assert!(session.finish(generation, outcome));
+    let entries = serde_json::to_value(session.view()).unwrap()["entries"].clone();
+    assert_eq!(
+        entries[1],
+        json!({"id": 2, "role": "assistant", "content": "One Document: Roadmap.",
+               "activity": [{"package": "documents", "port": "document.list", "ok": true}]})
+    );
+    assert_eq!(
+        *ports.calls.lock().unwrap(),
+        vec![(
+            DOCUMENTS.to_owned(),
+            "document.list".to_owned(),
+            "query".to_owned(),
+            json!({"limit": 10})
+        )]
+    );
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        offered(&requests[0].body)
+            .unwrap()
+            .contains(&"documents__document_list".to_owned())
+    );
+    let result = last_message(&requests[1].body);
+    assert_eq!(result["role"], "tool");
+    assert!(
+        result["content"].as_str().unwrap().contains("Roadmap"),
+        "{result}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabled_package_tools_are_not_offered() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let harness = &mut fixture.harness;
+    harness.activate().await.unwrap();
+    configure(harness, &stub).await;
+    // Installed and once enabled, then disabled again.
+    set_exhibits(harness, true).await;
+    set_exhibits(harness, false).await;
+
+    // Even when the model names an Exhibits tool, it is refused here and never reaches the Host.
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "exhibits__exhibit_list",
+        "{}",
+    )]));
+    stub.push(Behaviour::Reply("I cannot list Exhibits.".into()));
+    let answered = chat(harness, "what exhibits are there?").await;
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert_eq!(offered(&request.body), None, "{}", request.body);
+        assert!(
+            !request.body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("exhibits__")
+        );
+    }
+    let refusal = last_message(&requests[1].body);
+    assert_eq!(refusal["role"], "tool");
+    assert_eq!(
+        serde_json::from_str::<Value>(refusal["content"].as_str().unwrap()).unwrap(),
+        json!({"error": "agent.tool_unavailable", "retryable": false})
+    );
+    assert!(conversations.exhibits_calls().is_empty());
+    // An unknown tool did no Package operation, so the answer shows none.
+    assert_eq!(answered["entries"][1].get("activity"), None, "{answered}");
+    assert_eq!(answered["entries"][1]["content"], "I cannot list Exhibits.");
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reply_uses_tool_then_posts_exactly_once() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 20).await;
+    set_exhibits(&mut fixture.harness, true).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
+
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "exhibits__exhibit_list",
+        "{}",
+    )]));
+    stub.push(Behaviour::Reply("We have one Exhibit: Q3 review.".into()));
+    say(
+        &conversations,
+        ports,
+        BOB_KEY,
+        "@Scout what exhibits are there?",
+    )
+    .await;
+    wait_until("the reply", || conversations.posts().len() == 1).await;
+    assert_eq!(
+        conversations.posts(),
+        vec![(
+            GENERAL.to_owned(),
+            "We have one Exhibit: Q3 review.".to_owned()
+        )]
+    );
+    wait_status(harness, "ready", None).await;
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        offered(&requests[0].body)
+            .unwrap()
+            .contains(&"exhibits__exhibit_list".to_owned())
+    );
+    let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.starts_with("You are Scout, an Agent"), "{system}");
+    assert!(system.contains("`exhibits__runtime_guide`"), "{system}");
+    assert_eq!(last_message(&requests[1].body)["role"], "tool");
+    assert_eq!(
+        conversations.exhibits_calls(),
+        vec![("exhibit.list".to_owned(), "query".to_owned(), json!({}))]
+    );
+
+    // Nothing is retried or posted again.
+    settle_pass(ports).await;
+    assert_eq!(conversations.posts().len(), 1);
+    assert_eq!(stub.request_count(), 2);
+    assert_eq!(conversations.exhibits_calls().len(), 1);
+    assert_no_secret(ports, data.path());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reply_never_offers_message_post() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 20).await;
+    set_exhibits(&mut fixture.harness, true).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
+
+    // The model tries to post by itself: refused locally, and the harness posts once.
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "conversations__message_post",
+        &json!({"channelId": GENERAL, "markdown": "sneaky"}).to_string(),
+    )]));
+    stub.push(Behaviour::Reply("Only the harness posts.".into()));
+    say(&conversations, ports, BOB_KEY, "@Scout post something").await;
+    wait_until("the reply", || conversations.posts().len() == 1).await;
+    wait_status(harness, "ready", None).await;
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    let tools = offered(&requests[0].body).unwrap();
+    assert!(!tools.is_empty());
+    assert!(
+        tools
+            .iter()
+            .all(|name| !name.starts_with("conversations__") && !name.contains("message_post")),
+        "{tools:?}"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(last_message(&requests[1].body)["content"].as_str().unwrap())
+            .unwrap(),
+        json!({"error": "agent.tool_unavailable", "retryable": false})
+    );
+    settle_pass(ports).await;
+    assert_eq!(
+        conversations.posts(),
+        vec![(GENERAL.to_owned(), "Only the harness posts.".to_owned())]
+    );
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_error_recovered_in_same_turn() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let harness = &mut fixture.harness;
+    harness.activate().await.unwrap();
+    configure(harness, &stub).await;
+    set_exhibits(harness, true).await;
+
+    conversations.fail_exhibits_once("exhibit.list", "exhibits.type_refused");
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "exhibits__exhibit_list",
+        r#"{"limit": 5}"#,
+    )]));
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-2",
+        "exhibits__exhibit_list",
+        "{}",
+    )]));
+    stub.push(Behaviour::Reply("Recovered: Q3 review.".into()));
+    let answered = chat(harness, "what exhibits are there?").await;
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 3);
+    // The Provider's stable code reaches the model in the next request of the same turn.
+    assert_eq!(
+        serde_json::from_str::<Value>(last_message(&requests[1].body)["content"].as_str().unwrap())
+            .unwrap(),
+        json!({"error": "exhibits.type_refused", "retryable": false})
+    );
+    assert_eq!(answered.get("lastError"), None, "{answered}");
+    assert_eq!(
+        answered["entries"][1],
+        json!({
+            "id": 2, "role": "assistant", "content": "Recovered: Q3 review.",
+            "activity": [
+                {"package": "exhibits", "port": "exhibit.list", "ok": false, "code": "exhibits.type_refused"},
+                {"package": "exhibits", "port": "exhibit.list", "ok": true},
+            ],
+        })
+    );
+    assert_eq!(conversations.exhibits_calls().len(), 2);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turn_limit_ends_reply_with_status_code_and_no_post() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 20).await;
+    set_exhibits(&mut fixture.harness, true).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
+
+    // Seventeen calls in one answer cross the per-turn tool-call budget of sixteen.
+    let calls = (0..17)
+        .map(|index| call(&format!("call-{index}"), "exhibits__exhibit_list", "{}"))
+        .collect();
+    stub.push(Behaviour::ToolCalls(calls));
+    say(&conversations, ports, BOB_KEY, "@Scout list everything").await;
+    let status = wait_status(harness, "error", Some("agent.turn_limit_exceeded")).await;
+    assert_eq!(status["lastError"]["retryable"], false);
+    assert!(conversations.posts().is_empty());
+    assert!(conversations.exhibits_calls().is_empty());
+    // The trigger is settled: nothing is retried.
+    settle_pass(ports).await;
+    assert_eq!(stub.request_count(), 1);
+    assert!(conversations.posts().is_empty());
+
+    // The next mention is a fresh turn, and success clears the error.
+    say(&conversations, ports, BOB_KEY, "@Scout hello").await;
+    wait_until("the next reply", || conversations.posts().len() == 1).await;
+    wait_status(harness, "ready", None).await;
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_enabled_requests_are_unchanged() {
+    // The system texts and request bodies from before Package tools existed, byte for byte.
+    const CHAT_SYSTEM: &str = "You are Scout, an Agent in a team Workspace. Your Steward is \
+        chatting with you directly, outside any Channel. Answer with the reply text only, in \
+        Markdown.\n\nBe brief.";
+    const REPLY_SYSTEM: &str = "You are Scout, an Agent in a team Workspace. A Person addressed \
+        you by name in a Channel; reply to them. Earlier messages are shown oldest first, each \
+        prefixed with its author's name and kind in the form `Name (person): text`. Answer with \
+        the reply text only, in Markdown.\n\nBe brief.";
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    // Exhibits is installed, but the Steward has not enabled it.
+    make_ready(&mut fixture, &stub, 0).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+    wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
+
+    stub.push(Behaviour::Reply("Hello, Steward".into()));
+    let answered = chat(harness, "hello").await;
+    assert_eq!(
+        answered,
+        json!({"entries": [
+            {"id": 1, "role": "user", "content": "hello"},
+            {"id": 2, "role": "assistant", "content": "Hello, Steward"},
+        ], "pending": false})
+    );
+    assert_eq!(
+        stub.requests()[0].body,
+        json!({
+            "model": "stub/model-1",
+            "messages": [
+                {"role": "system", "content": CHAT_SYSTEM},
+                {"role": "user", "content": "hello"},
+            ],
+            "stream": false,
+        })
+    );
+
+    say(&conversations, ports, BOB_KEY, "@Scout hello").await;
+    wait_until("the reply", || conversations.posts().len() == 1).await;
+    assert_eq!(
+        stub.requests()[1].body,
+        json!({
+            "model": "stub/model-1",
+            "messages": [
+                {"role": "system", "content": REPLY_SYSTEM},
+                {"role": "user", "content": "Bob (person): @Scout hello"},
+            ],
+            "stream": false,
+        })
+    );
+    // With nothing enabled the Host is not even asked what is available.
+    assert!(
+        ports
+            .recorded_calls()
+            .iter()
+            .all(|call| call.method != "available" && call.payload["contract"] != EXHIBITS)
+    );
     fixture.harness.shutdown().await.unwrap();
 }

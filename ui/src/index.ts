@@ -11,9 +11,9 @@ import {
   type PackageSubscription,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
-import type { AgentContract, Candidate, Chat, PackageView, Settings, Status } from "./contract.generated";
+import type { Activity, AgentContract, Candidate, Chat, PackageView, Settings, Status } from "./contract.generated";
 
-export type { Candidate, Chat, PackageView, Settings, Status };
+export type { Activity, Candidate, Chat, PackageView, Settings, Status };
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -88,9 +88,35 @@ export function describeChatError(code: string): string {
       return "The endpoint rejected the request. Check the endpoint, model and API key.";
     case "agent.model_error":
       return "The model did not return a usable reply.";
+    case "agent.turn_limit_exceeded":
+      return "The reply needed more steps than one turn allows. Ask for something smaller.";
     default:
       return code;
   }
+}
+
+/** A package alias as a name: `exhibits` → `Exhibits`, `field-notes` → `Field Notes`. */
+function packageName(alias: string): string {
+  return alias
+    .split(/[-_]/)
+    .filter((word) => word.length > 0)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+/**
+ * One line naming the Package operations an answer used, grouped by package in first-use order:
+ * `Used Exhibits: runtime.guide, exhibit.list; Agent: skill_read`. A failed call shows its code.
+ */
+export function describeActivity(activity: readonly Activity[]): string {
+  const groups = new Map<string, string[]>();
+  for (const call of activity) {
+    const label = call.ok ? call.port : `${call.port} (failed: ${call.code ?? "unknown"})`;
+    const calls = groups.get(call.package) ?? [];
+    if (!calls.includes(label)) calls.push(label);
+    groups.set(call.package, calls);
+  }
+  return `Used ${Array.from(groups, ([name, calls]) => `${packageName(name)}: ${calls.join(", ")}`).join("; ")}`;
 }
 
 /** The Package's own code, or the Teamarness description, as one display sentence. */
@@ -312,6 +338,7 @@ const AGENT_CSS = `
   .chat-entry[data-role="assistant"] { align-self: stretch; }
   .chat-author { display: block; font-size: .8em; font-weight: 600; color: var(--teamarness-color-text-muted); margin-bottom: .2rem; }
   .chat-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .chat-activity { margin: .35rem 0 0; font-size: .8em; color: var(--teamarness-color-text-muted); overflow-wrap: anywhere; }
   .chat-empty { color: var(--teamarness-color-text-muted); }
   textarea.chat-input { min-height: 4.5rem; }
   .package-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
@@ -705,6 +732,13 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
         content.className = "chat-content";
         content.textContent = entry.content;
         item.append(author, content);
+        if (entry.activity && entry.activity.length > 0) {
+          const activity = document.createElement("p");
+          activity.className = "chat-activity";
+          activity.dataset.role = "chat-activity";
+          activity.textContent = describeActivity(entry.activity);
+          item.append(activity);
+        }
         return item;
       }));
       chatLog.scrollTop = chatLog.scrollHeight;

@@ -1,5 +1,12 @@
 // Generated from ui-contract.json by teamarness-contract-types. Do not edit.
 
+export type Activity = {
+  readonly "code"?: string;
+  readonly "ok": boolean;
+  readonly "package": string;
+  readonly "port": string;
+};
+
 export type Agent = {
   readonly "name": Name;
   readonly "principalId": PrincipalId;
@@ -26,6 +33,7 @@ export type Chat = {
 };
 
 export type ChatEntry = {
+  readonly "activity"?: readonly Activity[];
   readonly "content": string;
   readonly "id": number;
   readonly "role": "user" | "assistant";

@@ -12,6 +12,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use teamarness_package_sdk::BackendError;
+use teamarness_package_sdk::ports::PortClient;
 
 use crate::catalog::{Catalog, CatalogContract, alias};
 use crate::tools::UsableContract;
@@ -141,6 +142,22 @@ pub fn usable(
             usable
         })
         .collect()
+}
+
+/// The contracts one turn may use: [`usable`] over what the Host reports available now.
+///
+/// With nothing enabled, or no Port grant, nothing is usable and the Host is not asked, so a
+/// turn with no Packages makes exactly the calls it made before Packages existed.
+pub async fn usable_now(
+    catalog: &(impl Catalog + ?Sized),
+    ports: Option<&PortClient>,
+    enabled: &[String],
+) -> Vec<UsableContract> {
+    let Some(ports) = ports.filter(|_| !enabled.is_empty()) else {
+        return Vec::new();
+    };
+    let availability = Availability::from_result(&ports.available().await);
+    usable(catalog, &availability, enabled)
 }
 
 /// Every agent-facing contract, in catalog order, with its availability and enablement.

@@ -389,6 +389,50 @@ fn status_failure(status: reqwest::StatusCode) -> ModelFailure {
     }
 }
 
+/// The configured endpoint, model and key as the turn engine's [`crate::turn::Model`].
+///
+/// Holds the key for one turn; it is dropped with this value and never logged, so this type has
+/// no `Debug`.
+pub struct ConfiguredModel {
+    client: ModelClient,
+    endpoint_base_url: String,
+    model: String,
+    api_key: String,
+}
+
+impl ConfiguredModel {
+    #[must_use]
+    pub fn new(
+        client: ModelClient,
+        endpoint_base_url: String,
+        model: String,
+        api_key: String,
+    ) -> Self {
+        Self {
+            client,
+            endpoint_base_url,
+            model,
+            api_key,
+        }
+    }
+}
+
+impl crate::turn::Model for ConfiguredModel {
+    fn respond(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolDefinition],
+    ) -> impl Future<Output = Result<Assistant, ModelFailure>> + Send {
+        self.client.respond(
+            &self.endpoint_base_url,
+            &self.model,
+            messages,
+            tools,
+            &self.api_key,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
