@@ -48,6 +48,7 @@ fn certain(error: &BackendError) -> bool {
                 | "agent_binding_changed"
                 | "port_version_mismatch"
                 | "port_request_invalid"
+                | "provider_error"
                 | "capability_version_unsupported"
                 | "overloaded"
         )

@@ -267,7 +267,7 @@ struct ConversationsState {
     /// `(port, kind, request)` of every Exhibits invoke the Agent issued.
     exhibits_calls: Vec<(String, String, Value)>,
     /// One-shot Provider errors, by Exhibits port.
-    exhibits_errors: HashMap<String, VecDeque<&'static str>>,
+    exhibits_errors: HashMap<String, VecDeque<BackendError>>,
 }
 
 #[derive(Clone, Default)]
@@ -364,13 +364,17 @@ impl FakeConversations {
 
     /// The next Exhibits call to `port` fails with this Provider `code`.
     fn fail_exhibits_once(&self, port: &str, code: &'static str) {
+        self.fail_exhibits_error_once(port, BackendError::new(code, false, empty()));
+    }
+
+    fn fail_exhibits_error_once(&self, port: &str, error: BackendError) {
         self.state
             .lock()
             .unwrap()
             .exhibits_errors
             .entry(port.into())
             .or_default()
-            .push_back(code);
+            .push_back(error);
     }
 
     /// The scripted Exhibits Provider: its guide, one Exhibit, and any scripted error.
@@ -379,12 +383,12 @@ impl FakeConversations {
         state
             .exhibits_calls
             .push((port.into(), kind.into(), request.clone()));
-        if let Some(code) = state
+        if let Some(error) = state
             .exhibits_errors
             .get_mut(port)
             .and_then(VecDeque::pop_front)
         {
-            return Err(BackendError::new(code, false, empty()));
+            return Err(error);
         }
         match port {
             "runtime.guide" => Ok(json!({"guide": "List Exhibits with exhibit.list."})),
@@ -2200,6 +2204,72 @@ async fn provider_error_recovered_in_same_turn() {
         })
     );
     assert_eq!(conversations.exhibits_calls().len(), 2);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordinary_provider_error_command_preserves_model_envelope_and_binding_liveness() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let harness = &mut fixture.harness;
+    harness.activate().await.unwrap();
+    configure(harness, &stub).await;
+    set_exhibits(harness, true).await;
+
+    // Script only an ordinary false-flag wrapper. True uncertainty and asynchronous held
+    // commands are covered at the production owner interface, not this serialized SDK pump.
+    conversations.fail_exhibits_error_once(
+        "draft.delete",
+        BackendError::new(
+            "provider_error",
+            false,
+            json!({"provider":{
+                "code":"qualification.refused", "retryable":false, "details":{}
+            }}),
+        ),
+    );
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "refused-delete",
+        "exhibits__draft_delete",
+        r#"{"exhibitId":"site"}"#,
+    )]));
+    stub.push(Behaviour::Reply("The Provider refused; no retry.".into()));
+    let answered = chat(harness, "delete the draft").await;
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(last_message(&requests[1].body)["content"].as_str().unwrap())
+            .unwrap(),
+        json!({"error":"provider_error", "retryable":false, "details":{
+            "provider":{"code":"qualification.refused", "retryable":false, "details":{}}
+        }})
+    );
+    assert_eq!(answered.get("lastError"), None, "{answered}");
+    assert_eq!(
+        answered["entries"][1]["activity"],
+        json!([
+            {"package":"exhibits", "port":"draft.delete", "ok":false, "code":"provider_error"}
+        ])
+    );
+    let bound = harness
+        .request("agent.binding.set", json!({"principalId":OTHER_ID}))
+        .await
+        .unwrap();
+    assert_eq!(bound["agent"]["principalId"], OTHER_ID);
+    assert_eq!(roster.bound_row()["principalId"], OTHER_ID);
+    assert_eq!(
+        conversations.exhibits_calls(),
+        vec![(
+            "draft.delete".into(),
+            "command".into(),
+            json!({"exhibitId":"site"})
+        )],
+        "ordinary refusal must not be replayed"
+    );
+    assert!(conversations.posts().is_empty());
     fixture.harness.shutdown().await.unwrap();
 }
 

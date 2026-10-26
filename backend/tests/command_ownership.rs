@@ -231,6 +231,69 @@ async fn certain_errors_release_but_transport_uncertainty_and_panics_do_not() {
 }
 
 #[tokio::test]
+async fn provider_error_preserves_terminal_and_only_certain_refusal_allows_binding() {
+    for uncertain in [false, true] {
+        let identity = IdentityWork::default();
+        let (host, mut queue) = host();
+        let intent = identity.intent(host.clone());
+        let waiter = tokio::spawn(async move {
+            intent
+                .command("provider", 3, "draft.delete", json!({"id":"refused"}))
+                .await
+        });
+        let details = json!({"provider":{
+            "code":"qualification.refused", "retryable":false, "details":{}
+        }});
+        queue
+            .recv()
+            .await
+            .unwrap()
+            .release
+            .send(Err(BackendError::new(
+                "provider_error",
+                false,
+                details.clone(),
+            )
+            .with_outcome_uncertain(uncertain)))
+            .unwrap();
+        let error = waiter.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), "provider_error");
+        assert!(!error.retryable());
+        assert_eq!(error.details(), &details);
+        // Probe actual binding before checking the flag: a certain terminal must not latch.
+        let binding = bind(&identity, &host, "B").await;
+        if uncertain {
+            assert_eq!(binding.unwrap_err().code(), BINDING_UNCERTAIN);
+            assert_eq!(*host.actor.lock().unwrap(), "A");
+        } else {
+            binding.unwrap();
+            assert_eq!(*host.actor.lock().unwrap(), "B");
+        }
+        assert_eq!(error.outcome_uncertain(), uncertain);
+        assert!(
+            host.effects.lock().unwrap().is_empty(),
+            "refusal mutated Provider state"
+        );
+        assert!(queue.try_recv().is_err(), "refused command replayed");
+        if !uncertain {
+            let fresh = identity.intent(host.clone());
+            let next = tokio::spawn(async move {
+                fresh
+                    .command("provider", 3, "draft.delete", json!({"id":"B work"}))
+                    .await
+            });
+            queue.recv().await.unwrap().release.send(Ok(())).unwrap();
+            assert_eq!(next.await.unwrap().unwrap()["actor"], "B");
+            assert_eq!(
+                *host.effects.lock().unwrap(),
+                vec![json!({"actor":"B","port":"draft.delete","request":{"id":"B work"}})]
+            );
+            assert!(queue.try_recv().is_err(), "command replayed after binding");
+        }
+    }
+}
+
+#[tokio::test]
 async fn cancelled_binding_waiter_retains_actual_mutation_exclusion_and_published_identity() {
     for uncertain in [false, true] {
         let identity = IdentityWork::default();
