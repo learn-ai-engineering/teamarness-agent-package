@@ -126,6 +126,12 @@ export function describeActivity(activity: readonly Activity[]): string {
 
 /** The Package's own code, or the Teamarness description, as one display sentence. */
 function describeFailure(error: unknown): string {
+  if (packageErrorCode(error) === "agent.binding_busy") {
+    return "A command or binding change is still pending. Wait for it to settle, then choose the binding again.";
+  }
+  if (packageErrorCode(error) === "agent.binding_uncertain") {
+    return "An earlier command or binding change has an unknown outcome. Binding changes are blocked. Do not replay it; keep this identity and seek Host recovery assistance. Restart safety has not been qualified.";
+  }
   if (packageErrorCode(error) === "agent.invalid_settings" && isPackageRequestError(error)) {
     const field = error.packageError?.details["field"];
     return typeof field === "string" ? `Check the ${field} field.` : "Check the settings.";

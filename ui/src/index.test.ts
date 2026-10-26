@@ -26,6 +26,7 @@ function fakeBackend(input?: {
   packages?: PackageView[];
   /** Every `agent.packages.set` fails with this code. */
   refusePackageSet?: string;
+  refuseBinding?: string;
   /** Every `agent.packages.set` waits for this before it answers. */
   holdPackageSet?: Promise<void>;
   holdFirstPackageGet?: Promise<void>;
@@ -63,6 +64,7 @@ function fakeBackend(input?: {
       },
       "agent.binding.candidates": () => ({ agents: candidates }),
       "agent.binding.set": (payload) => {
+        if (input?.refuseBinding) throw createPackageRequestError({ stage: "ui", packageError: { code: input.refuseBinding } });
         const id = (payload as { principalId: string }).principalId;
         const found = candidates.find((candidate) => candidate.principalId === id);
         if (!found) {
@@ -133,6 +135,21 @@ function lastState(states: AgentUiState[]): AgentUiState {
 }
 
 describe("Agent Package UI controller", () => {
+  it.each([
+    ["agent.binding_busy", "A command or binding change is still pending. Wait for it to settle, then choose the binding again."],
+    ["agent.binding_uncertain", "An earlier command or binding change has an unknown outcome. Binding changes are blocked. Do not replay it; keep this identity and seek Host recovery assistance. Restart safety has not been qualified."],
+  ])("shows safe binding refusal guidance for %s without changing identity", async (code, guidance) => {
+    const status: Status = { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } };
+    const { client } = fakeBackend({ status, refuseBinding: code });
+    const states: AgentUiState[] = [];
+    const controller = createAgentController(client, (state) => { states.push(state); });
+    await controller.start();
+    await controller.bind(OTHER_ID);
+    expect(lastState(states).error).toBe(guidance);
+    expect(lastState(states).status).toEqual(status);
+    expect(lastState(states).busy).toBe(false);
+    controller.dispose();
+  });
   it("loads settings, status and candidates, then follows status changes", async () => {
     const { fake, client } = fakeBackend();
     const states: AgentUiState[] = [];

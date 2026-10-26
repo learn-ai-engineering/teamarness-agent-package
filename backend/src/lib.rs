@@ -10,6 +10,7 @@
 pub mod access;
 pub mod catalog;
 pub mod chat;
+pub mod command_ownership;
 pub mod harness;
 pub mod mention;
 pub mod model;
@@ -100,6 +101,7 @@ pub struct AgentActive {
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
     chat: Arc<ChatCell>,
+    identity: command_ownership::IdentityWork,
 }
 
 /// What one chat turn needs from the stored configuration. Holds the key; never logged.
@@ -115,6 +117,7 @@ impl AgentActive {
     /// Called under `transition`; drain old replies before publishing a different identity/name.
     async fn apply_agent(&self, agent: Option<BoundAgent>) {
         if self.status.agent() != agent {
+            self.identity.invalidate();
             self.stop_harness().await;
             self.interrupt_package_chat(None).await;
             self.status.set_agent(agent);
@@ -166,6 +169,7 @@ impl AgentActive {
     /// The inputs a harness task needs, or `None` when the Package has no Port grant.
     fn harness_inputs(&self) -> Option<HarnessInputs> {
         Some(HarnessInputs {
+            commands: self.identity.intent(self.ports.clone()?),
             ports: self.ports.clone()?,
             principals: self.principals.clone(),
             settings: self.settings.clone(),
@@ -276,7 +280,7 @@ impl AgentActive {
         let usable = access::usable_now(
             self.ports
                 .as_ref()
-                .filter(|_| self.status.agent().is_some()),
+                .filter(|_| self.status.agent().is_some() && self.identity.identity_ready()),
         )
         .await
         .map_err(|cause| capability_error(&cause))?;
@@ -285,7 +289,11 @@ impl AgentActive {
             .map(|contract| contract.identity.clone())
             .collect();
         let name = self.status.agent().and_then(|agent| agent.name);
-        let tools = tools::TurnTools::new(&usable, self.ports.clone(), skills::bundled());
+        let tools = tools::TurnTools::new(
+            &usable,
+            self.identity.intent(self.ports.clone()),
+            skills::bundled(),
+        );
         let system = chat::system_message(name.as_deref(), &config.system_prompt, tools.context());
         let (turn, view) = self
             .chat
@@ -326,24 +334,38 @@ impl AgentActive {
     }
 
     async fn change_binding(&self, principal: Option<String>) -> Result<BindingView, BackendError> {
-        let _transition = self.transition.lock().await;
-        self.stop_harness().await;
-        self.interrupt_package_chat(None).await;
-        let result = match principal {
-            Some(principal) => self.binding.bind(&principal).await.map(Some),
-            None => self.binding.unbind().await.map(|()| None),
-        };
-        let agent = match result {
-            Ok(agent) => agent,
-            Err(cause) => {
-                self.sync_harness().await;
-                return Err(capability_error(&cause));
-            }
-        };
-        let summary = agent.as_ref().map(AgentSummary::from);
-        self.tasks.lock().await.reconciled = true;
-        self.apply_agent(agent).await;
-        Ok(BindingView { agent: summary })
+        let state = self.clone();
+        self.identity
+            .change_binding(move || async move {
+                let _transition = state.transition.lock().await;
+                state.stop_harness().await;
+                state.interrupt_package_chat(None).await;
+                let result = match principal {
+                    Some(principal) => state.binding.bind(&principal).await.map(Some),
+                    None => state.binding.unbind().await.map(|()| None),
+                };
+                let agent = match result {
+                    Ok(agent) => agent,
+                    Err(cause) => {
+                        state.sync_harness().await;
+                        return Err(cause);
+                    }
+                };
+                let summary = agent.as_ref().map(AgentSummary::from);
+                state.tasks.lock().await.reconciled = true;
+                state.apply_agent(agent).await;
+                Ok(BindingView { agent: summary })
+            })
+            .await
+            .map_err(|cause| {
+                if cause.outcome_uncertain() {
+                    error(command_ownership::BINDING_UNCERTAIN, false)
+                } else if cause.code().starts_with("agent.binding_") {
+                    cause
+                } else {
+                    capability_error(&cause)
+                }
+            })
     }
 
     async fn interrupt_package_chat(&self, contract: Option<&str>) {
@@ -655,6 +677,7 @@ pub fn router() -> Router<AgentActive> {
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
                 chat: Arc::new(ChatCell::default()),
+                identity: command_ownership::IdentityWork::default(),
             };
             // Reconcile the startup roster before starting any reply work.
             {
@@ -823,19 +846,14 @@ pub fn router() -> Router<AgentActive> {
         "agent.binding.set",
         |context: Context<AgentActive>, request: BindingSetRequest| async move {
             let state = context.state().clone();
-            // Dropping/aborting the UI waiter detaches this owner, never its transition.
-            tokio::spawn(async move { state.change_binding(Some(request.principal_id)).await })
-                .await
-                .map_err(|_| error("agent.capability_unavailable", false))?
+            state.change_binding(Some(request.principal_id)).await
         },
     )
     .request(
         "agent.binding.clear",
         |context: Context<AgentActive>, _: Empty| async move {
             let state = context.state().clone();
-            tokio::spawn(async move { state.change_binding(None).await })
-                .await
-                .map_err(|_| error("agent.capability_unavailable", false))?
+            state.change_binding(None).await
         },
     )
     .request(

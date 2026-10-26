@@ -37,6 +37,8 @@ The chat and Channel replies can use other installed Packages through Package Po
 - **What the Steward sees.** A chat answer that used Package operations shows a muted line such as "Used Exhibits: runtime.guide, exhibit.list". A failed call shows its code. A chat turn that fails shows the same line under its error, for the calls that ran before it ended. Only the final text is kept as chat history.
 - **Replies.** Conversations reads, event subscriptions and final posts require explicit enablement and a binding. Disable, rebind and unbind cancel affected turns. A terminal stream drains affected reply work before an explicit new subscription and reconciliation. The model never gets `message.post`; only the harness posts final text once. The trigger is persisted before the attempt and never replayed. Independent direct chat remains usable without Package access.
 - **Withheld ports.** Besides `message.post`, Exhibits `file.read` and `file.put` are not offered. One file chunk is larger than a tool result or a turn's message bound can carry, so file transfer waits for blob references.
+- **Identity transitions.** Final posts and generic commands have one bounded Agent-owned owner (at most 16 unresolved calls). Cancelling/aborting a turn stops observing, not an already admitted SDK call. Binding/clearing refuses immediately with `agent.binding_busy` while actual commands or a binding mutation remain pending; choose the binding again after a certain terminal. Commands are never retried. A local intent revision rejects old turns after a transition. Success and certain Provider/Host refusals release ownership, including failed posts.
+- **Uncertainty.** Ambiguous command outcomes block identity changes with `agent.binding_uncertain`, not unrelated replies or direct chat. Ambiguous binding mutations also block identity-dependent tools; independent no-tools chat, disable and settings remain usable. SDK timeout/disconnect/invalid-response or owner panic do not establish quiescence even when an opaque error lacks the uncertainty flag. No timer, settings edit, re-enable, unrelated success, roster refresh or task abort clears this state. Do not replay the command; keep the identity and seek Host recovery assistance. **Restart/instance-retirement safety is not yet qualified**; do not treat a restart as a proven recovery fence.
 - **Calls.** Tool arguments are validated locally before dispatch. Every call and subscription uses package-ports 2.0 Agent access and an explicit contract major. The Host reauthorizes each dispatch: metadata snapshots are not grants. Events and live queries are not ordinary model tools. A Provider error reaches the model with its stable code. Commands are never re-sent, including uncertain outcomes.
 
 ### Turn bounds and codes
@@ -52,6 +54,10 @@ Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 char
 | `agent.tool_unavailable` | The tool is unknown or not usable now. Also ends a turn whose tool set cannot be built. |
 | `agent.binding_required` | Bind an Agent before managing Packages. |
 | `agent.invalid_metadata` | Discovery exceeded the Agent snapshot bound or metadata disagreed with its summary. |
+| `agent.binding_busy` | A command or binding mutation remains pending; no new binding mutation sent. Choose again after settlement. |
+| `agent.binding_uncertain` | Earlier actual work may remain; identity changes refused. Do not replay; seek Host recovery assistance. Restart safety is unqualified. |
+| `agent.command_busy` | The 16-command ownership bound is full; refused before enqueue. |
+| `agent.stale_intent` | A turn belongs to an earlier identity revision; refused before enqueue. |
 
 ### SDK provenance and retained fixtures
 

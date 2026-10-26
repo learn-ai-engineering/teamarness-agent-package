@@ -755,7 +755,15 @@ async fn roster_reconnect_snapshot_reconciles_without_an_event() {
     fixture.principals.stream().opened().await;
     *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Pathfinder"));
     fixture.principals.stream().close("completed").await;
-    wait_binding(&mut fixture.harness, Some("Pathfinder")).await;
+    assert!(!fixture.principals.stream().is_open());
+    // Status is published before subscribe: wait for both observations within the
+    // existing five-second readiness budget, not for status as a proxy for open.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        wait_binding(&mut fixture.harness, Some("Pathfinder")).await;
+        fixture.principals.stream().opened().await;
+    })
+    .await
+    .expect("binding reconciliation and replacement roster stream");
     assert!(fixture.principals.recorded_opens().len() >= 2);
     fixture.harness.shutdown().await.unwrap();
 }
@@ -790,7 +798,8 @@ async fn a_failed_binding_change_does_not_block_later_binding_changes() {
         .request("agent.binding.set", json!({"principalId":AGENT_ID}))
         .await
         .unwrap();
-    *bindings.mutation_failure.lock().unwrap() = Some("host_unavailable");
+    // A certain Core refusal releases mutation ownership; transport ambiguity does not.
+    *bindings.mutation_failure.lock().unwrap() = Some("agent_not_stewarded");
     assert!(
         fixture
             .harness
@@ -1128,4 +1137,55 @@ async fn host_summary_overflow_empty_continuation_and_cursor_cycles_refuse_witho
         assert!(!data.path().join("packages.json").exists());
         harness.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ambiguous_binding_failure_is_not_cleared_by_roster_refresh_or_settings() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    let mut fixture = start(data.path(), &bindings).await;
+    fixture.harness.activate().await.unwrap();
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":AGENT_ID}))
+        .await
+        .unwrap();
+    *bindings.mutation_failure.lock().unwrap() = Some("host_unavailable");
+    assert!(
+        fixture
+            .harness
+            .request("agent.binding.set", json!({"principalId":OTHER_ID}))
+            .await
+            .is_err()
+    );
+    *bindings.mutation_failure.lock().unwrap() = None;
+    fixture.harness.request("agent.settings.set", json!({"settings": {"endpointBaseUrl":"http://localhost:1234", "model":"stub", "systemPrompt":"", "contextMessages":0}})).await.unwrap();
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Pathfinder"));
+    fixture.principals.stream().opened().await;
+    assert!(fixture.principals.stream().send(roster(2, true)).await);
+    wait_binding(&mut fixture.harness, Some("Pathfinder")).await;
+    let calls_before = fixture.binding_capability.recorded_calls();
+    let refused = fixture
+        .harness
+        .request("agent.binding.clear", empty())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), "agent.binding_uncertain");
+    assert_eq!(
+        bindings.bound.lock().unwrap().as_ref().unwrap()["principalId"],
+        AGENT_ID
+    );
+    assert_eq!(
+        fixture
+            .binding_capability
+            .recorded_calls()
+            .iter()
+            .filter(|c| matches!(c.method.as_str(), "bind" | "unbind"))
+            .count(),
+        calls_before
+            .iter()
+            .filter(|c| matches!(c.method.as_str(), "bind" | "unbind"))
+            .count()
+    );
+    fixture.harness.shutdown().await.unwrap();
 }

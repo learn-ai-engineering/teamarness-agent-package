@@ -240,6 +240,7 @@ struct Row {
 enum PostMode {
     Accept,
     Uncertain,
+    Transport,
 }
 
 #[derive(Clone)]
@@ -514,6 +515,7 @@ impl FakeConversations {
                             fake.append(&channel, AGENT_KEY, &markdown);
                             Ok(json!({"ok": true}))
                         }
+                        PostMode::Transport => Err(BackendError::new("host_unavailable", true, empty())),
                         PostMode::Uncertain => {
                             Err(BackendError::new("conversations.deferred", false, empty())
                                 .with_outcome_uncertain(true))
@@ -1535,9 +1537,21 @@ async fn overlapping_binding_and_readiness_changes_leave_no_old_work() {
         .harness
         .start_request("agent.key.clear", empty())
         .await;
-    bind.result().await.unwrap();
-    unbind.result().await.unwrap();
+    let bound = bind.result().await;
+    let unbound = unbind.result().await;
+    assert!(bound.is_ok() || unbound.is_ok());
+    for refused in [bound, unbound].into_iter().filter_map(Result::err) {
+        assert_eq!(refused.code(), "agent.binding_busy");
+        assert!(refused.retryable());
+    }
     clear.result().await.unwrap();
+    // A concurrent choice may be refused, not queued indefinitely. Reissue only the
+    // identity choice after the actual mutation settles; never replay the old reply.
+    fixture
+        .harness
+        .request("agent.binding.clear", empty())
+        .await
+        .unwrap();
     wait_status(&mut fixture.harness, "unconfigured", None).await;
     assert!(!fixture.ports.stream().is_open());
     let status = fixture
@@ -1561,7 +1575,8 @@ async fn a_post_failure_does_not_block_later_replies_or_binding() {
     let mut fixture = start(data.path(), &roster, &conversations).await;
     make_ready(&mut fixture, &stub, 0).await;
 
-    // One post fails with an uncertain outcome: the status says so, and it is not retried.
+    // The Provider's deferred error is not retried. Canonical Harness drops the scripted
+    // uncertainty flag, so this is certain-error liveness, NOT uncertainty transport proof.
     conversations.set_post_mode(PostMode::Uncertain);
     say(&conversations, &fixture.ports, BOB_KEY, "@Scout uncertain").await;
     let status = wait_status(&mut fixture.harness, "error", Some("agent.post_failed")).await;
@@ -2915,5 +2930,28 @@ async fn per_turn_metadata_never_substitutes_for_host_authority_on_a_later_dispa
             .all(|call| call.payload["access"] == "agent" && call.payload["major"] == 3)
     );
     assert!(conversations.posts().is_empty());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transport_post_failure_refuses_identity_change_without_replaying_or_stopping_chat() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    make_ready(&mut fixture, &stub, 0).await;
+    conversations.set_post_mode(PostMode::Transport);
+    say(&conversations, &fixture.ports, BOB_KEY, "@Scout transport").await;
+    wait_status(&mut fixture.harness, "error", Some("agent.post_failed")).await;
+    let refused = fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":OTHER_ID}))
+        .await;
+    assert_eq!(refused.unwrap_err().code(), "agent.binding_uncertain");
+    assert_eq!(roster.bound_row()["principalId"], AGENT_ID);
+    let answer = chat(&mut fixture.harness, "independent answer").await;
+    assert_eq!(answer["entries"][1]["content"], "Hello from Scout");
+    assert_eq!(conversations.posts().len(), 1);
     fixture.harness.shutdown().await.unwrap();
 }

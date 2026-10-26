@@ -21,13 +21,14 @@ use teamarness_package_sdk::ports::{PortAccess, PortClient};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::access;
+use crate::command_ownership::IntentPorts;
 use crate::mention::mentions;
 use crate::model::{ChatMessage, ConfiguredModel, ModelClient};
 use crate::progress::{Cursor, Progress};
 use crate::settings::SettingsStore;
 use crate::skills;
 use crate::status::StatusCell;
-use crate::tools::{ToolContext, TurnTools};
+use crate::tools::{PortCaller, ToolContext, TurnTools};
 use crate::turn::TurnOutcome;
 
 pub const CONVERSATIONS_CONTRACT: &str = "dev.teamarness.conversations";
@@ -46,6 +47,7 @@ const DRAIN: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 pub struct HarnessInputs {
     pub ports: PortClient,
+    pub commands: IntentPorts<PortClient>,
     pub principals: Principals,
     pub settings: Arc<Mutex<SettingsStore>>,
     pub status: Arc<StatusCell>,
@@ -219,6 +221,14 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
         if cancellation.is_cancelled() || !state.inputs.status.is_ready_to_run() {
             break;
         }
+        // A new harness can be constructed while its owned binding mutation is finishing.
+        // Do not discover, subscribe or read until that exact intent is current and certain.
+        if !state.inputs.commands.is_current() {
+            if wait_or_cancel(&cancellation, RETRY).await {
+                break;
+            }
+            continue;
+        }
         let enabled = tokio::select! {
             biased;
             () = cancellation.cancelled() => break,
@@ -317,7 +327,7 @@ impl Loop {
         tokio::select! {
             biased;
             () = self.work.cancelled() => Err(()),
-            response = self.inputs.ports.query(PortAccess::Agent, CONVERSATIONS_CONTRACT, 1, port, request) => response.map_err(|_| ()),
+            response = self.inputs.commands.query(CONVERSATIONS_CONTRACT, 1, port, request) => response.map_err(|_| ()),
         }
     }
 
@@ -708,7 +718,7 @@ async fn reply(
             Err(_) => return ReplyOutcome::Failed(crate::turn::TOOL_UNAVAILABLE, false),
         },
     };
-    let tools = TurnTools::new(&usable, inputs.ports.clone(), skills::bundled());
+    let tools = TurnTools::new(&usable, inputs.commands.clone(), skills::bundled());
     let system = system_message(&prompt.agent, &prompt.system_prompt, tools.context());
     let model = ConfiguredModel::new(client.clone(), endpoint, model, key);
     let outcome = tools.run(system, history, &model, cancellation).await;
@@ -733,8 +743,8 @@ async fn reply(
     let post = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        post = inputs.ports.command(
-            PortAccess::Agent, CONVERSATIONS_CONTRACT, 1,
+        post = inputs.commands.command(
+            CONVERSATIONS_CONTRACT, 1,
             "message.post",
             json!({"channelId":channel,"markdown":markdown}),
         ) => post,
