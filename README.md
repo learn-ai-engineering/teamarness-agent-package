@@ -1,6 +1,6 @@
 # Agent — Personal Teamarness Package
 
-Runs a stewarded Workspace Agent against an OpenAI-compatible completion endpoint. Replies when its current name is addressed as a whole word, optionally prefixed with `@`. Context comes from Conversations 1.2; signing authority stays in Teamarness Core.
+Runs a stewarded Workspace Agent against an OpenAI-compatible completion endpoint. Replies when its current name is addressed as a whole word, optionally prefixed with `@`. Conversations participation requires a binding and explicit Host enablement; signing authority stays in Teamarness Core.
 
 ## Build
 
@@ -11,7 +11,7 @@ npm ci
 npm run build
 ```
 
-Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies the bundled Provider contracts; both run as part of `npm test`.
+Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies historical Provider fixtures; both run as part of `npm test`.
 
 ## Register and configure
 
@@ -21,7 +21,7 @@ Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests an
 4. In a Workspace, choose an Agent you steward on this Installation, set its completion endpoint/model/instructions, and store its API key in the Agent UI.
 5. Open the **Chat** tab to talk to the configured model directly. The chat needs the endpoint, model and key but no binding; it is never posted to a Channel. The Backend keeps the transcript in memory only (up to 64 entries); a Backend restart clears it. `agent.chat.send` returns at once and the reply arrives through `agent.chat.changes`, because a completion can outlast the Host's 30 s UI request deadline.
 
-6. Optionally, in the **Packages** section of the Configuration tab, enable the Packages the Agent may use. See [Package tools](#package-tools).
+6. In the **Packages** section of the Configuration tab, explicitly enable **Conversations** to receive Channel replies. Enable other Packages only when you want their model tools. See [Package tools](#package-tools).
 
 Rebuild and restart after code changes; no hot reload. Each Installation has separate configuration. Personal installation does not share keys or grant extra Workspace authority. The Backend has the current OS user's native authority and sends Channel context to the configured model endpoint.
 
@@ -31,13 +31,13 @@ Changing only the source from bundled to local preserves the existing data-direc
 
 The chat and Channel replies can use other installed Packages through Package Ports. Each turn offers the model the tools of the Packages that are usable now, plus the Agent's own compiled-in skills.
 
-- **Which Packages are listed.** A Provider contract is agent-facing only when it has a `runtime.guide` query. The **Packages** section lists every agent-facing contract the Agent knows, whether the Host reports it available, and a switch. Today only Exhibits has a guide, so only Exhibits is listed. Documents and Conversations are listed once `package-alignment` publishes their guides and the catalog is refreshed.
-- **Enablement.** The switch state is stored in `packages.json` (`{"schemaVersion": 1, "enabled": [identity]}`) in the Package Data Directory. A missing file means nothing is enabled. A Package is usable only when it is agent-facing, available and enabled. Documents and Exhibits are optional in the manifest, so the Agent installs and runs without them; a missing Package shows as **Unavailable**.
+- **Discovery.** The Host lists admitted guide-bearing contracts, including Providers unknown to this Agent and unavailable retained selections. Conversations and Exhibits have guides in the current Host; Documents does not. Discovery needs a binding and does not start Providers. The Agent accepts at most 32 identities per snapshot. It uses validated SDK pages and complete, hash-verified metadata, never guide Markdown as schemas.
+- **Enablement.** The Host owns durable selections for this Package Instance. Enable sends the offered major the UI observed; it never substitutes a newer offer. Use **Refresh Packages** after a changed-offer refusal before explicitly enabling the new major. The UI displays the saved enabled major separately. Unavailable choices remain disableable by identity. Host failures do not become local successful switches. Existing `packages.json` is untouched and grants nothing. No legacy selection is imported.
 - **What the model sees.** The system message has one line per usable Package, naming its guide tool (`<alias>__runtime_guide`), and one line per skill. The model reads a guide or a skill (`skill_read`) only on request. Tool output is data, not instructions. With nothing enabled, no tools are sent and the request is the same as before tools existed.
 - **What the Steward sees.** A chat answer that used Package operations shows a muted line such as "Used Exhibits: runtime.guide, exhibit.list". A failed call shows its code. A chat turn that fails shows the same line under its error, for the calls that ran before it ended. Only the final text is kept as chat history.
-- **Replies.** The model is never offered `message.post`. The harness posts the final text of a reply turn exactly once. A turn that fails posts nothing and sets the status error. The trigger is persisted before the attempt and never retried.
+- **Replies.** Conversations reads, event subscriptions and final posts require explicit enablement and a binding. Disable, rebind and unbind cancel affected turns. A terminal stream drains affected reply work before an explicit new subscription and reconciliation. The model never gets `message.post`; only the harness posts final text once. The trigger is persisted before the attempt and never replayed. Independent direct chat remains usable without Package access.
 - **Withheld ports.** Besides `message.post`, Exhibits `file.read` and `file.put` are not offered. One file chunk is larger than a tool result or a turn's message bound can carry, so file transfer waits for blob references.
-- **Calls.** Tool arguments are validated against the port's request schema before anything is sent. A disabled or unknown tool is refused locally, without reaching the Host. A Provider error reaches the model with its stable code, so it can recover in the same turn. A command is never re-sent; an unknown outcome is reported to the model as unknown.
+- **Calls.** Tool arguments are validated locally before dispatch. Every call and subscription uses package-ports 2.0 Agent access and an explicit contract major. The Host reauthorizes each dispatch: metadata snapshots are not grants. Events and live queries are not ordinary model tools. A Provider error reaches the model with its stable code. Commands are never re-sent, including uncertain outcomes.
 
 ### Turn bounds and codes
 
@@ -50,18 +50,22 @@ Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 char
 | `agent.tool_arguments_invalid` | The arguments are not JSON or fail the port's request schema. Not sent. |
 | `agent.tool_outcome_unknown` | A command was sent, but its outcome is unknown. Never re-sent. |
 | `agent.tool_unavailable` | The tool is unknown or not usable now. Also ends a turn whose tool set cannot be built. |
-| `agent.unknown_package` | The UI asked to enable a contract that is not agent-facing. |
+| `agent.binding_required` | Bind an Agent before managing Packages. |
+| `agent.invalid_metadata` | Discovery exceeded the Agent snapshot bound or metadata disagreed with its summary. |
 
-### Refresh the bundled catalog
+### SDK provenance and retained fixtures
 
-`backend/catalog/` holds verbatim copies of Provider `ports.json` files, and `backend/catalog/provenance.json` records their Teamarness revision and digests. To refresh them from a Teamarness checkout:
+The approved SDK snapshot comes from clean Host revision `4e0249b7e354f87586971aa4d8951613151906eb`. This controlled migration uses the canonical generator's complete production tree sets, dependency declarations, notices, and digest conventions:
 
 ```sh
-node scripts/refresh-catalog.mjs --from <teamarness-checkout>
-npm run check:catalog
+node scripts/refresh-sdk.mjs /path/to/clean/Host-at-4e0249b
+node /path/to/Host/scripts/create-package.mjs --vendor-report "$PWD"
+npm run check:vendor
 ```
 
-Then update the version ranges in `teamarness.package.json`. The `manifest_and_catalog_agree` test fails until the manifest and the catalog declare the same contracts, versions and ports.
+The refresh refuses another revision or a dirty Host. It does not patch vendor implementation. Builds remain independent of the Host checkout. The SDK's new contract/sha2 dependencies are recorded in `Cargo.lock`; model/network dependencies are unchanged.
+
+`backend/catalog/` retains historical verbatim Provider schemas, with their original provenance and digest gate. They test existing policy and tool-schema behavior, not runtime discovery. `fixed_harness_declaration_matches_its_historical_fixture` checks the five fixed Conversations ports against their fixture; Documents and Exhibits have no fixed consumed declaration. dynamic Agent access does not require a consumed declaration. Refreshing fixtures is separate from Host discovery and must preserve their tests and provenance.
 
 ## Optional Teamarness integration qualification
 
@@ -72,16 +76,18 @@ TEAMARNESS_AGENT_PACKAGE_DIR=/absolute/path/to/agent/dist/dev.teamarness.agent \
   cargo test -p teamarness-system-tests --test agent_reply_flow --locked -- --ignored
 ```
 
-This explicitly runs four external-package checks: registration, loopback two-profile reply and backlog delivery, queued-post actor attribution during rebinding, and cancelled-binding-waiter ownership. The queued-post attribution check (`agent_reply_flow.rs::enqueued_reply_keeps_old_actor_during_rebind`) asserts the dispatch fence, which has been removed, so it is expected to fail until Teamarness updates or drops it. The default Teamarness suite does not require this separate project. The focused `local_agent_package_loads_from_registration` check covers the packaging boundary without repeating model/backlog behavior.
+Run the complete external target, including real Host admission/initialization, explicit Conversations enablement, attribution, cancellation, and at-most-once behavior. Also qualify an unknown Provider through real discovery and a scripted loopback model. The linked integration workstream owns these downstream tests. No local scripted-capability test substitutes for real Host authority.
+
+Canonical `HarnessBuilder` currently initializes scripted capabilities at major 1. Agent tests use it to observe actual 2.0 payloads and SDK metadata verification, not to prove negotiated-major compatibility. Manifest validation and Backend smoke launch prove their packaging boundaries only. Real Host 2.0 qualification and the Steward's UI/model journey remain required before end-to-end completion.
 
 ## Provenance and verification
 
-Product source/tests/contracts were extracted without behavioral changes from Teamarness commit `c9304d0` on `don-smith/agent_package`. `teamarness-authoring.json` records the current generated SDK snapshot. The Agent identity, capabilities, UI contract, local data formats and Conversations Ports are unchanged.
+Product source/tests/contracts were extracted without behavioral changes from Teamarness commit `c9304d0` on `don-smith/agent_package`. `teamarness-authoring.json` records the current generated SDK snapshot. The Agent identity and settings/key/progress formats remain unchanged. This integration migrates package-ports to 2.0 and extends only the Packages UI operations with offered/enabled majors.
 
 Bounded cleanup resolves the following findings. Consolidated verification and independent review passed for Backend/test source `ed3c016`, then passed again against merged Teamarness Host `a67f3c4` with the unchanged Agent distribution:
 
-- CR-002 / CR-009: binding/readiness transitions serialize. A binding change, readiness change or suspend stops the harness first, which cancels replies that have not been posted yet. The dispatch fence that held already-dispatched posts against a rebind has been removed: binding is a setup-time action, and the fence's latch stopped all replies until restart after any post failure.
-- At-most-once limit: a trigger is persisted before its reply is attempted, and a post is never re-sent. A failed post sets `agent.post_failed` without blocking later replies or binding changes. An in-flight post is not fenced against a concurrent rebind, so a post already dispatched when the binding changes may be attributed to the new Agent. There is no automatic replay or persisted recovery machinery. Follow-up: Teamarness must update or drop the external qualification check `enqueued_reply_keeps_old_actor_during_rebind`, which still expects the fence's refusal.
+- CR-002 / CR-009: binding/readiness transitions serialize. Binding changes stop affected reply and Package-tool chat work before publishing another Agent. Independent no-tools chat does not depend on binding.
+- At-most-once limit: triggers settle before the reply attempt. A failed or uncertain post is never replayed. The current Host preserves the authorization-time actor of earlier commands; disable or rebind does not retract already-authorized work. No dispatch fence is added, and uncertainty is never reported as certain failure. Real queued-command attribution is a downstream Host qualification requirement.
 - CR-003: startup/reconnect reconcile binding after capturing the roster cursor and before subscribing; failed reconciliation retries without another event. Reply work waits for startup/resume reconciliation.
 - CR-005: completion redirects are rejected, with loopback 307/308 no-forwarding regressions; explicitly configured loopback HTTP remains supported.
 - CR-006: successful complete settings/key changes clear stale errors while preserving replies still active in another Channel.
@@ -89,8 +95,8 @@ Bounded cleanup resolves the following findings. Consolidated verification and i
 - SM-003: progress open/advance and key reads already use SDK blocking work; remaining activation/resume key metadata checks now do too. Storage formats and at-most-once revision settlement are unchanged.
 - SM-002: Teamarness Packages R14 now conditions its local-Installation check on Person actors and references the existing Agent-authority rule.
 
-The `agent-package` workstream records the passing consolidated review and validation at `verify/20261024T080059Z_agent-package-{review,validation}.md` and passing merged-Host qualification at `verify/20261024T092503Z_post-merge-{review,validation}.md`. All four explicit integration cases pass. Extraction alone did not resolve the findings; the later code corrections and review did. The vendored SDK snapshot remains unchanged.
+The `agent-package` workstream records the passing consolidated review and validation at `verify/20261024T080059Z_agent-package-{review,validation}.md` and passing merged-Host qualification at `verify/20261024T092503Z_post-merge-{review,validation}.md`. Those historical checks passed on their recorded source, not this migration. Extraction alone did not resolve the findings; the later code corrections and review did. The canonical SDK refresh and current local checks are recorded separately for this migration.
 
 The developer observed real-endpoint replies, Personal Package discovery, retained configuration after restart, and an offline-addressed reply visible at first inspection after the Steward returned. This is limited manual evidence, not exhaustive desktop coverage or measured latency. It was not repeated after the Host merge. Local verification does not authorize source push, remote creation, or publication.
 
-Key-at-rest protection beyond file mode `0600`, streaming, Documents participation (pending its `runtime.guide`), file uploads through Package tools, scheduled posts, supported SDK publication, and stronger Package isolation need separate Scopes. The Teamarness roadmap owns those follow-ups. Incoming Teamarness Documents limitations and its record-log JSON authoring-schema mismatch remain separate upstream debt, not cleared by Agent qualification.
+Key-at-rest protection beyond file mode `0600`, streaming, Documents guidance/tools, file uploads through Package tools, scheduled posts, supported SDK publication, and stronger Package isolation need separate Scopes. The Teamarness roadmap owns those follow-ups. Incoming Teamarness Documents limitations and its record-log JSON authoring-schema mismatch remain separate upstream debt, not cleared by Agent qualification.

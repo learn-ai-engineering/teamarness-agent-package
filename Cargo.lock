@@ -1397,11 +1397,13 @@ dependencies = [
 name = "teamarness-agent-package"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "jsonschema",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "teamarness-package-protocol",
  "teamarness-package-sdk",
  "tempfile",
@@ -1438,6 +1440,8 @@ dependencies = [
  "base64 0.23.1",
  "serde",
  "serde_json",
+ "sha2",
+ "teamarness-package-contract",
  "teamarness-package-protocol",
  "tokio",
 ]

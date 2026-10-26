@@ -18,7 +18,7 @@ use std::future::Future;
 
 use jsonschema::{Draft, Validator};
 use serde_json::{Map, Value, json};
-use teamarness_package_sdk::ports::PortClient;
+use teamarness_package_sdk::ports::{PortAccess, PortClient};
 use teamarness_package_sdk::{BackendError, CancellationToken};
 
 use crate::access::display_name;
@@ -45,6 +45,7 @@ const CANCELLED: &str = "cancelled";
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsableContract {
     pub identity: String,
+    pub major: u16,
     pub description: String,
     pub ports: Vec<CatalogPort>,
     /// The declaring document's `$defs`.
@@ -55,6 +56,7 @@ impl From<&CatalogContract> for UsableContract {
     fn from(contract: &CatalogContract) -> Self {
         Self {
             identity: contract.identity.clone(),
+            major: contract.major,
             description: contract.description.clone(),
             ports: contract.ports.clone(),
             defs: contract.defs.clone(),
@@ -161,6 +163,7 @@ pub trait PortCaller: Send + Sync {
     fn query(
         &self,
         contract: &str,
+        major: u16,
         port: &str,
         request: Value,
     ) -> impl Future<Output = Result<Value, BackendError>> + Send;
@@ -168,6 +171,7 @@ pub trait PortCaller: Send + Sync {
     fn command(
         &self,
         contract: &str,
+        major: u16,
         port: &str,
         request: Value,
     ) -> impl Future<Output = Result<Value, BackendError>> + Send;
@@ -177,19 +181,21 @@ impl PortCaller for PortClient {
     fn query(
         &self,
         contract: &str,
+        major: u16,
         port: &str,
         request: Value,
     ) -> impl Future<Output = Result<Value, BackendError>> + Send {
-        PortClient::query(self, contract, port, request)
+        PortClient::query(self, PortAccess::Agent, contract, major, port, request)
     }
 
     fn command(
         &self,
         contract: &str,
+        major: u16,
         port: &str,
         request: Value,
     ) -> impl Future<Output = Result<Value, BackendError>> + Send {
-        PortClient::command(self, contract, port, request)
+        PortClient::command(self, PortAccess::Agent, contract, major, port, request)
     }
 }
 
@@ -199,11 +205,12 @@ impl<P: PortCaller> PortCaller for Option<P> {
     async fn query(
         &self,
         contract: &str,
+        major: u16,
         port: &str,
         request: Value,
     ) -> Result<Value, BackendError> {
         match self {
-            Some(ports) => ports.query(contract, port, request).await,
+            Some(ports) => ports.query(contract, major, port, request).await,
             None => Err(BackendError::new(TOOL_UNAVAILABLE, false, json!({}))),
         }
     }
@@ -211,11 +218,12 @@ impl<P: PortCaller> PortCaller for Option<P> {
     async fn command(
         &self,
         contract: &str,
+        major: u16,
         port: &str,
         request: Value,
     ) -> Result<Value, BackendError> {
         match self {
-            Some(ports) => ports.command(contract, port, request).await,
+            Some(ports) => ports.command(contract, major, port, request).await,
             None => Err(BackendError::new(TOOL_UNAVAILABLE, false, json!({}))),
         }
     }
@@ -223,6 +231,7 @@ impl<P: PortCaller> PortCaller for Option<P> {
 
 struct PortTool {
     contract: String,
+    major: u16,
     alias: String,
     port: String,
     kind: PortKind,
@@ -265,7 +274,7 @@ impl<P: PortCaller> PortTools<P> {
         let mut tools = HashMap::new();
         for contract in usable {
             for port in &contract.ports {
-                if port.kind == PortKind::Event {
+                if port.kind == PortKind::Event || port.event.is_some() {
                     continue;
                 }
                 let name = tool_name(&contract.identity, &port.name)?;
@@ -281,6 +290,7 @@ impl<P: PortCaller> PortTools<P> {
                     .map_err(|cause| LoadError(format!("{name}: {cause}")))?;
                 let tool = PortTool {
                     contract: contract.identity.clone(),
+                    major: contract.major,
                     alias: alias(&contract.identity).to_owned(),
                     port: port.name.clone(),
                     kind: port.kind,
@@ -388,14 +398,14 @@ impl<P: PortCaller> ToolExecutor for PortTools<P> {
             PortKind::Query => tokio::select! {
                 biased;
                 () = cancel.cancelled() => return tool.refused(CANCELLED, false),
-                result = self.ports.query(&tool.contract, &tool.port, request) => result,
+                result = self.ports.query(&tool.contract, tool.major, &tool.port, request) => result,
             },
             // Sent once. Once polled it may have taken effect, so cancellation from here on
             // leaves its outcome unknown; it is never re-sent either way.
             PortKind::Command => tokio::select! {
                 biased;
                 () = cancel.cancelled() => return tool.refused(TOOL_OUTCOME_UNKNOWN, false),
-                result = self.ports.command(&tool.contract, &tool.port, request) => result,
+                result = self.ports.command(&tool.contract, tool.major, &tool.port, request) => result,
             },
             PortKind::Event => return tool.refused(TOOL_UNAVAILABLE, false),
         };
@@ -642,7 +652,7 @@ impl<P: PortCaller> TurnTools<P> {
     /// Runs one turn within [`TurnBounds::PRODUCTION`]: the `system` message, then `history`,
     /// against `model`, offering these tools.
     ///
-    /// The bundled catalog always loads; a tool set that cannot be built ends the turn with
+    /// A tool set that cannot be built ends the turn with
     /// `agent.tool_unavailable` before the model is asked, never a panic.
     pub async fn run(
         self,
@@ -742,6 +752,7 @@ mod tests {
         fn query(
             &self,
             contract: &str,
+            _major: u16,
             port: &str,
             request: Value,
         ) -> impl Future<Output = Result<Value, BackendError>> + Send {
@@ -751,6 +762,7 @@ mod tests {
         fn command(
             &self,
             contract: &str,
+            _major: u16,
             port: &str,
             request: Value,
         ) -> impl Future<Output = Result<Value, BackendError>> + Send {

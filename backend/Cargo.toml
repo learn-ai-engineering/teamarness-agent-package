@@ -16,6 +16,8 @@ teamarness-package-sdk = { path = "../vendor/teamarness/package-sdk" }
 tokio.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
+sha2.workspace = true
 teamarness-package-sdk = { path = "../vendor/teamarness/package-sdk", features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net"] }

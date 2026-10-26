@@ -28,6 +28,7 @@ function fakeBackend(input?: {
   refusePackageSet?: string;
   /** Every `agent.packages.set` waits for this before it answers. */
   holdPackageSet?: Promise<void>;
+  holdFirstPackageGet?: Promise<void>;
   /** Every `agent.packages.get` after the first fails with this code. */
   failLaterPackageGets?: string;
 }) {
@@ -93,12 +94,14 @@ function fakeBackend(input?: {
         chat = { entries: [], pending: false };
         return chat;
       },
-      "agent.packages.get": () => {
+      "agent.packages.get": async () => {
         packageGets += 1;
         if (input?.failLaterPackageGets && packageGets > 1) {
           throw createPackageRequestError({ stage: "ui", packageError: { code: input.failLaterPackageGets, retryable: true } });
         }
-        return { packages };
+        const snapshot = packages;
+        if (packageGets === 1) await input?.holdFirstPackageGet;
+        return { packages: snapshot };
       },
       "agent.packages.set": async (payload) => {
         const { contract, enabled } = payload as { contract: string; enabled: boolean };
@@ -109,7 +112,7 @@ function fakeBackend(input?: {
         if (!packages.some((entry) => entry.contract === contract)) {
           throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.unknown_package" } });
         }
-        packages = packages.map((entry) => (entry.contract === contract ? { ...entry, enabled } : entry));
+        packages = packages.map((entry) => (entry.contract === contract ? { ...entry, enabled, enabledMajor: enabled ? entry.major : null } : entry));
         return { packages };
       },
     },
@@ -120,7 +123,7 @@ function fakeBackend(input?: {
     chat = { entries: [...chat.entries, { id: chat.entries.length + 1, role: "assistant", content }], pending: false };
     await fake.emit("agent.chat.changes", chat satisfies PackageValue);
   };
-  return { fake, client: fake.client, reply, secretSeen: () => fake.calls.some((call) => JSON.stringify(call.payload).includes(SECRET)) };
+  return { fake, client: fake.client, reply, updatePackages: (next: PackageView[]) => { packages = next; }, secretSeen: () => fake.calls.some((call) => JSON.stringify(call.payload).includes(SECRET)) };
 }
 
 function lastState(states: AgentUiState[]): AgentUiState {
@@ -247,8 +250,8 @@ describe("Agent Package UI controller", () => {
   it("describes every status state without exposing details", () => {
     expect(describeStatus({ state: "unconfigured" })).toBe("Not configured: add the endpoint, model and API key.");
     expect(describeStatus({ state: "no_agent" })).toBe("No Agent: choose one of your Agents below.");
-    expect(describeStatus({ state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } })).toBe("Ready: Scout replies when addressed.");
-    expect(describeStatus({ state: "ready", agent: { principalId: AGENT_ID, name: null } })).toBe("Ready: the Agent replies when addressed.");
+    expect(describeStatus({ state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } })).toBe("Ready: Scout.");
+    expect(describeStatus({ state: "ready", agent: { principalId: AGENT_ID, name: null } })).toBe("Ready: the Agent is configured.");
     expect(describeStatus({ state: "replying" })).toBe("Replying...");
     expect(describeStatus({ state: "error", lastError: { code: "agent.endpoint_rejected", retryable: false } })).toBe("Error: agent.endpoint_rejected");
     expect(describeStatus(null)).toBe("Loading...");
@@ -334,7 +337,7 @@ describe("Agent Package UI mount", () => {
     if (picker) picker.value = AGENT_ID;
     root.querySelector<HTMLButtonElement>('button[data-action="bind"]')?.click();
     await flush();
-    expect(root.querySelector('[data-role="status"]')?.textContent).toBe("Ready: Scout replies when addressed.");
+    expect(root.querySelector('[data-role="status"]')?.textContent).toBe("Ready: Scout.");
 
     await fake.emit("agent.status.changes", { state: "error", lastError: { code: "agent.endpoint_rejected", retryable: false } } satisfies PackageValue);
     expect(root.querySelector('[data-role="status"]')?.textContent).toBe("Error: agent.endpoint_rejected");
@@ -550,6 +553,8 @@ describe("Agent Package UI chat activity", () => {
 describe("Agent Package UI packages", () => {
   const EXHIBITS: PackageView = {
     contract: "dev.teamarness.exhibits",
+    major: 3,
+    enabledMajor: null,
     name: "Exhibits",
     description: "Author Exhibits. Call runtime.guide first.",
     available: false,
@@ -557,6 +562,8 @@ describe("Agent Package UI packages", () => {
   };
   const NOTES: PackageView = {
     contract: "com.example.notes",
+    major: 1,
+    enabledMajor: 1,
     name: "Notes",
     description: "Notes for the Workspace.",
     available: true,
@@ -616,7 +623,7 @@ describe("Agent Package UI packages", () => {
     toggle.dispatchEvent(new Event("change", { bubbles: true }));
     await flush();
     const sets = fake.calls.filter((call) => call.operation === "agent.packages.set");
-    expect(sets.map((call) => call.payload)).toEqual([{ contract: "dev.teamarness.exhibits", enabled: true }]);
+    expect(sets.map((call) => call.payload)).toEqual([{ contract: "dev.teamarness.exhibits", enabled: true, major: 3 }]);
     expect(section.querySelector('[data-role="packages-message"]')?.textContent).toBe("");
     expect(exhibits()?.checked).toBe(true);
     expect(exhibits()?.disabled).toBe(false);
@@ -636,7 +643,7 @@ describe("Agent Package UI packages", () => {
     const controller = createAgentController(client, (state) => { states.push(state); });
     await controller.start();
     expect(lastState(states).packages).toEqual([EXHIBITS]);
-    await controller.setPackage("com.example.gone", true);
+    await controller.setPackage("com.example.gone", false);
     expect(lastState(states).packagesError).toBe("agent.unknown_package");
     expect(lastState(states).packages).toEqual([EXHIBITS]);
     expect(lastState(states).packagesBusy).toBe(false);
@@ -687,6 +694,63 @@ describe("Agent Package UI packages", () => {
     expect(exhibits()).toBe(toggle);
     expect(toggle.checked).toBe(false);
     expect(toggle.disabled).toBe(false);
+    await cleanup();
+  });
+
+  it("disables an unavailable retained major by identity without silently adopting the offer", async () => {
+    const retained = { ...EXHIBITS, major: 4, enabled: true, enabledMajor: 2 };
+    const { fake, section, cleanup } = await mountedWith([retained]);
+    expect(section.querySelector('[data-role="package-version"]')?.textContent).toBe("Enabled major 2; offered major 4");
+    const toggle = section.querySelector<HTMLInputElement>('input[role="switch"]');
+    if (!toggle) throw new Error("switch missing");
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(fake.calls.filter((call) => call.operation === "agent.packages.set").map((call) => call.payload)).toEqual([
+      { contract: EXHIBITS.contract, enabled: false },
+    ]);
+    expect(toggle.checked).toBe(false);
+    await cleanup();
+  });
+
+  it("does not let an older Packages read overwrite a newer successful change", async () => {
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const { fake, client } = fakeBackend({ packages: [{ ...EXHIBITS, enabled: true, enabledMajor: 3 }], holdFirstPackageGet: held });
+    const states: AgentUiState[] = [];
+    const controller = createAgentController(client, (state) => { states.push(state); });
+    const starting = controller.start();
+    await flush();
+    expect(fake.calls.some((call) => call.operation === "agent.packages.get")).toBe(true);
+    await controller.setPackage(EXHIBITS.contract, false);
+    expect(lastState(states).packages?.[0]?.enabled).toBe(false);
+    release(); await starting;
+    expect(lastState(states).packages?.[0]?.enabled).toBe(false);
+    expect(lastState(states).packagesBusy).toBe(false);
+    controller.dispose();
+  });
+
+  it("refreshes an offer after a stale-major refusal before another explicit enable", async () => {
+    const { fake, section, updatePackages, cleanup } = await mountedWith([EXHIBITS], { refusePackageSet: "agent.capability_unavailable" });
+    const toggle = section.querySelector<HTMLInputElement>('input[role="switch"]');
+    if (!toggle) throw new Error("switch missing");
+    toggle.checked = true; toggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(toggle.checked).toBe(false);
+    updatePackages([{ ...EXHIBITS, major: 4 }]);
+    const refresh = section.querySelector<HTMLButtonElement>('[data-action="refresh-packages"]');
+    expect(refresh).not.toBeNull();
+    refresh?.click(); await flush();
+    expect(section.querySelector('[data-role="package-version"]')?.textContent).toBe("Offered major 4");
+    const freshToggle = section.querySelector<HTMLInputElement>('input[role="switch"]');
+    if (!freshToggle) throw new Error("refreshed switch missing");
+    freshToggle.checked = true; freshToggle.dispatchEvent(new Event("change", { bubbles: true }));
+    await flush();
+    expect(fake.calls.filter((call) => call.operation === "agent.packages.set").map((call) => call.payload)).toEqual([
+      { contract: EXHIBITS.contract, enabled: true, major: 3 },
+      { contract: EXHIBITS.contract, enabled: true, major: 4 },
+    ]);
+    expect(freshToggle.checked).toBe(false);
     await cleanup();
   });
 

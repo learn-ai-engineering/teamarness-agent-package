@@ -17,14 +17,12 @@ use serde_json::{Value, json};
 use teamarness_package_sdk::CancellationToken;
 use teamarness_package_sdk::capabilities::agent_binding::BoundAgent;
 use teamarness_package_sdk::capabilities::principals::{Principal, PrincipalKind, Principals};
-use teamarness_package_sdk::ports::PortClient;
+use teamarness_package_sdk::ports::{PortAccess, PortClient};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::access;
-use crate::catalog::Catalog;
 use crate::mention::mentions;
 use crate::model::{ChatMessage, ConfiguredModel, ModelClient};
-use crate::packages::PackagesStore;
 use crate::progress::{Cursor, Progress};
 use crate::settings::SettingsStore;
 use crate::skills;
@@ -53,10 +51,6 @@ pub struct HarnessInputs {
     pub status: Arc<StatusCell>,
     /// Shared across suspend/resume so blocking writes have one serialized owner.
     pub progress: Arc<Mutex<Progress>>,
-    /// The Steward's Package enablement, read when each reply starts.
-    pub packages: Arc<Mutex<PackagesStore>>,
-    /// The Provider contracts the Agent knows.
-    pub catalog: &'static (dyn Catalog + Send + Sync),
 }
 
 pub struct TaskHandle {
@@ -225,10 +219,23 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
         if cancellation.is_cancelled() || !state.inputs.status.is_ready_to_run() {
             break;
         }
+        let enabled = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            summaries = crate::catalog::summaries(&state.inputs.ports) => summaries.is_ok_and(|rows|
+                rows.iter().any(|row| row.contract == CONVERSATIONS_CONTRACT && row.major == 1
+                    && row.available && row.enabled && row.enabled_major == Some(1))),
+        };
+        if !enabled {
+            if wait_or_cancel(&cancellation, RETRY).await {
+                break;
+            }
+            continue;
+        }
         let subscription = tokio::select! {
             biased;
             () = cancellation.cancelled() => break,
-            events = state.inputs.ports.subscribe_event(CONVERSATIONS_CONTRACT, "messages.changed") => events,
+            events = state.inputs.ports.subscribe_event(PortAccess::Agent, CONVERSATIONS_CONTRACT, 1, "messages.changed") => events,
         };
         let mut events = match subscription {
             Ok(events) => events,
@@ -263,7 +270,14 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
                 }
                 next = events.recv() => match next {
                     Some(Ok(_)) => state.pass().await,
-                    Some(Err(_)) | None => { events.close().await; break; }
+                    Some(Err(_)) | None => {
+                        events.close().await;
+                        // End affected turns before explicit reconnect, even for an idle stream.
+                        state.shutdown().await;
+                        state.work = cancellation.child();
+                        state.slots.clear();
+                        break;
+                    }
                 },
                 () = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
                     state.pass().await;
@@ -303,7 +317,7 @@ impl Loop {
         tokio::select! {
             biased;
             () = self.work.cancelled() => Err(()),
-            response = self.inputs.ports.query(CONVERSATIONS_CONTRACT, port, request) => response.map_err(|_| ()),
+            response = self.inputs.ports.query(PortAccess::Agent, CONVERSATIONS_CONTRACT, 1, port, request) => response.map_err(|_| ()),
         }
     }
 
@@ -668,27 +682,20 @@ async fn reply(
     cancellation: &CancellationToken,
 ) -> ReplyOutcome {
     let settings = inputs.settings.clone();
-    let packages = inputs.packages.clone();
     let configured = teamarness_package_sdk::blocking(cancellation, move |cancel| {
         let store = settings.lock().map_err(|_| crate::storage_failed())?;
         if cancel.is_cancelled() {
             return Err(crate::storage_failed());
         }
-        let enabled = packages
-            .lock()
-            .map_err(|_| crate::storage_failed())?
-            .enabled()
-            .to_vec();
         Ok((
             store.settings().endpoint_base_url.clone(),
             store.settings().model.clone(),
             store.api_key().map_err(|_| crate::storage_failed())?,
-            enabled,
         ))
     })
     .await;
-    let (endpoint, model, key, enabled) = match configured {
-        Ok((endpoint, model, Some(key), enabled)) => (endpoint, model, key, enabled),
+    let (endpoint, model, key) = match configured {
+        Ok((endpoint, model, Some(key))) => (endpoint, model, key),
         Err(_) if cancellation.is_cancelled() => return ReplyOutcome::Cancelled,
         _ => return ReplyOutcome::Failed(crate::model::ENDPOINT_REJECTED, false),
     };
@@ -696,7 +703,10 @@ async fn reply(
     let usable = tokio::select! {
         biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        usable = access::usable_now(inputs.catalog, Some(&inputs.ports), &enabled) => usable,
+        usable = access::usable_now(Some(&inputs.ports)) => match usable {
+            Ok(usable) => usable,
+            Err(_) => return ReplyOutcome::Failed(crate::turn::TOOL_UNAVAILABLE, false),
+        },
     };
     let tools = TurnTools::new(&usable, inputs.ports.clone(), skills::bundled());
     let system = system_message(&prompt.agent, &prompt.system_prompt, tools.context());
@@ -724,7 +734,7 @@ async fn reply(
         biased;
         () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
         post = inputs.ports.command(
-            CONVERSATIONS_CONTRACT,
+            PortAccess::Agent, CONVERSATIONS_CONTRACT, 1,
             "message.post",
             json!({"channelId":channel,"markdown":markdown}),
         ) => post,

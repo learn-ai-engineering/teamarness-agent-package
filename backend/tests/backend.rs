@@ -1,6 +1,8 @@
 //! The Agent Package through the SDK harness: settings and key storage, Agent Binding through the
 //! capability, and the status state machine, with no model endpoint involved.
 
+mod support;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -271,7 +273,7 @@ fn manifest() -> Value {
 type Consumed = (String, u64, u64, u64, Vec<(String, String)>);
 
 #[test]
-fn manifest_and_catalog_agree() {
+fn fixed_harness_declaration_matches_its_historical_fixture() {
     let manifest = manifest();
     let declared: Vec<Consumed> = manifest["consumedPorts"]
         .as_array()
@@ -305,6 +307,7 @@ fn manifest_and_catalog_agree() {
     let bundled: Vec<Consumed> = BundledCatalog::get()
         .contracts()
         .iter()
+        .filter(|contract| contract.identity == support::CONVERSATIONS)
         .map(|contract| {
             (
                 contract.identity.clone(),
@@ -319,7 +322,7 @@ fn manifest_and_catalog_agree() {
             )
         })
         .collect();
-    // Same contracts, the exact bundled minor, and the same ports; order is not meaningful.
+    // Only the built-in harness keeps a fixed dependency, with all five original ports.
     let sorted = |mut contracts: Vec<Consumed>| {
         for contract in &mut contracts {
             contract.4.sort();
@@ -331,7 +334,7 @@ fn manifest_and_catalog_agree() {
 }
 
 #[test]
-fn optional_contracts_are_not_required() {
+fn fixed_consumed_ports_are_only_for_conversations_and_package_ports_negotiates_two() {
     let manifest = manifest();
     let required: Vec<(&str, bool)> = manifest["consumedPorts"]
         .as_array()
@@ -344,13 +347,16 @@ fn optional_contracts_are_not_required() {
             )
         })
         .collect();
+    assert_eq!(required, [("dev.teamarness.conversations", true)]);
+    let ports = manifest["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|capability| capability["identity"] == "teamarness.package-ports")
+        .unwrap();
     assert_eq!(
-        required,
-        [
-            ("dev.teamarness.conversations", true),
-            ("dev.teamarness.documents", false),
-            ("dev.teamarness.exhibits", false),
-        ]
+        ports,
+        &json!({"identity":"teamarness.package-ports","major":2,"minMinor":0,"maxMinor":0})
     );
 }
 
@@ -822,117 +828,88 @@ async fn a_failed_binding_change_does_not_block_later_binding_changes() {
 
 const EXHIBITS: &str = "dev.teamarness.exhibits";
 
-/// A package-ports capability whose `available` answer reports `contracts` as available. Every
-/// declared contract is listed, as the Host lists every contract the manifest declares.
-fn ports_reporting(available: &[&'static str]) -> ScriptedCapability {
-    let available = available.to_vec();
-    ScriptedCapability::new().calls(move |method, _| match method {
-        "available" => Ok(json!({
-            "contracts": manifest()["consumedPorts"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|contract| {
-                    let identity = contract["identity"].as_str().unwrap();
-                    json!({
-                        "contract": identity,
-                        "major": contract["major"],
-                        "minor": contract["minMinor"],
-                        "available": available.contains(&identity),
-                        "ports": contract["ports"],
-                    })
-                })
-                .collect::<Vec<_>>(),
-        })),
-        _ => Err(BackendError::new("port_ungranted", false, empty())),
+fn host_ports(catalog: &support::HostCatalog, bindings: &FakeBindings) -> ScriptedCapability {
+    let catalog = catalog.clone();
+    let bindings = bindings.clone();
+    ScriptedCapability::new().calls(move |method, request| {
+        if bindings.bound.lock().unwrap().is_none() {
+            return Err(BackendError::new("agent_not_bound", false, empty()));
+        }
+        catalog
+            .handle(method, &request)
+            .unwrap_or_else(|| Err(BackendError::new("ungranted_port", false, empty())))
     })
 }
 
-fn exhibits_view(available: bool, enabled: bool) -> Value {
-    let description = BundledCatalog::get()
-        .contracts()
-        .iter()
-        .find(|contract| contract.identity == EXHIBITS)
-        .unwrap()
-        .description
-        .clone();
-    json!({"packages": [{
-        "contract": EXHIBITS,
-        "name": "Exhibits",
-        "description": description,
-        "available": available,
-        "enabled": enabled,
-    }]})
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn packages_get_lists_exhibits_only() {
+async fn package_switches_use_host_success_pins_and_unavailable_disable_and_never_local_preferences()
+ {
     let data = tempfile::tempdir().unwrap();
+    let legacy = br#"{"schemaVersion":1,"enabled":["dev.teamarness.exhibits"]}"#;
+    std::fs::write(data.path().join("packages.json"), legacy).unwrap();
     let bindings = stewarded();
+    let catalog = support::HostCatalog::providers();
+    let ports = host_ports(&catalog, &bindings);
     let Fixture { mut harness, .. } = start_with_ports(
         data.path(),
         &bindings,
         principals_capability(),
-        ports_reporting(&["dev.teamarness.conversations", EXHIBITS]),
+        ports.clone(),
     )
     .await;
     harness.activate().await.unwrap();
-    let packages = harness
+    let missing = harness
+        .request("agent.packages.get", empty())
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), "agent.binding_required");
+    harness
+        .request("agent.binding.set", json!({"principalId":AGENT_ID}))
+        .await
+        .unwrap();
+    let view = harness
         .request("agent.packages.get", empty())
         .await
         .unwrap();
-    // Conversations and Documents have no runtime.guide, so they are not agent-facing.
-    assert_eq!(packages, exhibits_view(true, false));
-    harness.shutdown().await.unwrap();
-
-    // Exhibits not installed: listed, but unavailable.
-    let Fixture { mut harness, .. } = start_with_ports(
-        data.path(),
-        &bindings,
-        principals_capability(),
-        ports_reporting(&["dev.teamarness.conversations"]),
-    )
-    .await;
-    harness.activate().await.unwrap();
-    let packages = harness
-        .request("agent.packages.get", empty())
-        .await
-        .unwrap();
-    assert_eq!(packages, exhibits_view(false, false));
-    harness.shutdown().await.unwrap();
-
-    // The Host could not answer: every contract is unavailable, and activation still succeeds.
-    let Fixture { mut harness, .. } = start(data.path(), &bindings).await;
-    harness.activate().await.unwrap();
-    let packages = harness
-        .request("agent.packages.get", empty())
-        .await
-        .unwrap();
-    assert_eq!(packages, exhibits_view(false, false));
-    harness.shutdown().await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn packages_set_persists_across_restart_and_suspend_resume() {
-    let data = tempfile::tempdir().unwrap();
-    let bindings = stewarded();
-    let ports = || ports_reporting(&[EXHIBITS]);
-    let Fixture { mut harness, .. } =
-        start_with_ports(data.path(), &bindings, principals_capability(), ports()).await;
-    harness.activate().await.unwrap();
+    assert!(
+        view["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["enabled"] == false)
+    );
+    let enable = json!({"contract": EXHIBITS,"enabled":true,"major":1});
+    *catalog.refusal.lock().unwrap() = Some("storage_failed");
+    assert!(
+        harness
+            .request("agent.packages.set", enable.clone())
+            .await
+            .is_err()
+    );
+    assert!(catalog.selections.lock().unwrap().is_empty());
+    *catalog.refusal.lock().unwrap() = None;
     let enabled = harness
-        .request(
-            "agent.packages.set",
-            json!({"contract": EXHIBITS, "enabled": true}),
-        )
+        .request("agent.packages.set", enable.clone())
         .await
         .unwrap();
-    assert_eq!(enabled, exhibits_view(true, true));
-    let document: Value =
-        serde_json::from_str(&std::fs::read_to_string(data.path().join("packages.json")).unwrap())
-            .unwrap();
-    assert_eq!(document, json!({"schemaVersion": 1, "enabled": [EXHIBITS]}));
-
+    assert_eq!(enabled["packages"][1]["enabledMajor"], 1);
+    // Metadata changes after the UI observed major 1. No implicit upgrade.
+    catalog.documents.lock().unwrap().get_mut(EXHIBITS).unwrap()["contracts"][0]["major"] =
+        json!(2);
+    assert!(harness.request("agent.packages.set", enable).await.is_err());
+    let changed = harness
+        .request("agent.packages.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(changed["packages"][1]["major"], 2);
+    assert_eq!(changed["packages"][1]["enabledMajor"], 1);
+    assert_eq!(changed["packages"][1]["available"], false);
+    catalog.documents.lock().unwrap().remove(EXHIBITS);
+    let unavailable = harness
+        .request("agent.packages.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(unavailable["packages"][1]["enabled"], true);
     harness.suspend().await.unwrap();
     harness.recover().await.unwrap();
     assert_eq!(
@@ -940,86 +917,215 @@ async fn packages_set_persists_across_restart_and_suspend_resume() {
             .request("agent.packages.get", empty())
             .await
             .unwrap(),
-        exhibits_view(true, true)
+        unavailable
     );
     harness.shutdown().await.unwrap();
-
-    // A new process generation reads the choice back, then a disable persists too.
-    let Fixture { mut harness, .. } =
-        start_with_ports(data.path(), &bindings, principals_capability(), ports()).await;
+    let Fixture { mut harness, .. } = start_with_ports(
+        data.path(),
+        &bindings,
+        principals_capability(),
+        host_ports(&catalog, &bindings),
+    )
+    .await;
     harness.activate().await.unwrap();
     assert_eq!(
         harness
             .request("agent.packages.get", empty())
             .await
             .unwrap(),
-        exhibits_view(true, true)
+        unavailable
     );
     let disabled = harness
         .request(
             "agent.packages.set",
-            json!({"contract": EXHIBITS, "enabled": false}),
+            json!({"contract":EXHIBITS,"enabled":false}),
         )
         .await
         .unwrap();
-    assert_eq!(disabled, exhibits_view(true, false));
-    harness.shutdown().await.unwrap();
-
-    let Fixture { mut harness, .. } =
-        start_with_ports(data.path(), &bindings, principals_capability(), ports()).await;
-    harness.activate().await.unwrap();
+    assert!(
+        disabled["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["contract"] != EXHIBITS)
+    );
     assert_eq!(
-        harness
-            .request("agent.packages.get", empty())
-            .await
-            .unwrap(),
-        exhibits_view(true, false)
+        std::fs::read(data.path().join("packages.json")).unwrap(),
+        legacy
+    );
+    for call in ports.recorded_calls() {
+        if call.method == "enable" {
+            assert_eq!(call.payload, json!({"contract":EXHIBITS,"major":1}));
+        }
+        if call.method == "available" {
+            assert_eq!(call.payload, json!({"access":"agent"}));
+        }
+    }
+    harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn package_enable_requires_observed_major_and_closed_payload() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
+    let catalog = support::HostCatalog::providers();
+    let ports = host_ports(&catalog, &bindings);
+    let Fixture { mut harness, .. } = start_with_ports(
+        data.path(),
+        &bindings,
+        principals_capability(),
+        ports.clone(),
+    )
+    .await;
+    harness.activate().await.unwrap();
+    for payload in [
+        json!({"contract":EXHIBITS,"enabled":true}),
+        json!({"contract":EXHIBITS,"enabled":true,"major":0}),
+        json!({"contract":EXHIBITS,"enabled":false,"major":1}),
+        json!({"contract":EXHIBITS,"enabled":true,"major":1,"extra":true}),
+    ] {
+        assert!(
+            harness
+                .request("agent.packages.set", payload)
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        ports
+            .recorded_calls()
+            .iter()
+            .all(|call| call.method != "enable" && call.method != "disable")
     );
     harness.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn packages_set_rejects_non_agent_facing() {
+async fn host_discovery_lists_unknown_and_retained_selected_major_without_local_grants() {
     let data = tempfile::tempdir().unwrap();
+    let legacy = br#"{"schemaVersion":1,"enabled":["dev.teamarness.exhibits"]}"#;
+    std::fs::write(data.path().join("packages.json"), legacy).unwrap();
+    let ports = ScriptedCapability::new().calls(|method, request| {
+        let _ = (method, request);
+        Ok(json!({"contracts":[{
+            "contract":"com.example.unknown", "major":3, "minor":null,
+            "description":null, "available":false, "enabled":true,
+            "enabledMajor":2, "metadataSha256":null
+        }]}))
+    });
     let bindings = stewarded();
+    *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
     let Fixture { mut harness, .. } = start_with_ports(
         data.path(),
         &bindings,
         principals_capability(),
-        ports_reporting(&["dev.teamarness.conversations", EXHIBITS]),
+        ports.clone(),
     )
     .await;
     harness.activate().await.unwrap();
-    for contract in [
-        "dev.teamarness.conversations",
-        "dev.teamarness.documents",
-        "com.example.unknown",
-    ] {
-        let error = harness
-            .request(
-                "agent.packages.set",
-                json!({"contract": contract, "enabled": true}),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), "agent.unknown_package", "{contract}");
-        assert!(!error.retryable());
-    }
-    let error = harness
-        .request(
-            "agent.packages.set",
-            json!({"contract": EXHIBITS, "enabled": true, "extra": 1}),
-        )
+    let view = harness
+        .request("agent.packages.get", empty())
         .await
-        .unwrap_err();
-    assert_eq!(error.code(), "package.invalid_payload");
-    // Nothing was enabled by the refused requests.
+        .unwrap();
     assert_eq!(
-        harness
+        view,
+        json!({"packages":[{
+            "contract":"com.example.unknown", "name":"Unknown", "description":"",
+            "major":3, "enabledMajor":2, "available":false, "enabled":true
+        }]})
+    );
+    assert_eq!(
+        std::fs::read(data.path().join("packages.json")).unwrap(),
+        legacy
+    );
+    assert_eq!(ports.recorded_calls()[0].payload, json!({"access":"agent"}));
+    harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_summary_pages_are_complete_sorted_and_bounded_before_ui_publication() {
+    for malformed in [false, true] {
+        let data = tempfile::tempdir().unwrap();
+        let bindings = stewarded();
+        *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
+        let ports = ScriptedCapability::new().calls(move |_, request| {
+            let identity = if request.get("cursor").is_none() || malformed { "com.example.alpha" } else { "com.example.beta" };
+            let mut page = json!({"contracts":[{"contract":identity,"major":1,"minor":0,"description":"Discovered live.","available":true,"enabled":false,"enabledMajor":null,"metadataSha256":"a".repeat(64)}]});
+            if request.get("cursor").is_none() { page["nextCursor"] = json!("second"); }
+            Ok(page)
+        });
+        let Fixture { mut harness, .. } = start_with_ports(
+            data.path(),
+            &bindings,
+            principals_capability(),
+            ports.clone(),
+        )
+        .await;
+        harness.activate().await.unwrap();
+        let result = harness.request("agent.packages.get", empty()).await;
+        if malformed {
+            assert!(
+                result.is_err(),
+                "repeated/out-of-order identity must not publish partial state"
+            );
+        } else {
+            let view = result.unwrap();
+            assert_eq!(view["packages"][0]["contract"], "com.example.alpha");
+            assert_eq!(view["packages"][1]["contract"], "com.example.beta");
+        }
+        assert_eq!(ports.recorded_calls().len(), 2);
+        assert_eq!(
+            ports.recorded_calls()[1].payload,
+            json!({"access":"agent","cursor":"second"})
+        );
+        harness.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_summary_overflow_empty_continuation_and_cursor_cycles_refuse_without_partial_success()
+{
+    for case in ["overflow", "empty", "cursor-cycle", "reverse-order"] {
+        let data = tempfile::tempdir().unwrap();
+        let bindings = stewarded();
+        *bindings.bound.lock().unwrap() = Some(agent_row(AGENT_ID, AGENT_KEY, "Scout"));
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = counter.clone();
+        let ports = ScriptedCapability::new().calls(move |_, _| {
+            let page = observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rows = match case { "overflow" => 32, "empty" => 0, _ => 1 };
+            let contracts: Vec<_> = (0..rows).map(|row| json!({
+                "contract":format!("com.example.row-{:03}", if case == "reverse-order" { 100-page } else { page*32+row }),
+                "major":1,"minor":0,"description":"Live.","available":true,"enabled":false,"enabledMajor":null,"metadataSha256":"a".repeat(64)
+            })).collect();
+            Ok(json!({"contracts":contracts,"nextCursor": if page.is_multiple_of(2) { "cursor-a" } else { "cursor-b" }}))
+        });
+        let Fixture { mut harness, .. } = start_with_ports(
+            data.path(),
+            &bindings,
+            principals_capability(),
+            ports.clone(),
+        )
+        .await;
+        harness.activate().await.unwrap();
+        let error = harness
             .request("agent.packages.get", empty())
             .await
-            .unwrap(),
-        exhibits_view(true, false)
-    );
-    harness.shutdown().await.unwrap();
+            .unwrap_err();
+        assert_eq!(error.code(), "agent.capability_unavailable");
+        assert_eq!(error.details()["causeCode"], "agent.invalid_metadata");
+        assert!(
+            counter.load(std::sync::atomic::Ordering::SeqCst) <= 3,
+            "bounded {case}"
+        );
+        assert!(
+            ports
+                .recorded_calls()
+                .iter()
+                .all(|call| call.method == "available")
+        );
+        assert!(!data.path().join("packages.json").exists());
+        harness.shutdown().await.unwrap();
+    }
 }

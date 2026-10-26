@@ -191,6 +191,13 @@ pub struct SyncState {
     pub pending_record_count: u64,
 }
 
+/// The fixed installation-local prefix scanned by a v1.1 subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayEnd {
+    pub cursor: Cursor,
+    pub gap_free: bool,
+}
+
 /// A condition the host wants the Package to know about, named by a stable code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncWarning {
@@ -203,6 +210,7 @@ pub enum RecordLogEvent {
     Record(Box<RecordEvent>),
     State(SyncState),
     Warning(SyncWarning),
+    ReplayEnd(ReplayEnd),
 }
 
 /// A typed client for `teamarness.synchronization.immutable-record-log`.
@@ -402,10 +410,14 @@ impl Delivery {
     }
 
     /// Accepts the event, letting the host send the next one.
-    pub async fn acknowledge(mut self) {
+    pub async fn acknowledge(mut self) -> Result<(), BackendError> {
         if let Some(credit) = self.credit.take() {
-            credit.release().await;
+            credit
+                .release()
+                .await
+                .map_err(|_| BackendError::new("host_unavailable", true, empty()))?;
         }
+        Ok(())
     }
 }
 
@@ -443,6 +455,12 @@ pub trait RecordLogSink: Send + Sync + 'static {
 
     /// The session failed and will retry.
     fn on_session_error(&self, _error: &BackendError) {}
+
+    /// Called only for a gap-free, from-start marker after all prior ingests and credits.
+    fn on_qualified_replay(&self, _boundary: &ReplayEnd) {}
+
+    /// A failed or closed stream invalidates a qualification for this session generation.
+    fn on_replay_invalidated(&self) {}
 }
 
 /// How long a session waits before resubscribing.
@@ -474,9 +492,32 @@ pub async fn run_session(
     cancellation: CancellationToken,
     options: SessionOptions,
 ) {
+    run_session_inner(log, sink, cancellation, options, false).await;
+}
+
+/// Starts with a v1.1 from-start replay, then resumes cursored live delivery.
+/// A broken first replay restarts from the beginning rather than certifying a gap.
+pub async fn run_session_from_start(
+    log: RecordLog,
+    sink: Arc<dyn RecordLogSink>,
+    cancellation: CancellationToken,
+    options: SessionOptions,
+) {
+    run_session_inner(log, sink, cancellation, options, true).await;
+}
+
+async fn run_session_inner(
+    log: RecordLog,
+    sink: Arc<dyn RecordLogSink>,
+    cancellation: CancellationToken,
+    options: SessionOptions,
+    from_start: bool,
+) {
+    let mut qualified = !from_start;
     let mut backoff = options.initial_backoff;
     loop {
         if cancellation.is_cancelled() {
+            sink.on_replay_invalidated();
             return;
         }
         let cursor = {
@@ -496,8 +537,11 @@ pub async fn run_session(
                 continue;
             }
         };
-        let started_from_cursor = cursor.is_some();
-        let mut subscription = match log.subscribe(cursor.as_ref()).await {
+        let started_from_cursor = qualified && cursor.is_some();
+        let mut subscription = match log
+            .subscribe(if qualified { cursor.as_ref() } else { None })
+            .await
+        {
             Ok(subscription) => subscription,
             Err(error) => {
                 if cancellation.is_cancelled() {
@@ -511,14 +555,26 @@ pub async fn run_session(
             }
         };
         let mut progressed = false;
-        let outcome = deliver(&mut subscription, &sink, &cancellation, &mut progressed).await;
+        let outcome = deliver(
+            &mut subscription,
+            &sink,
+            &cancellation,
+            &mut progressed,
+            !qualified,
+            &mut qualified,
+        )
+        .await;
         subscription.close().await;
+        sink.on_replay_invalidated();
+        if from_start {
+            qualified = false;
+        }
         if progressed {
             backoff = options.initial_backoff;
         }
         match outcome {
             Outcome::Cancelled => return,
-            Outcome::Ended => {
+            Outcome::Ended | Outcome::ReplayUnqualified => {
                 if !back_off(&cancellation, &mut backoff, options).await {
                     return;
                 }
@@ -563,6 +619,7 @@ pub async fn run_session(
 enum Outcome {
     Cancelled,
     Ended,
+    ReplayUnqualified,
     CursorInvalid,
     Failed(BackendError),
 }
@@ -572,6 +629,8 @@ async fn deliver(
     sink: &Arc<dyn RecordLogSink>,
     cancellation: &CancellationToken,
     progressed: &mut bool,
+    from_start: bool,
+    qualified: &mut bool,
 ) -> Outcome {
     loop {
         let delivery = tokio::select! {
@@ -604,8 +663,26 @@ async fn deliver(
             }
             RecordLogEvent::State(state) => sink.on_state(state),
             RecordLogEvent::Warning(warning) => sink.on_warning(warning),
+            RecordLogEvent::ReplayEnd(boundary) => {
+                let boundary = boundary.clone();
+                if let Err(error) = delivery.acknowledge().await {
+                    return Outcome::Failed(error);
+                }
+                if from_start {
+                    if !boundary.gap_free {
+                        return Outcome::ReplayUnqualified;
+                    }
+                    if !cancellation.is_cancelled() {
+                        sink.on_qualified_replay(&boundary);
+                        *qualified = true;
+                    }
+                }
+                continue;
+            }
         }
-        delivery.acknowledge().await;
+        if let Err(error) = delivery.acknowledge().await {
+            return Outcome::Failed(error);
+        }
     }
 }
 
@@ -643,6 +720,12 @@ fn decode_event(payload: &JsonValue) -> Result<RecordLogEvent, BackendError> {
         })),
         "warning" => Ok(RecordLogEvent::Warning(SyncWarning {
             code: string_field(payload, "code")?,
+        })),
+        "replay_end" => Ok(RecordLogEvent::ReplayEnd(ReplayEnd {
+            cursor: Cursor::decode(payload, "cursor")?,
+            gap_free: field(payload, "gapFree")?
+                .as_bool()
+                .ok_or_else(invalid_response)?,
         })),
         _ => Err(invalid_response()),
     }

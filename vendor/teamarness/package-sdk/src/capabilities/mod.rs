@@ -6,6 +6,7 @@
 //! half-decoded value.
 
 pub mod agent_binding;
+pub mod content_views;
 pub mod membership;
 pub mod principals;
 pub mod record_log;

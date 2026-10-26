@@ -109,13 +109,15 @@
     "packageView": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["contract", "name", "description", "available", "enabled"],
+      "required": ["contract", "name", "description", "available", "enabled", "major", "enabledMajor"],
       "properties": {
         "contract": { "$ref": "#/$defs/contractIdentity" },
         "name": { "type": "string", "minLength": 1, "maxLength": 128 },
         "description": { "type": "string", "maxLength": 1024 },
         "available": { "type": "boolean" },
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "major": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "enabledMajor": { "anyOf": [{ "type": "integer", "minimum": 1, "maximum": 65535 }, { "type": "null" }] }
       }
     },
     "contractIdentity": { "type": "string", "minLength": 1, "maxLength": 256 },
@@ -210,13 +212,25 @@
     },
     "agent.packages.set": {
       "request": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["contract", "enabled"],
-        "properties": {
-          "contract": { "$ref": "#/$defs/contractIdentity" },
-          "enabled": { "type": "boolean" }
-        }
+        "oneOf": [
+          {
+            "type": "object", "additionalProperties": false,
+            "required": ["contract", "enabled", "major"],
+            "properties": {
+              "contract": { "$ref": "#/$defs/contractIdentity" },
+              "enabled": { "const": true },
+              "major": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            }
+          },
+          {
+            "type": "object", "additionalProperties": false,
+            "required": ["contract", "enabled"],
+            "properties": {
+              "contract": { "$ref": "#/$defs/contractIdentity" },
+              "enabled": { "const": false }
+            }
+          }
+        ]
       },
       "response": { "$ref": "#/$defs/packages" }
     }

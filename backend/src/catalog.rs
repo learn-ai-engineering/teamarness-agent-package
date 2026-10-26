@@ -1,13 +1,7 @@
-//! The Catalog seam: which Provider contracts the Agent knows, with their ports and schemas.
+//! Host-backed, complete per-turn metadata at the Catalog seam.
 //!
-//! [`BundledCatalog`] is the implementation used today. It compiles in verbatim copies of Provider
-//! `ports.json` files from `backend/catalog/`, whose provenance and digests
-//! `npm run check:catalog` verifies. A later Host-discovery implementation answers the same
-//! [`Catalog`] trait.
-//!
-//! A contract is agent-facing if and only if it has a `runtime.guide` query
-//! ([`CatalogContract::has_guide`]). Events are kept, as [`PortKind::Event`], so the manifest can
-//! be checked against the catalog, but they are never offered to the model as tools.
+//! `discovered` uses the canonical SDK's chunk, digest and schema validation. BundledCatalog
+//! retains historical Provider fixtures for policy/schema regressions, never runtime discovery.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -53,6 +47,8 @@ pub struct CatalogPort {
     pub request: Option<Value>,
     #[serde(default)]
     pub response: Option<Value>,
+    #[serde(default)]
+    pub event: Option<Value>,
 }
 
 /// One version of a Provider contract, with the `$defs` of the document that declared it.
@@ -171,7 +167,7 @@ pub fn parse_document(text: &str) -> Result<Vec<CatalogContract>, CatalogError> 
         .collect()
 }
 
-/// The Provider contracts compiled into this Backend.
+/// Historical Provider fixtures, never production discovery authority.
 #[derive(Debug)]
 pub struct BundledCatalog {
     contracts: Vec<CatalogContract>,
@@ -212,6 +208,86 @@ impl Catalog for BundledCatalog {
     fn contracts(&self) -> &[CatalogContract] {
         &self.contracts
     }
+}
+
+/// Complete, owned metadata for one turn. The SDK verifies chunks, digest and schemas;
+/// this snapshot never grants dispatch authority and is not reused by another turn.
+pub async fn discovered(
+    ports: &teamarness_package_sdk::ports::PortClient,
+) -> Result<Vec<CatalogContract>, teamarness_package_sdk::BackendError> {
+    use teamarness_package_sdk::ports::PortAccess;
+    let mut contracts = Vec::new();
+    for summary in summaries(ports).await? {
+        if !summary.available || !summary.enabled || summary.enabled_major != Some(summary.major) {
+            continue;
+        }
+        let digest = summary.metadata_sha256.ok_or_else(invalid_metadata)?;
+        let document = ports
+            .describe(PortAccess::Agent, &summary.contract, &digest)
+            .await?;
+        if !document.has_guide(&summary.contract) || document.contracts[0].major != summary.major {
+            return Err(invalid_metadata());
+        }
+        let parsed = tokio::task::spawn_blocking(move || {
+            let value = serde_json::json!({
+                "schemaVersion":1,"$defs":document.definitions,"contracts":document.contracts
+            });
+            parse_document(&value.to_string())
+        })
+        .await
+        .map_err(|_| invalid_metadata())?
+        .map_err(|_| invalid_metadata())?;
+        contracts.extend(parsed);
+    }
+    Ok(contracts)
+}
+
+/// The UI contract and per-turn snapshot accept at most 32 identities. Fetch through the
+/// SDK's validated pages and stop before accumulating more, even for a changing Host catalog.
+pub async fn summaries(
+    ports: &teamarness_package_sdk::ports::PortClient,
+) -> Result<Vec<teamarness_package_sdk::ports::ContractSummary>, teamarness_package_sdk::BackendError>
+{
+    use teamarness_package_sdk::ports::PortAccess;
+    let mut rows: Vec<teamarness_package_sdk::ports::ContractSummary> = Vec::new();
+    let mut cursor = None::<String>;
+    let mut cursors = BTreeSet::new();
+    loop {
+        let page = ports
+            .available(PortAccess::Agent, cursor.as_deref())
+            .await?;
+        let entries: Vec<teamarness_package_sdk::ports::ContractSummary> =
+            serde_json::from_value(page["contracts"].clone()).map_err(|_| invalid_metadata())?;
+        if rows.len() + entries.len() > 32
+            || (entries.is_empty() && page.get("nextCursor").is_some())
+        {
+            return Err(invalid_metadata());
+        }
+        for entry in entries {
+            if rows
+                .last()
+                .is_some_and(|last| last.contract >= entry.contract)
+            {
+                return Err(invalid_metadata());
+            }
+            rows.push(entry);
+        }
+        let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
+            return Ok(rows);
+        };
+        if rows.len() == 32 || !cursors.insert(next.to_owned()) {
+            return Err(invalid_metadata());
+        }
+        cursor = Some(next.to_owned());
+    }
+}
+
+fn invalid_metadata() -> teamarness_package_sdk::BackendError {
+    teamarness_package_sdk::BackendError::new(
+        "agent.invalid_metadata",
+        false,
+        serde_json::json!({}),
+    )
 }
 
 #[cfg(test)]

@@ -58,6 +58,9 @@ pub const MANIFEST_NAME: &str = "teamarness.package.json";
 /// The Package Process Protocol version the Host speaks.
 pub const SUPPORTED_PROTOCOL: (u16, u16) = (1, 0);
 
+/// Maximum declared contract dependencies in one manifest.
+pub const MAX_CONSUMED_CONTRACTS: usize = 64;
+
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_UI_ENTRYPOINT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UI_ASSET_BYTES: usize = 8 * 1024 * 1024;
@@ -595,7 +598,7 @@ fn validate_capabilities(values: &[CapabilityRequirement]) -> Result<(), Contrac
 }
 
 fn validate_consumed_ports(values: &[ConsumedContract]) -> Result<(), ContractError> {
-    if values.len() > 64 {
+    if values.len() > MAX_CONSUMED_CONTRACTS {
         return Err(malformed("manifest.consumed_bounds"));
     }
     let mut identities = BTreeSet::new();

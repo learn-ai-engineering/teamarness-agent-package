@@ -53,6 +53,7 @@ export type AgentController = Readonly<{
   clearChat(): Promise<void>;
   /** Enables or disables one agent-facing contract and shows the stored state it returns. */
   setPackage(contract: string, enabled: boolean): Promise<void>;
+  refreshPackages(): Promise<void>;
   dispose(): void;
 }>;
 
@@ -66,8 +67,8 @@ export function describeStatus(status: Status | null): string {
       return "No Agent: choose one of your Agents below.";
     case "ready":
       return status.agent?.name
-        ? `Ready: ${status.agent.name} replies when addressed.`
-        : "Ready: the Agent replies when addressed.";
+        ? `Ready: ${status.agent.name}.`
+        : "Ready: the Agent is configured.";
     case "replying":
       return "Replying...";
     case "error":
@@ -195,16 +196,20 @@ export function createAgentController(
     }
   };
 
+  let packagesRequestVersion = 0;
   const packagesRequest = async (
     work: () => Promise<readonly PackageView[]>,
     pendingPackage?: PendingPackage,
   ): Promise<void> => {
     if (disposed) return;
+    const version = ++packagesRequestVersion;
     update({ packagesBusy: true, packagesError: undefined, pendingPackage });
     try {
-      update({ packages: await work(), packagesBusy: false, pendingPackage: undefined });
+      const packages = await work();
+      if (version !== packagesRequestVersion || disposed) return;
+      update({ packages, packagesBusy: false, pendingPackage: undefined });
     } catch (error) {
-      if (isAbortError(error)) return;
+      if (isAbortError(error) || version !== packagesRequestVersion || disposed) return;
       update({ packagesBusy: false, packagesError: describePackageError(error), pendingPackage: undefined });
     }
   };
@@ -262,6 +267,7 @@ export function createAgentController(
         const status = await typed.request("agent.status.get", {});
         return { status, candidates: await loadCandidates() };
       });
+      await packagesRequest(async () => (await typed.request("agent.packages.get", {})).packages);
     },
 
     async unbind(): Promise<void> {
@@ -270,6 +276,7 @@ export function createAgentController(
         const status = await typed.request("agent.status.get", {});
         return { status, candidates: await loadCandidates() };
       });
+      await packagesRequest(async () => (await typed.request("agent.packages.get", {})).packages);
     },
 
     async sendChat(content: string): Promise<boolean> {
@@ -280,9 +287,20 @@ export function createAgentController(
       await chatRequest(() => typed.request("agent.chat.clear", {}));
     },
 
+    async refreshPackages(): Promise<void> {
+      await packagesRequest(async () => (await typed.request("agent.packages.get", {})).packages);
+    },
+
     async setPackage(contract: string, enabled: boolean): Promise<void> {
       await packagesRequest(
-        async () => (await typed.request("agent.packages.set", { contract, enabled })).packages,
+        async () => {
+          const observed = state.packages?.find((entry) => entry.contract === contract);
+          if (enabled) {
+            if (!observed) throw new Error("Refresh Packages before enabling this contract.");
+            return (await typed.request("agent.packages.set", { contract, enabled: true, major: observed.major })).packages;
+          }
+          return (await typed.request("agent.packages.set", { contract, enabled: false })).packages;
+        },
         { contract, enabled },
       );
     },
@@ -566,9 +584,10 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   packagesMessage.className = "message";
   packagesMessage.dataset.role = "packages-message";
   packagesMessage.setAttribute("role", "status");
+  const refreshPackagesButton = button("Refresh Packages", "refresh-packages", "secondary");
   const packagesSection = group("Packages",
-    "Packages whose tools the Agent may use once enabled. A package must be installed in this Workspace to be available.",
-    packageList, packagesMessage);
+    "The Host controls access. Explicitly enable Conversations for Channel replies. Refresh to see changed offers.",
+    packageList, refreshPackagesButton, packagesMessage);
 
   form.append(statusSection, agentSection, settingsSection, keySection, packagesSection);
   configPanel.append(form);
@@ -688,6 +707,12 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
         name.className = "package-name";
         name.textContent = entry.name;
         heading.append(name);
+        const version = document.createElement("span");
+        version.dataset.role = "package-version";
+        version.textContent = entry.enabledMajor === null
+          ? `Offered major ${entry.major}`
+          : `Enabled major ${entry.enabledMajor}; offered major ${entry.major}`;
+        heading.append(version);
         if (!entry.available) {
           const marker = document.createElement("span");
           marker.className = "package-unavailable";
@@ -726,6 +751,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     }
     packagesEmpty.remove();
     if (state.packages !== null && packages.length === 0) packageList.before(packagesEmpty);
+    refreshPackagesButton.disabled = state.packagesBusy;
     packagesMessage.textContent = state.packagesError ?? "";
     if (state.packagesError) packagesMessage.dataset.kind = "error";
     else delete packagesMessage.dataset.kind;
@@ -838,6 +864,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     }
   };
   const onClearChat = (): void => { void controller.clearChat(); };
+  const onRefreshPackages = (): void => { void controller.refreshPackages(); };
   const onPackageToggle = (event: Event): void => {
     const toggle = event.target as HTMLInputElement | null;
     const contract = toggle?.dataset.contract;
@@ -855,6 +882,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   chatInput.addEventListener("keydown", onChatKey);
   clearChatButton.addEventListener("click", onClearChat);
   packageList.addEventListener("change", onPackageToggle);
+  refreshPackagesButton.addEventListener("click", onRefreshPackages);
 
   await controller.start();
 
@@ -875,6 +903,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     chatInput.removeEventListener("keydown", onChatKey);
     clearChatButton.removeEventListener("click", onClearChat);
     packageList.removeEventListener("change", onPackageToggle);
+    refreshPackagesButton.removeEventListener("click", onRefreshPackages);
     page.remove();
     cleanupStyles();
     cleanupKit();

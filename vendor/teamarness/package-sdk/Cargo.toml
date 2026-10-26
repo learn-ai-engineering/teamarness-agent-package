@@ -10,6 +10,8 @@ license.workspace = true
 testing = []
 
 [dependencies]
+sha2.workspace = true
+teamarness-package-contract = { path = "../package-contract" }
 base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true

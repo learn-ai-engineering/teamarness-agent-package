@@ -1,24 +1,18 @@
-//! The single place Package enablement is decided.
+//! Host-selected Package tools and deliberate model withholding.
 //!
-//! A contract is offered to the model ([`usable`]) only when it is agent-facing (its catalog
-//! entry has `runtime.guide`), the Host reports it declared and available, and the Steward has
-//! enabled it. The [`WITHHELD`] ports are removed. [`listed`] is the Steward's view of the
-//! same facts: every agent-facing contract, whatever its availability or enablement.
-//!
-//! "Declared" is read from the Host: the package-ports `available` answer lists only contracts
-//! this Package's manifest declares, so a contract missing from it is neither declared nor
-//! available. `manifest_and_catalog_agree` keeps the manifest and the bundled catalog equal.
+//! Production turns load complete Host metadata through `usable_now`; a snapshot is not a grant.
+//! The pure legacy catalog helpers below remain only as fixture regressions.
 
 use serde::Serialize;
+#[cfg(test)]
 use serde_json::Value;
 use teamarness_package_sdk::BackendError;
 use teamarness_package_sdk::ports::PortClient;
 
-use crate::catalog::{Catalog, CatalogContract, alias};
+use crate::catalog::alias;
+#[cfg(test)]
+use crate::catalog::{Catalog, CatalogContract};
 use crate::tools::UsableContract;
-
-/// The UI asked to enable or disable a contract that is not agent-facing. Not retryable.
-pub const UNKNOWN_PACKAGE: &str = "agent.unknown_package";
 
 /// Ports never offered to the model, as `(contract, port)`.
 ///
@@ -31,11 +25,13 @@ pub const WITHHELD: [(&str, &str); 3] = [
 ];
 
 /// The contracts the Host reports available, by identity and major.
+#[cfg(test)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Availability {
     available: Vec<(String, Option<u64>)>,
 }
 
+#[cfg(test)]
 impl Availability {
     /// Nothing is available: no Port grant, or the Host could not answer.
     #[must_use]
@@ -92,6 +88,8 @@ pub struct PackageView {
     pub description: String,
     pub available: bool,
     pub enabled: bool,
+    pub major: u16,
+    pub enabled_major: Option<u16>,
 }
 
 /// A contract's display name: the title-cased last identity segment
@@ -113,10 +111,12 @@ pub fn display_name(identity: &str) -> String {
 
 /// Whether `identity` names an agent-facing contract the catalog knows.
 #[must_use]
+#[cfg(test)]
 pub fn is_agent_facing(catalog: &(impl Catalog + ?Sized), identity: &str) -> bool {
     agent_facing(catalog).any(|contract| contract.identity == identity)
 }
 
+#[cfg(test)]
 fn agent_facing(catalog: &(impl Catalog + ?Sized)) -> impl Iterator<Item = &CatalogContract> {
     catalog
         .contracts()
@@ -124,6 +124,7 @@ fn agent_facing(catalog: &(impl Catalog + ?Sized)) -> impl Iterator<Item = &Cata
         .filter(|contract| contract.has_guide)
 }
 
+#[cfg(test)]
 fn is_enabled(enabled: &[String], contract: &CatalogContract) -> bool {
     enabled.contains(&contract.identity)
 }
@@ -134,6 +135,7 @@ fn is_withheld(contract: &str, port: &str) -> bool {
 
 /// The contracts the model may use now, with withheld ports removed.
 #[must_use]
+#[cfg(test)]
 pub fn usable(
     catalog: &(impl Catalog + ?Sized),
     availability: &Availability,
@@ -151,24 +153,32 @@ pub fn usable(
         .collect()
 }
 
-/// The contracts one turn may use: [`usable`] over what the Host reports available now.
-///
-/// With nothing enabled, or no Port grant, nothing is usable and the Host is not asked, so a
-/// turn with no Packages makes exactly the calls it made before Packages existed.
-pub async fn usable_now(
-    catalog: &(impl Catalog + ?Sized),
-    ports: Option<&PortClient>,
-    enabled: &[String],
-) -> Vec<UsableContract> {
-    let Some(ports) = ports.filter(|_| !enabled.is_empty()) else {
-        return Vec::new();
+/// Loads usable contracts from Host-selected, available, major-matching metadata.
+/// Missing binding or grant leaves independent direct chat without Package tools.
+pub async fn usable_now(ports: Option<&PortClient>) -> Result<Vec<UsableContract>, BackendError> {
+    let Some(ports) = ports else {
+        return Ok(Vec::new());
     };
-    let availability = Availability::from_result(&ports.available().await);
-    usable(catalog, &availability, enabled)
+    let catalog = match crate::catalog::discovered(ports).await {
+        Ok(catalog) => catalog,
+        Err(error) if error.code() == "agent_not_bound" => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    Ok(catalog
+        .iter()
+        .map(|contract| {
+            let mut usable = UsableContract::from(contract);
+            usable
+                .ports
+                .retain(|port| !is_withheld(&contract.identity, &port.name));
+            usable
+        })
+        .collect())
 }
 
 /// Every agent-facing contract, in catalog order, with its availability and enablement.
 #[must_use]
+#[cfg(test)]
 pub fn listed(
     catalog: &(impl Catalog + ?Sized),
     availability: &Availability,
@@ -181,6 +191,8 @@ pub fn listed(
             description: contract.description.clone(),
             available: availability.includes(contract),
             enabled: is_enabled(enabled, contract),
+            major: contract.major,
+            enabled_major: is_enabled(enabled, contract).then_some(contract.major),
         })
         .collect()
 }
@@ -199,6 +211,7 @@ mod tests {
             description: format!("{name} port"),
             request: (kind != PortKind::Event).then(|| json!({"type": "object"})),
             response: (kind != PortKind::Event).then(|| json!({"type": "object"})),
+            event: None,
         }
     }
 
@@ -446,6 +459,8 @@ mod tests {
                     .clone(),
                 available: false,
                 enabled: false,
+                major: 1,
+                enabled_major: None,
             }]
         );
     }

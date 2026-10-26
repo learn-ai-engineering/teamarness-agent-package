@@ -137,15 +137,14 @@ pub struct StreamCredit {
 
 impl StreamCredit {
     /// Returns the credit, allowing the host to send one more event.
-    pub async fn release(self) {
-        let _ = self
-            .writer
+    pub async fn release(self) -> Result<(), crate::SdkError> {
+        self.writer
             .control(object([
                 ("kind", JsonValue::String("credit".into())),
                 ("streamId", JsonValue::String(self.id)),
                 ("amount", JsonValue::from(1_u64)),
             ]))
-            .await;
+            .await
     }
 }
 

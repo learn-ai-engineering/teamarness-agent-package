@@ -1,9 +1,7 @@
-//! The Steward's Package enablement, in `packages.json` in the Package Data Directory.
+//! Historical local preference format, retained for storage regressions only.
 //!
-//! The document is `{schemaVersion: 1, enabled: [contractIdentity]}`. A missing file means
-//! nothing is enabled. Identities the Agent no longer knows are kept, so a catalog that loses a
-//! contract and later regains it keeps the Steward's choice. [`crate::access`] decides what an
-//! enabled identity means; this store only remembers the choice.
+//! Production activation never opens this store. Existing packages.json bytes are not read,
+//! imported, changed or deleted; only Host selections can authorize Package access.
 
 use std::fs;
 use std::path::Path;

@@ -55,6 +55,8 @@ export type PackageView = {
   readonly "contract": ContractIdentity;
   readonly "description": string;
   readonly "enabled": boolean;
+  readonly "enabledMajor": number | null;
+  readonly "major": number;
   readonly "name": string;
 };
 
@@ -106,7 +108,11 @@ export type AgentContract = {
     readonly "agent.packages.get": { readonly request: Empty; readonly response: Packages };
     readonly "agent.packages.set": { readonly request: {
         readonly "contract": ContractIdentity;
-        readonly "enabled": boolean;
+        readonly "enabled": true;
+        readonly "major": number;
+      } | {
+        readonly "contract": ContractIdentity;
+        readonly "enabled": false;
       }; readonly response: Packages };
     readonly "agent.settings.get": { readonly request: Empty; readonly response: SettingsView };
     readonly "agent.settings.set": { readonly request: {

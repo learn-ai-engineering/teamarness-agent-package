@@ -51,7 +51,7 @@
     },
     {
       "identity": "teamarness.package-ports",
-      "major": 1,
+      "major": 2,
       "minMinor": 0,
       "maxMinor": 0
     }
@@ -68,36 +68,6 @@
         { "name": "message.changes", "kind": "query" },
         { "name": "channel.list", "kind": "query" },
         { "name": "messages.changed", "kind": "event" }
-      ]
-    },
-    {
-      "identity": "dev.teamarness.documents",
-      "major": 1,
-      "minMinor": 1,
-      "maxMinor": 1,
-      "required": false,
-      "ports": [
-        { "name": "document.list", "kind": "query" },
-        { "name": "document.markdown", "kind": "query" },
-        { "name": "document.revise", "kind": "command" },
-        { "name": "documents.changed", "kind": "event" }
-      ]
-    },
-    {
-      "identity": "dev.teamarness.exhibits",
-      "major": 1,
-      "minMinor": 0,
-      "maxMinor": 0,
-      "required": false,
-      "ports": [
-        { "name": "runtime.guide", "kind": "query" },
-        { "name": "file.put", "kind": "command" },
-        { "name": "files.missing", "kind": "query" },
-        { "name": "draft.update", "kind": "command" },
-        { "name": "exhibit.list", "kind": "query" },
-        { "name": "exhibit.read", "kind": "query" },
-        { "name": "file.read", "kind": "query" },
-        { "name": "draft.delete", "kind": "command" }
       ]
     }
   ],

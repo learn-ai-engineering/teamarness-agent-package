@@ -33,9 +33,11 @@ Package UI
 
 `ui-contract.json` defines the requests that may cross this path. Treat it as the shared boundary between the UI and Backend. Change the contract before implementing a new request on either side.
 
-The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports capabilities, and consumes Documents 1.1 and Exhibits 1.0 as optional contracts. It also offers the Steward a direct, in-memory chat with the configured model on a separate UI tab. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
+The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It declares workspace-context, principals, agent-binding and package-ports 2.0 capabilities. Only the built-in Conversations harness retains a fixed consumed declaration; other eligible tools are discovered without manifest entries. It also offers the Steward a direct, in-memory chat with the configured model on a separate UI tab. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
 
-Chat and reply turns can call the tools of enabled Packages. A turn is a bounded loop (`backend/src/turn.rs`) between the model and a tool set (`backend/src/tools.rs`): the usable contracts' ports plus the Agent's compiled-in skills. `access::usable` is the only place that decides which contracts are usable. A contract is agent-facing only when it has a `runtime.guide` query; today only Exhibits has one. The Steward enables Packages in the Packages section on Configuration, stored in `packages.json`. The model is never offered `message.post`, nor Exhibits `file.read`/`file.put` (`access::WITHHELD`); the harness posts each reply's final text once. Chat and replies assemble a turn through one helper, `tools::TurnTools`. The message bound counts only what a turn's tool calls add, never its starting history. A dispatched command is never re-sent. There is no dispatch fence: a post already dispatched when the binding changes may be attributed to the new Agent. README.md lists the turn bounds and the `agent.*` codes.
+Chat and reply turns can call tools of Host-enabled Packages through package-ports 2.0. `backend/src/turn.rs` bounds the model/tool loop; `access::usable_now` obtains complete Host metadata for available selections pinned to the offered major. Discovery uses the existing Catalog seam and canonical SDK page/chunk/hash/schema checks. Events and streaming queries remain distinct and are not ordinary model tools. A turn snapshot is not a grant: every call/subscription uses explicit Agent access and contract major, and the Host authorizes dispatch.
+
+The Steward changes Host-owned selections in Configuration's Packages section. Enable sends the observed offered major; unavailable saved selections remain disableable. Legacy `packages.json` is not opened, imported or changed. Conversations participation needs explicit enablement and a binding, never an automatic grant. Disable/rebind/unbind cancel affected work; stream terminals drain replies before explicit reconnect/reconciliation. Independent direct chat still works without a binding or Package tools. The model never gets Conversations `message.post` or Exhibits `file.read`/`file.put` (`access::WITHHELD`). The harness posts final reply text once; already-authorized commands retain the Host's original actor and uncertainty and are never replayed. README.md documents bounds and qualification limits.
 
 ## Project map
 
@@ -47,9 +49,9 @@ Chat and reply turns can call the tools of enabled Packages. A turn is a bounded
 | `backend/src/turn.rs` | The sans-I/O turn engine and its bounds (`TurnBounds`) and stable codes. |
 | `backend/src/model.rs` | The OpenAI-compatible model client, with tool definitions and tool calls. |
 | `backend/src/tools.rs` | The generic port tool executor, `skill_read`, the system-message tool context, and `TurnTools`, which runs a chat or reply turn. |
-| `backend/src/catalog.rs` | The `Catalog` seam and the bundled Provider contracts. |
+| `backend/src/catalog.rs` | The `Catalog` seam, bounded Host discovery and historical Provider fixtures. |
 | `backend/src/access.rs` | Decides which contracts are listed and usable. |
-| `backend/src/packages.rs` | The Steward's Package enablement, `packages.json` (schema v1). |
+| `backend/src/packages.rs` | Historical `packages.json` storage regressions only; no production authorization. |
 | `backend/src/skills.rs` and `backend/skills/` | The Agent's compiled-in skills. |
 | `backend/catalog/` | Verbatim Provider `ports.json` copies and `provenance.json`. Refresh with `node scripts/refresh-catalog.mjs --from <teamarness-checkout>`; never edit by hand. |
 | `backend/src/main.rs` | Starts the Backend through the vendored SDK. Keep it thin. |
@@ -160,7 +162,7 @@ Package source, trust, Workspace enablement, synchronization, sharing, networkin
 
 Do not edit `dist/` after assembly. Any byte change makes the manifest declaration stale.
 
-The foundation assembler copies one Backend executable, `ui/dist/index.js`, and `ui-contract.json`. The manifest declares no assets. The catalog and skills are compiled into the Backend, not shipped as files. Keep the UI inside the single ESM bundle unless the product needs a different artifact shape.
+The foundation assembler copies one Backend executable, `ui/dist/index.js`, and `ui-contract.json`. The manifest declares no assets. Historical catalog fixtures and skills are compiled into the Backend, not shipped as files. Keep the UI inside the single ESM bundle unless the product needs a different artifact shape.
 
 If you add UI assets, another Backend, or another target platform, update all of the following together:
 
@@ -179,7 +181,7 @@ Treat vendored SDK files as external infrastructure. Do not modify them to imple
 
 `teamarness-authoring.json` records which checkout the copy came from — `sdkRevision`, `sdkRevisionDirty` — and a digest of every vendored tree. `npm run check:vendor` recomputes those digests as part of `npm test`, so a failure there means a vendored file was edited: restore it rather than weakening the check. From a Teamarness checkout, `npm run create:package -- --vendor-report <project>` reports which trees differ from that checkout, and changes nothing.
 
-There is no supported in-place SDK upgrade yet. Teamarness SDK fixes do not arrive in this repository automatically. Preserve source notices, license metadata, relative dependency paths, and `teamarness-authoring.json` provenance.
+There is no general supported in-place SDK upgrade. The approved package-ports 2.0 migration uses `scripts/refresh-sdk.mjs` to reproduce the exact clean canonical Host 4e0249b generator snapshot; it refuses other revisions and records every tree digest. Teamarness SDK fixes do not arrive in this repository automatically. Preserve source notices, license metadata, relative dependency paths, and `teamarness-authoring.json` provenance.
 
 ## Security model
 

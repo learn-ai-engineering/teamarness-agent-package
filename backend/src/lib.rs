@@ -4,7 +4,7 @@
 //! read through `teamarness.agent-binding`, the status its UI shows, and the reply harness
 //! ([`harness`]) with its model client ([`model`]) that runs while the status is in the ready
 //! family, the Steward's direct [`chat`] with the same model, and the Steward's Package
-//! enablement ([`packages`]), which [`access`] combines with the [`catalog`] and Host availability.
+//! selections held by the Host, which [`access`] combines with complete live [`catalog`] metadata.
 //! A turn's [`tools`] are the usable contracts' ports plus the Agent's compiled-in [`skills`].
 
 pub mod access;
@@ -35,12 +35,10 @@ use teamarness_package_sdk::{
 };
 use tokio::sync::watch;
 
-use access::{Availability, PackageView};
-use catalog::{BundledCatalog, Catalog};
+use access::PackageView;
 use chat::{ChatCell, ChatView};
 use harness::{HarnessInputs, TaskHandle};
 use model::{ConfiguredModel, ModelClient};
-use packages::PackagesStore;
 use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
@@ -60,6 +58,7 @@ fn invalid_request() -> BackendError {
 /// Maps a capability failure to a Package-owned code. Never carries payload or secrets.
 fn capability_error(cause: &BackendError) -> BackendError {
     match cause.code() {
+        "agent_not_bound" => error("agent.binding_required", false),
         "agent_not_stewarded" => error("agent.not_stewarded", false),
         "agent_not_found" => error("agent.agent_not_found", false),
         "capability_request_invalid" | "package.invalid_capability_request" => invalid_request(),
@@ -83,6 +82,8 @@ struct Tasks {
     harness: Option<TaskHandle>,
     /// The chat turn in flight, if any.
     chat: Option<TaskHandle>,
+    /// Package snapshots used by that chat, for targeted selection/binding cancellation.
+    chat_contracts: Vec<String>,
 }
 
 /// Everything one activation of the Agent Package owns.
@@ -99,10 +100,6 @@ pub struct AgentActive {
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
     chat: Arc<ChatCell>,
-    /// The Steward's Package enablement, `packages.json`.
-    packages: Arc<Mutex<PackagesStore>>,
-    /// The Provider contracts the Agent knows; [`access`] decides which are usable.
-    catalog: &'static (dyn Catalog + Send + Sync),
 }
 
 /// What one chat turn needs from the stored configuration. Holds the key; never logged.
@@ -112,8 +109,6 @@ struct ChatConfig {
     system_prompt: String,
     context_messages: usize,
     api_key: String,
-    /// The Steward's enabled Packages when the turn starts.
-    enabled: Vec<String>,
 }
 
 impl AgentActive {
@@ -121,6 +116,7 @@ impl AgentActive {
     async fn apply_agent(&self, agent: Option<BoundAgent>) {
         if self.status.agent() != agent {
             self.stop_harness().await;
+            self.interrupt_package_chat(None).await;
             self.status.set_agent(agent);
         }
         self.sync_harness().await;
@@ -175,8 +171,6 @@ impl AgentActive {
             settings: self.settings.clone(),
             status: self.status.clone(),
             progress: self.progress.clone(),
-            packages: self.packages.clone(),
-            catalog: self.catalog,
         })
     }
 
@@ -229,7 +223,11 @@ impl AgentActive {
     }
 
     async fn stop_chat(&self) {
-        let turn = self.tasks.lock().await.chat.take();
+        let turn = {
+            let mut tasks = self.tasks.lock().await;
+            tasks.chat_contracts.clear();
+            tasks.chat.take()
+        };
         if let Some(turn) = turn {
             turn.stop().await;
         }
@@ -241,7 +239,6 @@ impl AgentActive {
         cancellation: &CancellationToken,
     ) -> Result<Option<ChatConfig>, BackendError> {
         let settings = self.settings.clone();
-        let packages = self.packages.clone();
         teamarness_package_sdk::blocking(cancellation, move |cancel| {
             if cancel.is_cancelled() {
                 return Err(storage_failed());
@@ -254,18 +251,12 @@ impl AgentActive {
             let Some(api_key) = store.api_key().map_err(|_| storage_failed())? else {
                 return Ok(None);
             };
-            let enabled = packages
-                .lock()
-                .map_err(|_| storage_failed())?
-                .enabled()
-                .to_vec();
             Ok(Some(ChatConfig {
                 endpoint_base_url: current.endpoint_base_url.clone(),
                 model: current.model.clone(),
                 system_prompt: current.system_prompt.clone(),
                 context_messages: current.context_messages as usize,
                 api_key,
-                enabled,
             }))
         })
         .await
@@ -274,15 +265,25 @@ impl AgentActive {
     /// Records the Steward's message and starts its turn in the background, so the request
     /// answers before the Host's UI deadline whatever the model takes.
     ///
-    /// The turn offers the tools of the Packages usable now. Availability is read before
-    /// anything is recorded, and only when a Package is enabled; the Host's deadline bounds it,
+    /// The turn offers the tools of the Packages usable now. Complete metadata is read before
+    /// anything is recorded; the Host's request deadline bounds it,
     /// as it does for `agent.packages.get`.
     async fn start_chat(
         &self,
         content: &str,
         config: ChatConfig,
     ) -> Result<ChatView, BackendError> {
-        let usable = access::usable_now(self.catalog, self.ports.as_ref(), &config.enabled).await;
+        let usable = access::usable_now(
+            self.ports
+                .as_ref()
+                .filter(|_| self.status.agent().is_some()),
+        )
+        .await
+        .map_err(|cause| capability_error(&cause))?;
+        let chat_contracts = usable
+            .iter()
+            .map(|contract| contract.identity.clone())
+            .collect();
         let name = self.status.agent().and_then(|agent| agent.name);
         let tools = tools::TurnTools::new(&usable, self.ports.clone(), skills::bundled());
         let system = chat::system_message(name.as_deref(), &config.system_prompt, tools.context());
@@ -313,7 +314,11 @@ impl AgentActive {
             cell.update(|session| session.finish(generation, outcome));
         });
         // Any earlier task has settled or belongs to a cleared generation.
-        let previous = self.tasks.lock().await.chat.replace(task);
+        let previous = {
+            let mut tasks = self.tasks.lock().await;
+            tasks.chat_contracts = chat_contracts;
+            tasks.chat.replace(task)
+        };
         if let Some(previous) = previous {
             previous.stop().await;
         }
@@ -323,6 +328,7 @@ impl AgentActive {
     async fn change_binding(&self, principal: Option<String>) -> Result<BindingView, BackendError> {
         let _transition = self.transition.lock().await;
         self.stop_harness().await;
+        self.interrupt_package_chat(None).await;
         let result = match principal {
             Some(principal) => self.binding.bind(&principal).await.map(Some),
             None => self.binding.unbind().await.map(|()| None),
@@ -340,20 +346,77 @@ impl AgentActive {
         Ok(BindingView { agent: summary })
     }
 
-    /// What the Host reports available now; no Port grant or a Host error means nothing is.
-    async fn availability(&self) -> Availability {
-        match &self.ports {
-            Some(ports) => Availability::from_result(&ports.available().await),
-            None => Availability::none(),
+    async fn interrupt_package_chat(&self, contract: Option<&str>) {
+        let affected = self
+            .tasks
+            .lock()
+            .await
+            .chat_contracts
+            .iter()
+            .any(|used| contract.is_none_or(|contract| contract == used));
+        if affected {
+            self.stop_chat().await;
+            self.chat.update(chat::ChatSession::interrupt);
         }
     }
 
-    /// The Steward's view of every agent-facing contract. Reads only the in-memory store.
-    fn packages_view(&self, availability: &Availability) -> Result<PackagesView, BackendError> {
-        let store = self.packages.lock().map_err(|_| storage_failed())?;
+    /// Host summaries are the only selection authority; legacy packages.json is untouched.
+    async fn packages_view(&self) -> Result<PackagesView, BackendError> {
+        let ports = self
+            .ports
+            .as_ref()
+            .ok_or_else(|| error("agent.capability_unavailable", false))?;
+        let summaries = catalog::summaries(ports)
+            .await
+            .map_err(|cause| capability_error(&cause))?;
         Ok(PackagesView {
-            packages: access::listed(self.catalog, availability, store.enabled()),
+            packages: summaries
+                .into_iter()
+                .map(|summary| PackageView {
+                    name: access::display_name(&summary.contract),
+                    contract: summary.contract,
+                    description: summary.description.unwrap_or_default(),
+                    available: summary.available,
+                    enabled: summary.enabled,
+                    major: summary.major,
+                    enabled_major: summary.enabled_major,
+                })
+                .collect(),
         })
+    }
+
+    async fn change_package(
+        &self,
+        request: PackagesSetRequest,
+    ) -> Result<PackagesView, BackendError> {
+        let _transition = self.transition.lock().await;
+        let ports = self
+            .ports
+            .as_ref()
+            .ok_or_else(|| error("agent.capability_unavailable", false))?;
+        if request.enabled {
+            let major = request
+                .major
+                .filter(|major| *major > 0)
+                .ok_or_else(invalid_request)?;
+            // Send the observed offer, never substitute the latest major.
+            ports
+                .enable(&request.contract, major)
+                .await
+                .map_err(|cause| capability_error(&cause))?;
+        } else {
+            if request.major.is_some() {
+                return Err(invalid_request());
+            }
+            ports
+                .disable(&request.contract)
+                .await
+                .map_err(|cause| capability_error(&cause))?;
+            self.stop_harness().await;
+            self.interrupt_package_chat(Some(&request.contract)).await;
+        }
+        self.sync_harness().await;
+        self.packages_view().await
     }
 
     fn settings_view(&self) -> SettingsView {
@@ -472,6 +535,7 @@ struct BindingSetRequest {
 struct PackagesSetRequest {
     contract: String,
     enabled: bool,
+    major: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -547,16 +611,15 @@ pub fn router() -> Router<AgentActive> {
         let cancellation = activation.cancellation().clone();
         async move {
             let directory = initialization.data_directory().path().to_owned();
-            let (store, packages, progress, configured) =
+            let (store, progress, configured) =
                 teamarness_package_sdk::blocking(&cancellation, move |cancel| {
                     if cancel.is_cancelled() {
                         return Err(storage_failed());
                     }
                     let store = SettingsStore::open(&directory).map_err(|_| storage_failed())?;
-                    let packages = PackagesStore::open(&directory).map_err(|_| storage_failed())?;
                     let progress = Progress::open(&directory).map_err(|_| storage_failed())?;
                     let configured = store.is_configured();
-                    Ok((store, packages, progress, configured))
+                    Ok((store, progress, configured))
                 })
                 .await?;
             let binding = AgentBinding::from_initialization(&initialization, capabilities.clone())
@@ -586,13 +649,12 @@ pub fn router() -> Router<AgentActive> {
                     roster: None,
                     harness: None,
                     chat: None,
+                    chat_contracts: Vec::new(),
                     enabled: true,
                     reconciled: false,
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
                 chat: Arc::new(ChatCell::default()),
-                packages: Arc::new(Mutex::new(packages)),
-                catalog: BundledCatalog::get(),
             };
             // Reconcile the startup roster before starting any reply work.
             {
@@ -795,6 +857,7 @@ pub fn router() -> Router<AgentActive> {
             let Some(config) = state.chat_config(context.cancellation()).await? else {
                 return Err(error(chat::NOT_CONFIGURED, false));
             };
+            let _transition = state.transition.lock().await;
             state.start_chat(&request.content, config).await
         },
     )
@@ -811,39 +874,17 @@ pub fn router() -> Router<AgentActive> {
         "agent.packages.get",
         |context: Context<AgentActive>, _: Empty| async move {
             let state = context.state().clone();
-            let availability = state.availability().await;
-            context
-                .blocking(move |_| state.packages_view(&availability))
-                .await
+            state.packages_view().await
         },
     )
     .request(
         "agent.packages.set",
         |context: Context<AgentActive>, request: PackagesSetRequest| async move {
             let state = context.state().clone();
-            if !access::is_agent_facing(state.catalog, &request.contract) {
-                return Err(error(access::UNKNOWN_PACKAGE, false));
-            }
-            {
-                let state = state.clone();
-                context
-                    .blocking(move |cancel| {
-                        if cancel.is_cancelled() {
-                            return Err(storage_failed());
-                        }
-                        state
-                            .packages
-                            .lock()
-                            .map_err(|_| storage_failed())?
-                            .set(&request.contract, request.enabled)
-                            .map_err(|_| storage_failed())
-                    })
-                    .await?;
-            }
-            let availability = state.availability().await;
-            context
-                .blocking(move |_| state.packages_view(&availability))
+            // Keep the transition owner alive if the UI request is cancelled mid-mutation.
+            tokio::spawn(async move { state.change_package(request).await })
                 .await
+                .map_err(|_| error("agent.capability_unavailable", false))?
         },
     )
     .subscription(
