@@ -31,6 +31,73 @@ pub fn unknown_document() -> Value {
     ]}]})
 }
 
+/// Compile through the public SDK, then use the actual canonical projection and validators.
+/// The returned bytes are the external Host metadata fixture, not an Agent Catalog substitute.
+pub async fn project_document(document: Value) -> Value {
+    use teamarness_package_sdk::ports::{PortAccess, PortClient};
+    use teamarness_package_sdk::testing::{HarnessBuilder, ScriptedCapability};
+    use teamarness_package_sdk::{Empty, Router};
+
+    let identity = document["contracts"][0]["identity"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let catalog = HostCatalog::default();
+    catalog
+        .documents
+        .lock()
+        .unwrap()
+        .insert(identity.clone(), document.clone());
+    let router = Router::new(|activation| async move {
+        let grant = &activation.initialization().capabilities()[0].grant;
+        Ok(PortClient::new(
+            activation.capabilities().clone(),
+            grant.clone(),
+        ))
+    })
+    .request("fixture.project", move |ctx, _: Empty| {
+        let identity = identity.clone();
+        let expected = document.clone();
+        async move {
+            let compiled = ctx
+                .state()
+                .describe(PortAccess::Agent, &identity, &digest(&expected))
+                .await?;
+            assert!(compiled.warnings.is_empty());
+            assert!(compiled.has_guide(&identity));
+            assert_eq!(
+                compiled.definitions,
+                *expected["$defs"].as_object().unwrap()
+            );
+            compiled
+                .validate(&identity, "sample.read", "request", &json!({}))
+                .unwrap();
+            assert!(
+                compiled
+                    .validate(&identity, "sample.read", "request", &json!({"extra":1}))
+                    .is_err()
+            );
+            let projection = compiled.project_metadata(&identity, None).unwrap();
+            Ok(serde_json::from_slice::<Value>(&projection.bytes).unwrap())
+        }
+    });
+    let fixture = catalog.clone();
+    let data = tempfile::tempdir().unwrap();
+    let mut harness = HarnessBuilder::new(router.into_backend())
+        .data_directory(data.path())
+        .capability(
+            "teamarness.package-ports",
+            ScriptedCapability::new()
+                .calls(move |method, payload| fixture.handle(method, &payload).unwrap()),
+        )
+        .start()
+        .await;
+    harness.activate().await.unwrap();
+    let projected = harness.request("fixture.project", json!({})).await.unwrap();
+    harness.shutdown().await.unwrap();
+    projected
+}
+
 impl HostCatalog {
     pub fn providers() -> Self {
         let catalog = Self::default();

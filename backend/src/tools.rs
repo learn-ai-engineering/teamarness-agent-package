@@ -100,9 +100,180 @@ pub fn tool_name(identity: &str, port: &str) -> Result<String, LoadError> {
 ///
 /// # Errors
 /// A reference is not local, names a missing definition, refers back to a definition it is
-/// inside of, or is nested more than [`MAX_INLINE_DEPTH`] deep.
+/// inside of, is nested more than [`MAX_INLINE_DEPTH`] deep, or exceeds the private
+/// preparation node/byte allowance.
 pub fn inline_refs(schema: &Value, defs: &Map<String, Value>) -> Result<Value, LoadError> {
+    PreparationBudget::default().expanded(schema, defs, &mut Vec::new())?;
     inline(schema, defs, &mut Vec::new())
+}
+
+const MAX_PREPARATION_NODES: usize = 16_384;
+const MAX_PREPARATION_BYTES: usize = 1024 * 1024;
+
+/// Preflight before any schema copy or validator construction. Nodes count value visits,
+/// including reference occurrences and repeated subtrees. Bytes charge Value storage,
+/// UTF-8 strings, and 128 bytes per object entry (key storage plus map allocation overhead).
+/// This is an allocation-work allowance, not a measurement of allocator/validator peak RSS.
+/// One allowance covers all tools/contracts, both parameter copies and each validator's
+/// original request/full definitions. Neither successful tools nor references reset it.
+#[derive(Default)]
+struct PreparationBudget {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl PreparationBudget {
+    fn charge(&mut self, nodes: usize, bytes: usize) -> Result<(), LoadError> {
+        if nodes > MAX_PREPARATION_NODES - self.nodes {
+            return Err(LoadError("schema preparation node budget exceeded".into()));
+        }
+        if bytes > MAX_PREPARATION_BYTES - self.bytes {
+            return Err(LoadError("schema preparation byte budget exceeded".into()));
+        }
+        self.nodes += nodes;
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    fn key(&mut self, key: &str) -> Result<(), LoadError> {
+        self.charge(0, 128)?;
+        self.charge(0, key.len())
+    }
+
+    fn value(&mut self, value: &Value) -> Result<(), LoadError> {
+        self.charge(1, std::mem::size_of::<Value>())?;
+        if let Value::String(text) = value {
+            self.charge(0, text.len())?;
+        }
+        Ok(())
+    }
+
+    fn original(&mut self, value: &Value) -> Result<(), LoadError> {
+        self.value(value)?;
+        match value {
+            Value::Object(fields) => self.fields(fields),
+            Value::Array(items) => {
+                for item in items {
+                    self.original(item)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn fields(&mut self, fields: &Map<String, Value>) -> Result<(), LoadError> {
+        for (key, value) in fields {
+            self.key(key)?;
+            self.original(value)?;
+        }
+        Ok(())
+    }
+
+    fn expanded(
+        &mut self,
+        schema: &Value,
+        defs: &Map<String, Value>,
+        open: &mut Vec<String>,
+    ) -> Result<(), LoadError> {
+        self.value(schema)?;
+        match schema {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    self.key(key)?;
+                    if key != "$ref" {
+                        self.expanded(value, defs, open)?;
+                    }
+                }
+                if let Some(reference) = fields.get("$ref") {
+                    // Charge reference processing and both decoding passes before allocating
+                    // decoded names here or in inline. The stack is at most depth eight.
+                    self.original(reference)?;
+                    if let Some(text) = reference.as_str() {
+                        for _ in 0..4 {
+                            self.charge(0, text.len())?;
+                        }
+                    }
+                    let target = reference_target(reference)?;
+                    let definition = checked_definition(&target, defs, open)?;
+                    open.push(target);
+                    self.expanded(definition, defs, open)?;
+                    open.pop();
+                    if fields.len() > 1 {
+                        self.key("allOf")?;
+                        self.charge(1, std::mem::size_of::<Value>())?;
+                    }
+                }
+                Ok(())
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.expanded(item, defs, open)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn toolset(&mut self, usable: &[UsableContract]) -> Result<(), LoadError> {
+        for contract in usable {
+            for port in &contract.ports {
+                if port.kind == PortKind::Event || port.event.is_some() {
+                    continue;
+                }
+                // Bound descriptions and the two ToolDefinition copies as well.
+                for _ in 0..2 {
+                    self.charge(0, port.description.len())?;
+                    self.charge(0, contract.identity.len())?;
+                    self.charge(0, port.name.len())?;
+                }
+                let request = port.request.as_ref().ok_or_else(|| {
+                    LoadError(format!(
+                        "{}/{} has no request schema",
+                        contract.identity, port.name
+                    ))
+                })?;
+                // PortTools owns one copy; Toolset::for_turn clones the definitions once.
+                for _ in 0..2 {
+                    self.expanded(request, &contract.defs, &mut Vec::new())?;
+                }
+                self.original(request)?;
+                self.key("$defs")?;
+                self.charge(1, std::mem::size_of::<Value>())?;
+                self.fields(&contract.defs)?;
+                if !request.is_object() {
+                    self.key("allOf")?;
+                    self.charge(2, 2 * std::mem::size_of::<Value>())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn reference_target(reference: &Value) -> Result<String, LoadError> {
+    reference
+        .as_str()
+        .and_then(|reference| reference.strip_prefix("#/$defs/"))
+        .filter(|name| !name.contains('/'))
+        .map(|name| name.replace("~1", "/").replace("~0", "~"))
+        .ok_or_else(|| LoadError(format!("reference {reference} is not a local definition")))
+}
+
+fn checked_definition<'a>(
+    target: &str,
+    defs: &'a Map<String, Value>,
+    open: &[String],
+) -> Result<&'a Value, LoadError> {
+    if open.iter().any(|name| name == target) {
+        return Err(LoadError(format!("definition {target} is recursive")));
+    }
+    if open.len() >= MAX_INLINE_DEPTH {
+        return Err(LoadError(format!("definition {target} is nested too deep")));
+    }
+    defs.get(target)
+        .ok_or_else(|| LoadError(format!("definition {target} is missing")))
 }
 
 fn inline(
@@ -121,23 +292,8 @@ fn inline(
             let Some(reference) = fields.get("$ref") else {
                 return Ok(Value::Object(inlined));
             };
-            let target = reference
-                .as_str()
-                .and_then(|reference| reference.strip_prefix("#/$defs/"))
-                .filter(|name| !name.contains('/'))
-                .map(|name| name.replace("~1", "/").replace("~0", "~"))
-                .ok_or_else(|| {
-                    LoadError(format!("reference {reference} is not a local definition"))
-                })?;
-            if open.contains(&target) {
-                return Err(LoadError(format!("definition {target} is recursive")));
-            }
-            if open.len() >= MAX_INLINE_DEPTH {
-                return Err(LoadError(format!("definition {target} is nested too deep")));
-            }
-            let definition = defs
-                .get(&target)
-                .ok_or_else(|| LoadError(format!("definition {target} is missing")))?;
+            let target = reference_target(reference)?;
+            let definition = checked_definition(&target, defs, open)?;
             open.push(target);
             let written = inline(definition, defs, open)?;
             open.pop();
@@ -145,7 +301,7 @@ fn inline(
                 Ok(written)
             } else {
                 // A reference beside other keywords applies alongside them.
-                inlined.insert("allOf".into(), json!([written]));
+                inlined.insert("allOf".into(), Value::Array(vec![written]));
                 Ok(Value::Object(inlined))
             }
         }
@@ -268,8 +424,9 @@ impl<P: PortCaller> PortTools<P> {
     ///
     /// # Errors
     /// A port has no valid tool name, two ports share one, or a request schema cannot be
-    /// written out or compiled.
+    /// written out or compiled within the shared preparation allowance.
     pub fn new(usable: &[UsableContract], ports: P) -> Result<Self, LoadError> {
+        PreparationBudget::default().toolset(usable)?;
         let mut definitions = Vec::new();
         let mut tools = HashMap::new();
         for contract in usable {
@@ -284,7 +441,7 @@ impl<P: PortCaller> PortTools<P> {
                         contract.identity, port.name
                     ))
                 })?;
-                let parameters = inline_refs(request, &contract.defs)
+                let parameters = inline(request, &contract.defs, &mut Vec::new())
                     .map_err(|LoadError(cause)| LoadError(format!("{name}: {cause}")))?;
                 let validator = compile(request, &contract.defs)
                     .map_err(|cause| LoadError(format!("{name}: {cause}")))?;
@@ -817,6 +974,129 @@ mod tests {
             Value::Array(items) => items.iter().any(contains_ref),
             _ => false,
         }
+    }
+
+    fn budget_contract(identity: &str, request: Value, count: usize) -> UsableContract {
+        UsableContract {
+            identity: identity.into(),
+            major: 3,
+            description: "Budget fixture.".into(),
+            defs: Map::new(),
+            ports: (0..count)
+                .map(|index| CatalogPort {
+                    name: if index == 0 {
+                        "sample.read".into()
+                    } else {
+                        format!("sample.read{index}")
+                    },
+                    kind: PortKind::Query,
+                    description: "Read..".into(),
+                    request: Some(request.clone()),
+                    response: Some(json!({"type":"object"})),
+                    event: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn preparation_node_limit_accepts_exact_boundary_then_refuses_before_dispatch() {
+        // Two expanded copies and one original: 3 * (4 + 5457) + one defs object.
+        // No references or large strings: the byte allowance cannot cause this refusal.
+        let request =
+            json!({"type":"object","additionalProperties":false,"default":vec![Value::Null;5457]});
+        let contract = budget_contract("dev.example.budget", request.clone(), 1);
+        let ports = FakePorts::ok();
+        let tools = PortTools::new(&[contract], ports.clone()).unwrap();
+        assert_eq!(tools.definitions()[0].parameters, request);
+        let over = budget_contract(
+            "dev.example.budget",
+            json!({"type":"object","additionalProperties":false,"default":vec![Value::Null;5458]}),
+            1,
+        );
+        let error = PortTools::new(&[over], ports.clone()).err().unwrap();
+        assert_eq!(error.0, "schema preparation node budget exceeded");
+        assert!(ports.calls().is_empty());
+    }
+
+    #[test]
+    fn preparation_byte_limit_accepts_exact_boundary_then_refuses_scalars_and_keys() {
+        // Three schema copies: 553 bytes of values/entries/fixed text each, plus
+        // 165 for $defs and 70 for descriptions/names. 1894 + 3 * 348894 = 1 MiB.
+        let request =
+            json!({"type":"object","additionalProperties":false,"description":"s".repeat(348894)});
+        let contract = budget_contract("dev.example.budget", request.clone(), 1);
+        let tools = PortTools::new(&[contract], FakePorts::ok()).unwrap();
+        assert_eq!(tools.definitions()[0].parameters, request);
+        let over = budget_contract(
+            "dev.example.budget",
+            json!({"type":"object","additionalProperties":false,"description":"s".repeat(348895)}),
+            1,
+        );
+        assert_eq!(
+            PortTools::new(&[over], FakePorts::ok()).err().unwrap().0,
+            "schema preparation byte budget exceeded"
+        );
+        // Key-only schema: 1312 + 3 * 349088 = 1 MiB.
+        let key = "k".repeat(349088);
+        let request = json!({"default":{key:null}});
+        let contract = budget_contract("dev.example.budget", request.clone(), 1);
+        assert_eq!(
+            PortTools::new(&[contract], FakePorts::ok())
+                .unwrap()
+                .definitions()[0]
+                .parameters,
+            request
+        );
+        let key = "k".repeat(349089);
+        let over = budget_contract("dev.example.budget", json!({"default":{key:null}}), 1);
+        assert_eq!(
+            PortTools::new(&[over], FakePorts::ok()).err().unwrap().0,
+            "schema preparation byte budget exceeded"
+        );
+    }
+
+    #[test]
+    fn preparation_budgets_are_shared_across_individually_supported_tools_and_contracts() {
+        for (request, expected) in [
+            (
+                json!({"type":"object","additionalProperties":false,"default":vec![Value::Null;2200]}),
+                "schema preparation node budget exceeded",
+            ),
+            (
+                json!({"type":"object","additionalProperties":false,"description":"s".repeat(120000)}),
+                "schema preparation byte budget exceeded",
+            ),
+        ] {
+            let first = budget_contract("dev.example.first", request.clone(), 2);
+            let second = budget_contract("dev.example.second", request, 1);
+            assert!(PortTools::new(std::slice::from_ref(&first), FakePorts::ok()).is_ok());
+            assert!(PortTools::new(std::slice::from_ref(&second), FakePorts::ok()).is_ok());
+            assert_eq!(
+                PortTools::new(&[first, second], FakePorts::ok())
+                    .err()
+                    .unwrap()
+                    .0,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_bundle_preparation_fits_both_shared_allowances() {
+        let everything: Vec<_> = BundledCatalog::get()
+            .contracts()
+            .iter()
+            .map(UsableContract::from)
+            .collect();
+        let mut budget = PreparationBudget::default();
+        budget.toolset(&everything).unwrap();
+        println!(
+            "ordinary bundle: {} node visits, {} allocation-work bytes",
+            budget.nodes, budget.bytes
+        );
+        assert!(budget.nodes < 4096);
+        assert!(budget.bytes < 768 * 1024);
     }
 
     #[test]

@@ -3025,3 +3025,283 @@ async fn transport_post_failure_refuses_identity_change_without_replaying_or_sto
     assert_eq!(conversations.posts().len(), 1);
     fixture.harness.shutdown().await.unwrap();
 }
+
+/// Compact, valid annotation DAG. Width four/seven tiers has reference depth eight and
+/// 16,384 leaves (371,422 bytes including the request wrapper), never constructed by this test.
+fn schema_preparation_document(
+    identity: &str,
+    width: usize,
+    tiers: usize,
+    leaf: Value,
+    tools: usize,
+) -> Value {
+    let mut defs = serde_json::Map::new();
+    defs.insert("d0".into(), leaf);
+    for tier in 1..=tiers {
+        defs.insert(
+            format!("d{tier}"),
+            json!({"default":vec![json!({"$ref":format!("#/$defs/d{}",tier-1)}) ;width]}),
+        );
+    }
+    let mut ports = vec![
+        json!({"name":"runtime.guide","kind":"query","description":"Guide.",
+        "request":{"type":"object","additionalProperties":false},
+        "response":{"type":"object","additionalProperties":false,"required":["markdown"],"properties":{"markdown":{"type":"string","maxLength":1024}}}}),
+    ];
+    for tool in 0..tools {
+        ports.push(json!({"name":if tool==0 {"sample.read".to_owned()} else {format!("sample.read{tool}")},
+            "kind":"query","description":"Read.","request":{"type":"object","additionalProperties":false,"default":{"$ref":format!("#/$defs/d{tiers}")}},"response":{"type":"object","additionalProperties":false}}));
+    }
+    json!({"schemaVersion":1,"$defs":defs,"contracts":[{"identity":identity,"major":3,"minor":2,"description":"Bounded preparation fixture.","ports":ports}]})
+}
+
+async fn schema_preparation_refusal(documents: Vec<Value>) {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut identities = Vec::new();
+    for document in documents {
+        let projected = support::project_document(document).await;
+        let identity = projected["contracts"][0]["identity"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        conversations
+            .catalog
+            .documents
+            .lock()
+            .unwrap()
+            .insert(identity.clone(), projected);
+        identities.push(identity);
+    }
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    fixture.harness.activate().await.unwrap();
+    configure(&mut fixture.harness, &stub).await;
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":AGENT_ID}))
+        .await
+        .unwrap();
+    for identity in &identities {
+        fixture
+            .harness
+            .request(
+                "agent.packages.set",
+                json!({"contract":identity,"enabled":true,"major":3}),
+            )
+            .await
+            .unwrap();
+    }
+    let refused = chat(&mut fixture.harness, "must refuse the entire toolset").await;
+    assert_eq!(
+        refused["lastError"],
+        json!({"code":"agent.tool_unavailable","retryable":false}),
+        "{refused}"
+    );
+    assert_eq!(
+        stub.request_count(),
+        0,
+        "no partial toolset or model request"
+    );
+    assert!(
+        fixture
+            .ports
+            .recorded_calls()
+            .iter()
+            .all(|call| call.method != "invoke")
+    );
+    assert!(
+        fixture
+            .ports
+            .recorded_calls()
+            .iter()
+            .any(|call| call.method == "describe")
+    );
+    assert!(conversations.posts().is_empty());
+    // A preparation refusal neither latches identity uncertainty nor retries the turn.
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":OTHER_ID}))
+        .await
+        .unwrap();
+    for identity in &identities {
+        fixture
+            .harness
+            .request(
+                "agent.packages.set",
+                json!({"contract":identity,"enabled":false}),
+            )
+            .await
+            .unwrap();
+    }
+    let supported = chat(&mut fixture.harness, "independent work after local refusal").await;
+    assert_eq!(
+        supported["entries"].as_array().unwrap().last().unwrap()["content"],
+        "Hello from Scout"
+    );
+    assert_eq!(supported.get("lastError"), None);
+    assert_eq!(stub.request_count(), 1, "no automatic retry");
+    assert_eq!(offered(&stub.requests()[0].body), None);
+    assert!(
+        fixture
+            .ports
+            .recorded_calls()
+            .iter()
+            .all(|call| call.method != "invoke")
+    );
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_preparation_refuses_canonical_depth_eight_breadth_before_model_or_dispatch() {
+    schema_preparation_refusal(vec![schema_preparation_document(
+        support::UNKNOWN,
+        4,
+        7,
+        json!({"type":"string"}),
+        1,
+    )])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_preparation_refuses_scalar_and_key_bytes_independently_of_node_limit() {
+    schema_preparation_refusal(vec![schema_preparation_document(
+        support::UNKNOWN,
+        2,
+        5,
+        json!({"type":"string","description":"s".repeat(20000)}),
+        1,
+    )])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_preparation_refuses_large_keys_before_model_or_dispatch() {
+    schema_preparation_refusal(vec![schema_preparation_document(
+        support::UNKNOWN,
+        2,
+        5,
+        json!({"default":{"k".repeat(20000):null}}),
+        1,
+    )])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_preparation_charges_repeated_validator_definition_clones() {
+    let mut document = schema_preparation_document(
+        support::UNKNOWN,
+        1,
+        0,
+        json!({"type":"string","description":"s".repeat(100000)}),
+        12,
+    );
+    for port in document["contracts"][0]["ports"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .skip(1)
+    {
+        port["request"]["default"] = Value::Null;
+        port["response"] = json!({"$ref":"#/$defs/d0"});
+    }
+    schema_preparation_refusal(vec![document]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_preparation_shares_work_across_tools_and_contracts() {
+    schema_preparation_refusal(vec![
+        schema_preparation_document(
+            support::UNKNOWN,
+            1,
+            0,
+            json!({"default":vec![Value::Null;2200]}),
+            2,
+        ),
+        schema_preparation_document(
+            "com.example.second",
+            1,
+            0,
+            json!({"default":vec![Value::Null;2200]}),
+            1,
+        ),
+    ])
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn schema_preparation_preserves_bounded_dag_exact_parameters_and_original_validation() {
+    let document = schema_preparation_document(support::UNKNOWN, 2, 3, json!({"type":"string"}), 1);
+    let projected = support::project_document(document).await;
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    conversations
+        .catalog
+        .documents
+        .lock()
+        .unwrap()
+        .insert(support::UNKNOWN.into(), projected);
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    fixture.harness.activate().await.unwrap();
+    configure(&mut fixture.harness, &stub).await;
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId":AGENT_ID}))
+        .await
+        .unwrap();
+    fixture
+        .harness
+        .request(
+            "agent.packages.set",
+            json!({"contract":support::UNKNOWN,"enabled":true,"major":3}),
+        )
+        .await
+        .unwrap();
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "invalid",
+        "survey__sample_read",
+        r#"{"extra":1}"#,
+    )]));
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "valid",
+        "survey__sample_read",
+        "{}",
+    )]));
+    stub.push(Behaviour::Reply("bounded DAG worked".into()));
+    let answered = chat(&mut fixture.harness, "use the bounded DAG").await;
+    assert_eq!(answered["entries"][1]["content"], "bounded DAG worked");
+    let requests = stub.requests();
+    let parameters = &requests[0].body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "survey__sample_read")
+        .unwrap()["function"]["parameters"];
+    let pair = json!({"default":[{"type":"string"},{"type":"string"}]});
+    let four = json!({"default":[pair.clone(),pair]});
+    let eight = json!({"default":[four.clone(),four]});
+    assert_eq!(
+        parameters,
+        &json!({"type":"object","additionalProperties":false,"default":eight})
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(last_message(&requests[1].body)["content"].as_str().unwrap())
+            .unwrap()["error"],
+        "agent.tool_arguments_invalid"
+    );
+    let calls = fixture.ports.recorded_calls();
+    let invokes: Vec<_> = calls
+        .iter()
+        .filter(|call| call.method == "invoke")
+        .collect();
+    assert_eq!(invokes.len(), 1);
+    assert_eq!(
+        invokes[0].payload,
+        json!({"access":"agent","contract":support::UNKNOWN,"major":3,"port":"sample.read","kind":"query","request":{}})
+    );
+    fixture.harness.shutdown().await.unwrap();
+}

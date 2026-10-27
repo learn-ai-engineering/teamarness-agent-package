@@ -43,6 +43,8 @@ The chat and Channel replies can use other installed Packages through Package Po
 
 ### Turn bounds and codes
 
+Before a chat or reply calls the model, one shared toolset preparation allowance limits schema work to 16,384 JSON value visits and 1 MiB of allocation-work bytes. Preflight counts repeated reference expansion, both parameter copies, and each validator's original request and full definitions before copying or compiling. Bytes count `Value` storage, UTF-8 strings, and 128 bytes per object entry, plus reference decoding and tool names/descriptions. This is not a peak-memory measurement of the allocator or validator. Reference depth remains eight. An excessive toolset ends the turn with nonretryable `agent.tool_unavailable`; no partial toolset, model request, or Port call is sent, and no command uncertainty is created.
+
 Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 characters per tool result, 96 KiB of messages added by its own tool calls, and 180 seconds. The system message and history a turn starts with are not counted, so a long conversation with nothing enabled is sent as before. These stable codes can appear:
 
 | Code | Meaning |
