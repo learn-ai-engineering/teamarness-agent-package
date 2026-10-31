@@ -901,6 +901,25 @@ describe("Agent Package UI chat Markdown", () => {
     await cleanup();
   });
 
+  it("renders GitHub-style tables without alignment styles, and strips unsafe cell content", async () => {
+    const { bodies, cleanup } = await chatWith([
+      { id: 1, role: "assistant", content: "| Name | Count |\n| :--- | ---: |\n| **apples** | 3 |\n| pears | 5 |" },
+      { id: 2, role: "assistant", content: "| a | b |\n| - | - |\n| <script>alert(1)</script> | [x](javascript:alert(1)) ![i](https://example.invalid/i.png) |" },
+    ]);
+    const [table, unsafe] = bodies;
+    expect(Array.from(table?.querySelectorAll("thead th") ?? [], (cell) => cell.textContent)).toEqual(["Name", "Count"]);
+    expect(Array.from(table?.querySelectorAll("tbody tr") ?? [], (row) => Array.from(row.querySelectorAll("td"), (cell) => cell.textContent))).toEqual([
+      ["apples", "3"],
+      ["pears", "5"],
+    ]);
+    expect(table?.querySelector("tbody td strong")?.textContent).toBe("apples");
+    expect(table?.querySelector("[style]")).toBeNull();
+    expect(unsafe?.querySelector("table")).not.toBeNull();
+    expect(unsafe?.querySelector("script, img")).toBeNull();
+    expect(unsafe?.innerHTML).not.toContain("javascript:");
+    await cleanup();
+  });
+
   it("keeps status and error text as plain text", async () => {
     const { root, cleanup } = await chatWith([], { lastError: { code: "**agent.odd**", retryable: false } });
     const message = root.querySelector<HTMLElement>('[data-role="chat-message"]');

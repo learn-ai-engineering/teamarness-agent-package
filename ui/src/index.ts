@@ -468,6 +468,9 @@ const AGENT_CSS = `
   .message-markdown pre { max-width: 100%; overflow: auto; padding: .6rem; background: var(--teamarness-color-panel); }
   .message-markdown code { font-family: ui-monospace, monospace; }
   .message-markdown a { color: var(--teamarness-color-accent); }
+  .message-markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: .3rem 0 .5rem; }
+  .message-markdown th, .message-markdown td { border: 1px solid var(--teamarness-color-border); padding: .25rem .5rem; text-align: left; vertical-align: top; }
+  .message-markdown th { background: var(--teamarness-color-panel); font-weight: 600; }
   .chat-activity { margin: .35rem 0 0; font-size: .8em; color: var(--teamarness-color-text-muted); overflow-wrap: anywhere; }
   .chat-empty { color: var(--teamarness-color-text-muted); }
   textarea.chat-input { min-height: 4.5rem; }

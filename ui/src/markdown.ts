@@ -4,7 +4,7 @@ import Token from "markdown-it/lib/token.mjs";
 
 const SAFE_SCHEMES = /^(?:https?:|mailto:|tel:|#|\/|\.\.?\/)/i;
 const SAFE_URI = /^(?:(?:https?|mailto|tel):|[^a-z][^:]*$|#|\/|\.\.?\/)/i;
-const ALLOWED_TAGS = ["a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3", "h4", "hr", "li", "ol", "p", "pre", "strong", "ul"];
+const ALLOWED_TAGS = ["a", "blockquote", "br", "code", "del", "em", "h1", "h2", "h3", "h4", "hr", "li", "ol", "p", "pre", "strong", "table", "tbody", "td", "th", "thead", "tr", "ul"];
 const ALLOWED_ATTR = ["href", "target", "rel"];
 
 function safeLink(url: string): boolean {
