@@ -142,7 +142,7 @@ describe("Agent Package UI controller", () => {
     const status: Status = { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } };
     const { client } = fakeBackend({ status, refuseBinding: code });
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     await controller.start();
     await controller.bind(OTHER_ID);
     expect(lastState(states).error).toBe(guidance);
@@ -150,21 +150,22 @@ describe("Agent Package UI controller", () => {
     expect(lastState(states).busy).toBe(false);
     controller.dispose();
   });
-  it("loads settings, status and candidates, then follows status changes", async () => {
+  it("settings loads settings, status, candidates and Packages, then follows status changes", async () => {
     const { fake, client } = fakeBackend();
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     await controller.start();
 
     const operations = fake.calls.map((call) => call.operation);
-    expect(operations).toContain("agent.settings.get");
-    expect(operations).toContain("agent.status.get");
-    expect(operations).toContain("agent.binding.candidates");
-    expect(operations).toContain("agent.status.changes");
-    expect(operations).toContain("agent.chat.get");
-    expect(operations).toContain("agent.chat.changes");
+    expect(operations).toEqual([
+      "agent.settings.get",
+      "agent.status.get",
+      "agent.binding.candidates",
+      "agent.status.changes",
+      "agent.packages.get",
+    ]);
     const state = lastState(states);
-    expect(state.chat).toEqual({ entries: [], pending: false });
+    expect(state.chat).toBeNull();
     expect(state.settings?.contextMessages).toBe(20);
     expect(state.hasKey).toBe(false);
     expect(state.status).toEqual({ state: "unconfigured" });
@@ -175,10 +176,33 @@ describe("Agent Package UI controller", () => {
     controller.dispose();
   });
 
+  it("main loads only the status and the chat, and follows both", async () => {
+    const { fake, client } = fakeBackend();
+    const states: AgentUiState[] = [];
+    const controller = createAgentController(client, (state) => { states.push(state); }, "main");
+    await controller.start();
+
+    expect(fake.calls.map((call) => call.operation)).toEqual([
+      "agent.status.get",
+      "agent.chat.get",
+      "agent.status.changes",
+      "agent.chat.changes",
+    ]);
+    expect(lastState(states).settings).toBeNull();
+    expect(lastState(states).packages).toBeNull();
+    expect(lastState(states).chat).toEqual({ entries: [], pending: false });
+
+    await fake.emit("agent.status.changes", { state: "no_agent" });
+    expect(lastState(states).status).toEqual({ state: "no_agent" });
+    await fake.emit("agent.chat.changes", { entries: [{ id: 1, role: "user", content: "hi" }], pending: true });
+    expect(lastState(states).chat?.pending).toBe(true);
+    controller.dispose();
+  });
+
   it("saves settings, stores the key without keeping it, and reports invalid fields", async () => {
     const { fake, client, secretSeen } = fakeBackend();
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     await controller.start();
 
     await controller.saveSettings({ ...defaults(), model: "deepseek/deepseek-chat", contextMessages: 8 });
@@ -205,7 +229,7 @@ describe("Agent Package UI controller", () => {
   it("binds and clears the Agent and shows refusals", async () => {
     const { client } = fakeBackend();
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     await controller.start();
 
     await controller.bind(AGENT_ID);
@@ -224,7 +248,7 @@ describe("Agent Package UI controller", () => {
   it("sends chat messages, follows replies and explains refusals", async () => {
     const { fake, client, reply } = fakeBackend({ status: { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } } });
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "main");
     await controller.start();
 
     expect(await controller.sendChat("hello")).toBe(true);
@@ -245,7 +269,7 @@ describe("Agent Package UI controller", () => {
   });
 
   it("describes chat failures as sentences and passes unknown codes through", () => {
-    expect(describeChatError("agent.not_configured")).toBe("Add the endpoint, model and API key on the Configuration tab first.");
+    expect(describeChatError("agent.not_configured")).toBe("Add the endpoint, model and API key in the Agent's Configuration on its Package page first.");
     expect(describeChatError("agent.endpoint_unreachable")).toBe("The endpoint could not be reached. Try again.");
     expect(describeChatError("agent.chat_interrupted")).toBe("The reply was interrupted. Send the message again.");
     expect(describeChatError("agent.turn_limit_exceeded")).toBe("The reply needed more steps than one turn allows. Ask for something smaller.");
@@ -255,7 +279,7 @@ describe("Agent Package UI controller", () => {
   it("ignores updates after dispose", async () => {
     const { fake, client } = fakeBackend();
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     await controller.start();
     controller.dispose();
     const count = states.length;
@@ -288,7 +312,7 @@ describe("Agent Package UI mount", () => {
     });
     let unmount: Awaited<ReturnType<typeof mount>> | undefined;
     try {
-      unmount = await mount(createTestMountContext({ root, client }));
+      unmount = await mount(createTestMountContext({ root, client, view: "settings" }));
       const form = root.querySelector("form.agent-settings");
       expect(form?.querySelectorAll(":scope > section")).toHaveLength(5);
       const picker = form?.querySelector<HTMLSelectElement>('select[name="agent"]');
@@ -307,7 +331,8 @@ describe("Agent Package UI mount", () => {
       expect(css).not.toContain("display: contents");
       // Only the transcript scrolls; the chat page is pinned to the pane height.
       expect(css).toMatch(/\.agent-page\s*\{[^}]*width:\s*max\(75%[^}]*margin-inline:\s*auto/s);
-      expect(css).toMatch(/\.agent-page\[data-tab="chat"\]\s*\{[^}]*height:\s*100vh/s);
+      expect(css).toMatch(/\.agent-page\[data-view="main"\]\s*\{[^}]*height:\s*100vh/s);
+      expect(css).not.toContain("agent-tab");
       expect(css).toMatch(/\.chat-log\s*\{[^}]*overflow-y:\s*auto/s);
       expect(css).toMatch(/\.chat-form\s*\{[^}]*margin-top:\s*auto/s);
     } finally {
@@ -321,7 +346,7 @@ describe("Agent Package UI mount", () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
-    const context = createTestMountContext({ root, client, displayName: "Agent" });
+    const context = createTestMountContext({ root, client, displayName: "Agent", view: "settings" });
 
     const unmount = await mount(context);
     expect(root.querySelectorAll("form.agent-settings")).toHaveLength(1);
@@ -366,71 +391,73 @@ describe("Agent Package UI mount", () => {
   });
 });
 
-describe("Agent Package UI tabs and chat", () => {
-  async function mounted(status?: Status) {
+describe("Agent Package UI views and chat", () => {
+  async function mounted(status?: Status, view: "main" | "settings" = "main") {
     const backend = fakeBackend(status ? { status } : undefined);
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
-    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
-    const tab = (name: string) => {
-      const found = Array.from(root.querySelectorAll<HTMLButtonElement>("[role=tab]")).find((element) => element.textContent === name);
-      if (!found) throw new Error(`tab ${name} missing`);
-      return found;
-    };
-    const panel = (name: string) => {
-      const found = root.getElementById(tab(name).getAttribute("aria-controls") ?? "");
-      if (!found) throw new Error(`panel ${name} missing`);
-      return found;
-    };
+    const unmount = await mount(createTestMountContext({ root, client: backend.client, view }));
     const cleanup = async () => {
       await unmount();
       host.remove();
     };
-    return { ...backend, root, tab, panel, cleanup };
+    return { ...backend, root, chat: root, cleanup };
   }
 
-  it("opens on Configuration and switches panels by click and arrow keys", async () => {
-    const { root, tab, panel, cleanup } = await mounted();
-    expect(Array.from(root.querySelectorAll("[role=tab]")).map((element) => element.textContent)).toEqual(["Configuration", "Chat"]);
-    expect(tab("Configuration").getAttribute("aria-selected")).toBe("true");
-    expect(panel("Configuration").hidden).toBe(false);
-    expect(panel("Chat").hidden).toBe(true);
-    expect(panel("Configuration").querySelector("form.agent-settings")).not.toBeNull();
+  it("mounts the main view as the chat only, without configuration", async () => {
+    const { fake, root, cleanup } = await mounted();
+    expect(root.querySelector('[role="tab"], [role="tablist"]')).toBeNull();
+    expect(root.querySelector("article.agent-page")?.getAttribute("data-view")).toBe("main");
+    expect(root.querySelector('section.agent-chat textarea[name="chatMessage"]')).not.toBeNull();
+    expect(root.querySelector("form.agent-settings")).toBeNull();
+    for (const name of ["agent", "endpointBaseUrl", "model", "apiKey"]) {
+      expect(root.querySelector(`[name="${name}"]`)).toBeNull();
+    }
+    expect(root.querySelector('[data-role="packages"]')).toBeNull();
+    const operations = fake.calls.map((call) => call.operation);
+    expect(operations).not.toContain("agent.settings.get");
+    expect(operations).not.toContain("agent.packages.get");
+    await cleanup();
+  });
 
-    // One centered page frame for both tabs, so the header never moves between them.
-    const page = root.querySelector<HTMLElement>("article.agent-page");
-    const frame = page?.className;
-    expect(page?.dataset.tab).toBe("configuration");
-    tab("Chat").click();
-    expect(tab("Chat").getAttribute("aria-selected")).toBe("true");
-    expect(page?.dataset.tab).toBe("chat");
-    expect(page?.className).toBe(frame);
-    expect(tab("Configuration").tabIndex).toBe(-1);
-    expect(panel("Chat").hidden).toBe(false);
-    expect(panel("Configuration").hidden).toBe(true);
-
-    tab("Chat").dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }));
-    expect(tab("Configuration").getAttribute("aria-selected")).toBe("true");
-    expect(root.activeElement).toBe(tab("Configuration"));
-    expect(page?.className).toBe(frame);
+  it("mounts the settings view as the configuration only, without chat", async () => {
+    const { fake, root, cleanup } = await mounted(undefined, "settings");
+    expect(root.querySelector('[role="tab"], [role="tablist"]')).toBeNull();
+    expect(root.querySelector("article.agent-page")?.getAttribute("data-view")).toBe("settings");
+    expect(root.querySelector("form.agent-settings")).not.toBeNull();
+    expect(root.querySelector('select[name="agent"]')).not.toBeNull();
+    expect(root.querySelector('input[name="apiKey"]')).not.toBeNull();
+    expect(root.querySelector('[data-role="packages"]')).not.toBeNull();
+    expect(root.querySelector(".agent-chat, [data-role=\"chat-log\"], textarea[name=\"chatMessage\"]")).toBeNull();
+    const operations = fake.calls.map((call) => call.operation);
+    expect(operations).not.toContain("agent.chat.get");
+    expect(operations).not.toContain("agent.chat.changes");
     await cleanup();
   });
 
   it("asks for configuration before chatting", async () => {
-    const { tab, panel, cleanup } = await mounted();
-    tab("Chat").click();
-    expect(panel("Chat").querySelector('[data-role="chat-empty"]')?.textContent).toBe(
-      "Add the endpoint, model and API key on the Configuration tab before chatting.",
+    const { chat, cleanup } = await mounted();
+    expect(chat.querySelector('[data-role="chat-empty"]')?.textContent).toBe(
+      "Add the endpoint, model and API key in the Agent's Configuration on its Package page before chatting.",
     );
-    expect(panel("Chat").querySelector<HTMLButtonElement>('button[data-action="send-chat"]')?.disabled).toBe(true);
+    expect(chat.querySelector<HTMLButtonElement>('button[data-action="send-chat"]')?.disabled).toBe(true);
+    await cleanup();
+  });
+
+  it("leaves the unconfigured chat when a status change arrives", async () => {
+    const { fake, chat, cleanup } = await mounted();
+    const send = () => chat.querySelector<HTMLButtonElement>('button[data-action="send-chat"]');
+    expect(send()?.disabled).toBe(true);
+    // Configuration saved in the settings view reaches the chat through its status subscription.
+    await fake.emit("agent.status.changes", { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } } satisfies PackageValue);
+    expect(chat.querySelector('[data-role="chat-empty"]')?.textContent).toBe("No messages yet. Say hello.");
+    expect(send()?.disabled).toBe(false);
     await cleanup();
   });
 
   it("sends with Enter, shows the reply under the Agent's name and clears the conversation", async () => {
-    const { fake, reply, panel, tab, cleanup } = await mounted({ state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } });
-    tab("Chat").click();
-    const chat = panel("Chat");
+    const { fake, reply, chat, cleanup } = await mounted({ state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } });
     const input = chat.querySelector<HTMLTextAreaElement>('textarea[name="chatMessage"]');
     if (!input) throw new Error("chat input missing");
     expect(input.closest("label")?.textContent).toContain("Message");
@@ -595,7 +622,7 @@ describe("Agent Package UI packages", () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = host.attachShadow({ mode: "open" });
-    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
+    const unmount = await mount(createTestMountContext({ root, client: backend.client, view: "settings" }));
     const section = Array.from(root.querySelectorAll<HTMLElement>("section.agent-group")).find(
       (element) => element.querySelector(".agent-group-title")?.textContent === "Packages",
     );
@@ -657,7 +684,7 @@ describe("Agent Package UI packages", () => {
   it("shows a refused change as a Package error and keeps the last view", async () => {
     const { client } = fakeBackend({ packages: [EXHIBITS] });
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     await controller.start();
     expect(lastState(states).packages).toEqual([EXHIBITS]);
     await controller.setPackage("com.example.gone", false);
@@ -735,7 +762,7 @@ describe("Agent Package UI packages", () => {
     const held = new Promise<void>((resolve) => { release = resolve; });
     const { fake, client } = fakeBackend({ packages: [{ ...EXHIBITS, enabled: true, enabledMajor: 3 }], holdFirstPackageGet: held });
     const states: AgentUiState[] = [];
-    const controller = createAgentController(client, (state) => { states.push(state); });
+    const controller = createAgentController(client, (state) => { states.push(state); }, "settings");
     const starting = controller.start();
     await flush();
     expect(fake.calls.some((call) => call.operation === "agent.packages.get")).toBe(true);

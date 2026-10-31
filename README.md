@@ -18,10 +18,10 @@ Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests an
 1. Start the desired Teamarness profile once, then stop it.
 2. Add a local registration to `<app-data>/packages/registrations.v1.json`, using the canonical absolute path to `dist/dev.teamarness.agent/`, expected identity `dev.teamarness.agent`, and the explicit native trust acknowledgement documented by Teamarness's `docs/local-package-registration.md`. Preserve existing registrations. Use directory mode 700 and file mode 600; no symlinks.
 3. Restart Teamarness. Agent appears under **Personal Packages**.
-4. In a Workspace, choose an Agent you steward on this Installation, set its completion endpoint/model/instructions, and store its API key in the Agent UI.
-5. Open the **Chat** tab to talk to the configured model directly. The chat needs the endpoint, model and key but no binding; it is never posted to a Channel. The Backend keeps the transcript in memory only (up to 64 entries); a Backend restart clears it. `agent.chat.send` returns at once and the reply arrives through `agent.chat.changes`, because a completion can outlast the Host's 30 s UI request deadline.
+4. In a Workspace, open the Agent's Package page and its **Configuration** tab. Choose an Agent you steward on this Installation, set its completion endpoint/model/instructions, and store its API key there.
+5. Open the Agent itself to talk to the configured model directly; its main view is the chat. The chat needs the endpoint, model and key but no binding; it is never posted to a Channel. The Backend keeps the transcript in memory only (up to 64 entries); a Backend restart clears it. `agent.chat.send` returns at once and the reply arrives through `agent.chat.changes`, because a completion can outlast the Host's 30 s UI request deadline.
 
-6. In the **Packages** section of the Configuration tab, explicitly enable **Conversations** to receive Channel replies. Enable other Packages only when you want their model tools. See [Package tools](#package-tools).
+6. In the **Packages** section of the Agent's Configuration, explicitly enable **Conversations** to receive Channel replies. Enable other Packages only when you want their model tools. See [Package tools](#package-tools).
 
 Rebuild and restart after code changes; no hot reload. Each Installation has separate configuration. Personal installation does not share keys or grant extra Workspace authority. The Backend has the current OS user's native authority and sends Channel context to the configured model endpoint.
 

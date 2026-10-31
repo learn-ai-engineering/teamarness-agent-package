@@ -9,6 +9,7 @@ import {
   type PackageClient,
   type PackageMountContext,
   type PackageSubscription,
+  type PackageUiView,
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
 import type { Activity, AgentContract, Candidate, Chat, PackageView, Settings, Status } from "./contract.generated";
@@ -41,6 +42,7 @@ export type AgentUiState = Readonly<{
 export type PendingPackage = Readonly<{ contract: string; enabled: boolean }>;
 
 export type AgentController = Readonly<{
+  /** Loads what the controller's view shows and starts only that view's subscriptions. */
   start(): Promise<void>;
   saveSettings(settings: Settings): Promise<void>;
   setKey(apiKey: string): Promise<void>;
@@ -80,7 +82,7 @@ export function describeStatus(status: Status | null): string {
 export function describeChatError(code: string): string {
   switch (code) {
     case "agent.not_configured":
-      return "Add the endpoint, model and API key on the Configuration tab first.";
+      return "Add the endpoint, model and API key in the Agent's Configuration on its Package page first.";
     case "agent.chat_busy":
       return "Wait for the current reply before sending another message.";
     case "agent.invalid_message":
@@ -141,9 +143,14 @@ function describeFailure(error: unknown): string {
 
 // ─── Controller ──────────────────────────────────────────────────────────────
 
+/**
+ * The state behind one mount. The `settings` view shows configuration: settings, key, binding,
+ * status and Packages. The `main` view shows the chat, which needs only the status and the chat.
+ */
 export function createAgentController(
   client: PackageClient,
   present: (state: AgentUiState) => void,
+  view: PackageUiView,
 ): AgentController {
   const typed = typedPackageClient<AgentContract>(client);
   let disposed = false;
@@ -225,18 +232,29 @@ export function createAgentController(
 
   return Object.freeze({
     async start(): Promise<void> {
+      if (view !== "settings") {
+        // Chat follows the status too, so saving the configuration elsewhere enables it.
+        await run(async () => {
+          const status = await typed.request("agent.status.get", {});
+          const chat = await typed.request("agent.chat.get", {});
+          subscription = await typed.subscribe("agent.status.changes", {}, (event) => {
+            update({ status: event });
+          });
+          chatSubscription = await typed.subscribe("agent.chat.changes", {}, (event) => {
+            update({ chat: event });
+          });
+          return { status, chat };
+        });
+        return;
+      }
       await run(async () => {
         const settings = await typed.request("agent.settings.get", {});
         const status = await typed.request("agent.status.get", {});
         const candidates = await loadCandidates();
-        const chat = await typed.request("agent.chat.get", {});
         subscription = await typed.subscribe("agent.status.changes", {}, (event) => {
           update({ status: event });
         });
-        chatSubscription = await typed.subscribe("agent.chat.changes", {}, (event) => {
-          update({ chat: event });
-        });
-        return { settings: settings.settings, hasKey: settings.hasKey, status, candidates, chat };
+        return { settings: settings.settings, hasKey: settings.hasKey, status, candidates };
       });
       // A Packages failure stays in its own section; the rest of the page still works.
       await packagesRequest(async () => (await typed.request("agent.packages.get", {})).packages);
@@ -353,13 +371,7 @@ const AGENT_CSS = `
   .message[data-kind="error"] { color: var(--teamarness-color-danger, #b42318); }
   .message[data-kind="notice"] { color: var(--teamarness-color-text-muted); }
   button:disabled { opacity: .5; cursor: default; }
-  .agent-tabs { display: flex; gap: .25rem; border-bottom: 1px solid var(--teamarness-color-border); }
-  .agent-tab { appearance: none; background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; padding: .55rem .9rem; color: var(--teamarness-color-text-muted); font: inherit; font-weight: 600; cursor: pointer; }
-  .agent-tab[aria-selected="true"] { color: var(--teamarness-color-text); border-bottom-color: var(--teamarness-color-accent); }
-  .agent-tab:focus-visible { outline: 2px solid var(--teamarness-color-focus); outline-offset: 2px; }
-  .agent-panel[hidden] { display: none; }
-  .agent-page[data-tab="chat"] { display: flex; flex-direction: column; height: 100vh; }
-  .agent-page[data-tab="chat"] > #agent-panel-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .agent-page[data-view="main"] { display: flex; flex-direction: column; height: 100vh; }
   .agent-chat { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 1rem; }
   .chat-log { list-style: none; margin: 0; padding: 0 .25rem 0 0; flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 1.25rem; }
   .chat-log:empty { display: none; }
@@ -452,6 +464,14 @@ function input(name: string, type: string, placeholder?: string): HTMLInputEleme
   return element;
 }
 
+/** One view's content: its element, how it presents state, and its control listeners. */
+type AgentView = Readonly<{
+  element: HTMLElement;
+  render(state: AgentUiState): void;
+  /** Adds the view's listeners and returns their removal. */
+  listen(controller: AgentController): () => void;
+}>;
+
 export async function mount(context: PackageMountContext): Promise<PackageUnmount> {
   const cleanupKit = installPackageUiKit(context.root);
   let cleanupStyles: () => void;
@@ -464,6 +484,8 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
 
   const page = document.createElement("article");
   page.className = "teamarness-page agent-page";
+  // The chat fills the pane so only its transcript scrolls; configuration scrolls as a page.
+  page.dataset.view = context.view;
   const header = document.createElement("header");
   header.className = "teamarness-page-header";
   const title = document.createElement("h1");
@@ -474,44 +496,29 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   subtitle.textContent = "Run one of your Workspace Agents against an OpenAI-compatible endpoint.";
   header.append(title, subtitle);
 
-  // Tabs
-  const tabList = document.createElement("div");
-  tabList.className = "agent-tabs";
-  tabList.setAttribute("role", "tablist");
-  tabList.setAttribute("aria-label", "Agent sections");
-  const configPanel = document.createElement("div");
-  const chatPanel = document.createElement("div");
-  const tabs = ([["configuration", "Configuration", configPanel], ["chat", "Chat", chatPanel]] as const).map(
-    ([id, text, panel]) => {
-      const tab = document.createElement("button");
-      tab.type = "button";
-      tab.className = "agent-tab";
-      tab.id = `agent-tab-${id}`;
-      tab.dataset.tab = id;
-      tab.setAttribute("role", "tab");
-      tab.setAttribute("aria-controls", `agent-panel-${id}`);
-      tab.textContent = text;
-      panel.id = `agent-panel-${id}`;
-      panel.className = "agent-panel";
-      panel.setAttribute("role", "tabpanel");
-      panel.setAttribute("aria-labelledby", tab.id);
-      tabList.append(tab);
-      return { id, tab, panel };
-    },
-  );
-  const selectTab = (id: string, focus = false): void => {
-    // The chat fills the pane so only its transcript scrolls; configuration scrolls as a page.
-    page.dataset.tab = id;
-    for (const entry of tabs) {
-      const selected = entry.id === id;
-      entry.tab.setAttribute("aria-selected", String(selected));
-      entry.tab.tabIndex = selected ? 0 : -1;
-      entry.panel.hidden = !selected;
-      if (selected && focus) entry.tab.focus();
-    }
-  };
-  selectTab("configuration");
+  const view = context.view === "settings" ? configurationView(context) : chatView();
+  page.append(header, view.element);
+  context.root.append(page);
 
+  const controller = createAgentController(context.client, view.render, context.view);
+  const stopListening = view.listen(controller);
+
+  await controller.start();
+
+  let unmounted = false;
+  return () => {
+    if (unmounted) return;
+    unmounted = true;
+    controller.dispose();
+    stopListening();
+    page.remove();
+    cleanupStyles();
+    cleanupKit();
+  };
+}
+
+/** The settings view: status, Agent binding, model endpoint, API key and Packages. */
+function configurationView(context: PackageMountContext): AgentView {
   const form = document.createElement("form");
   form.className = "agent-settings";
   form.noValidate = true;
@@ -596,51 +603,6 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     packageList, refreshPackagesButton, packagesMessage);
 
   form.append(statusSection, agentSection, settingsSection, keySection, packagesSection);
-  configPanel.append(form);
-
-  // Chat
-  const chatSection = document.createElement("section");
-  chatSection.className = "agent-chat";
-  chatSection.setAttribute("aria-label", "Chat with the Agent");
-  const chatIntro = document.createElement("p");
-  chatIntro.className = "teamarness-help";
-  chatIntro.textContent = "A private conversation with the configured model. Nothing here is posted to a Channel, and it is kept only until the Package restarts.";
-  const chatEmpty = document.createElement("p");
-  chatEmpty.className = "chat-empty";
-  chatEmpty.dataset.role = "chat-empty";
-  const chatLog = document.createElement("ol");
-  chatLog.className = "chat-log";
-  chatLog.dataset.role = "chat-log";
-  chatLog.setAttribute("role", "log");
-  chatLog.setAttribute("aria-label", "Conversation");
-  const chatMessage = document.createElement("p");
-  chatMessage.className = "message";
-  chatMessage.dataset.role = "chat-message";
-  chatMessage.setAttribute("role", "status");
-  // What a failed turn did before it ended, under its error.
-  const chatFailedActivity = document.createElement("p");
-  chatFailedActivity.className = "chat-activity";
-  chatFailedActivity.dataset.role = "chat-failed-activity";
-  chatFailedActivity.hidden = true;
-  const chatForm = document.createElement("form");
-  chatForm.className = "teamarness-stack chat-form";
-  chatForm.noValidate = true;
-  const chatInput = document.createElement("textarea");
-  chatInput.className = "teamarness-input chat-input";
-  chatInput.name = "chatMessage";
-  chatInput.maxLength = 8192;
-  const chatRow = document.createElement("div");
-  chatRow.className = "row";
-  const sendButton = button("Send", "send-chat", "primary");
-  sendButton.type = "submit";
-  const clearChatButton = button("Clear conversation", "clear-chat", "secondary");
-  chatRow.append(sendButton, clearChatButton);
-  chatForm.append(field("Message", chatInput, "Enter sends; Shift+Enter adds a line."), chatRow);
-  chatSection.append(chatIntro, chatEmpty, chatLog, chatMessage, chatFailedActivity, chatForm);
-  chatPanel.append(chatSection);
-
-  page.append(header, tabList, configPanel, chatPanel);
-  context.root.append(page);
 
   let settingsLoaded = false;
   const render = (state: AgentUiState): void => {
@@ -690,7 +652,6 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     clearKeyButton.disabled = busy || !state.hasKey;
 
     renderPackages(state);
-    renderChat(state);
   };
 
   let renderedPackages = "";
@@ -763,8 +724,95 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     else delete packagesMessage.dataset.kind;
   };
 
+  const listen = (controller: AgentController): (() => void) => {
+    const readSettings = (): Settings => ({
+      endpointBaseUrl: endpointInput.value.trim(),
+      model: modelInput.value.trim(),
+      systemPrompt: promptInput.value,
+      contextMessages: Math.min(64, Math.max(0, Math.trunc(Number(contextInput.value) || 0))),
+    });
+    const onSave = (): void => { void controller.saveSettings(readSettings()); };
+    const onSetKey = (): void => {
+      const value = keyInput.value;
+      keyInput.value = "";
+      if (value.trim()) void controller.setKey(value);
+    };
+    const onClearKey = (): void => { void controller.clearKey(); };
+    const onBind = (): void => { if (picker.value) void controller.bind(picker.value); };
+    const onUnbind = (): void => { void controller.unbind(); };
+    const onRefresh = (): void => { void controller.refreshCandidates(); };
+    const onRefreshPackages = (): void => { void controller.refreshPackages(); };
+    const onPackageToggle = (event: Event): void => {
+      const toggle = event.target as HTMLInputElement | null;
+      const contract = toggle?.dataset.contract;
+      if (contract) void controller.setPackage(contract, toggle.checked);
+    };
+    saveButton.addEventListener("click", onSave);
+    setKeyButton.addEventListener("click", onSetKey);
+    clearKeyButton.addEventListener("click", onClearKey);
+    bindButton.addEventListener("click", onBind);
+    unbindButton.addEventListener("click", onUnbind);
+    refreshButton.addEventListener("click", onRefresh);
+    packageList.addEventListener("change", onPackageToggle);
+    refreshPackagesButton.addEventListener("click", onRefreshPackages);
+    return () => {
+      saveButton.removeEventListener("click", onSave);
+      setKeyButton.removeEventListener("click", onSetKey);
+      clearKeyButton.removeEventListener("click", onClearKey);
+      bindButton.removeEventListener("click", onBind);
+      unbindButton.removeEventListener("click", onUnbind);
+      refreshButton.removeEventListener("click", onRefresh);
+      packageList.removeEventListener("change", onPackageToggle);
+      refreshPackagesButton.removeEventListener("click", onRefreshPackages);
+    };
+  };
+
+  return { element: form, render, listen };
+}
+
+/** The main view: the Steward's direct chat with the configured model. */
+function chatView(): AgentView {
+  const chatSection = document.createElement("section");
+  chatSection.className = "agent-chat";
+  chatSection.setAttribute("aria-label", "Chat with the Agent");
+  const chatIntro = document.createElement("p");
+  chatIntro.className = "teamarness-help";
+  chatIntro.textContent = "A private conversation with the configured model. Nothing here is posted to a Channel, and it is kept only until the Package restarts.";
+  const chatEmpty = document.createElement("p");
+  chatEmpty.className = "chat-empty";
+  chatEmpty.dataset.role = "chat-empty";
+  const chatLog = document.createElement("ol");
+  chatLog.className = "chat-log";
+  chatLog.dataset.role = "chat-log";
+  chatLog.setAttribute("role", "log");
+  chatLog.setAttribute("aria-label", "Conversation");
+  const chatMessage = document.createElement("p");
+  chatMessage.className = "message";
+  chatMessage.dataset.role = "chat-message";
+  chatMessage.setAttribute("role", "status");
+  // What a failed turn did before it ended, under its error.
+  const chatFailedActivity = document.createElement("p");
+  chatFailedActivity.className = "chat-activity";
+  chatFailedActivity.dataset.role = "chat-failed-activity";
+  chatFailedActivity.hidden = true;
+  const chatForm = document.createElement("form");
+  chatForm.className = "teamarness-stack chat-form";
+  chatForm.noValidate = true;
+  const chatInput = document.createElement("textarea");
+  chatInput.className = "teamarness-input chat-input";
+  chatInput.name = "chatMessage";
+  chatInput.maxLength = 8192;
+  const chatRow = document.createElement("div");
+  chatRow.className = "row";
+  const sendButton = button("Send", "send-chat", "primary");
+  sendButton.type = "submit";
+  const clearChatButton = button("Clear conversation", "clear-chat", "secondary");
+  chatRow.append(sendButton, clearChatButton);
+  chatForm.append(field("Message", chatInput, "Enter sends; Shift+Enter adds a line."), chatRow);
+  chatSection.append(chatIntro, chatEmpty, chatLog, chatMessage, chatFailedActivity, chatForm);
+
   let renderedEntries = "";
-  const renderChat = (state: AgentUiState): void => {
+  const render = (state: AgentUiState): void => {
     const chat = state.chat;
     const entries = chat?.entries ?? [];
     const agentName = state.status?.agent?.name ?? "Agent";
@@ -797,7 +845,7 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     chatEmpty.hidden = entries.length > 0;
     chatEmpty.textContent = configured
       ? "No messages yet. Say hello."
-      : "Add the endpoint, model and API key on the Configuration tab before chatting.";
+      : "Add the endpoint, model and API key in the Agent's Configuration on its Package page before chatting.";
 
     const pending = chat?.pending ?? false;
     const failure = state.chatError ?? (chat?.lastError ? describeChatError(chat.lastError.code) : undefined);
@@ -819,99 +867,31 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     clearChatButton.disabled = state.chatBusy || (entries.length === 0 && !pending);
   };
 
-  const controller = createAgentController(context.client, render);
-
-  const readSettings = (): Settings => ({
-    endpointBaseUrl: endpointInput.value.trim(),
-    model: modelInput.value.trim(),
-    systemPrompt: promptInput.value,
-    contextMessages: Math.min(64, Math.max(0, Math.trunc(Number(contextInput.value) || 0))),
-  });
-  const onSave = (): void => { void controller.saveSettings(readSettings()); };
-  const onSetKey = (): void => {
-    const value = keyInput.value;
-    keyInput.value = "";
-    if (value.trim()) void controller.setKey(value);
-  };
-  const onClearKey = (): void => { void controller.clearKey(); };
-  const onBind = (): void => { if (picker.value) void controller.bind(picker.value); };
-  const onUnbind = (): void => { void controller.unbind(); };
-  const onRefresh = (): void => { void controller.refreshCandidates(); };
-  const showTab = (id: string, focus = false): void => {
-    selectTab(id, focus);
-    // A hidden transcript has no height, so the latest message is scrolled to once shown.
-    if (id === "chat") chatLog.scrollTop = chatLog.scrollHeight;
-  };
-  const onTabClick = (event: MouseEvent): void => {
-    const tab = (event.target as Element | null)?.closest<HTMLElement>("[role=tab]");
-    if (tab?.dataset.tab) showTab(tab.dataset.tab);
-  };
-  const onTabKey = (event: KeyboardEvent): void => {
-    const index = tabs.findIndex((entry) => entry.tab === event.target);
-    if (index < 0) return;
-    const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
-    const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[tabs.length - 1] : step ? tabs[(index + step + tabs.length) % tabs.length] : undefined;
-    if (!next) return;
-    event.preventDefault();
-    showTab(next.id, true);
-  };
-  const onSendChat = (event: SubmitEvent): void => {
-    event.preventDefault();
-    const content = chatInput.value.trim();
-    if (!content || sendButton.disabled) return;
-    void controller.sendChat(content).then((accepted) => {
-      if (accepted && chatInput.value.trim() === content) chatInput.value = "";
-    });
-  };
-  const onChatKey = (event: KeyboardEvent): void => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+  const listen = (controller: AgentController): (() => void) => {
+    const onSendChat = (event: SubmitEvent): void => {
       event.preventDefault();
-      chatForm.requestSubmit();
-    }
+      const content = chatInput.value.trim();
+      if (!content || sendButton.disabled) return;
+      void controller.sendChat(content).then((accepted) => {
+        if (accepted && chatInput.value.trim() === content) chatInput.value = "";
+      });
+    };
+    const onChatKey = (event: KeyboardEvent): void => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        chatForm.requestSubmit();
+      }
+    };
+    const onClearChat = (): void => { void controller.clearChat(); };
+    chatForm.addEventListener("submit", onSendChat);
+    chatInput.addEventListener("keydown", onChatKey);
+    clearChatButton.addEventListener("click", onClearChat);
+    return () => {
+      chatForm.removeEventListener("submit", onSendChat);
+      chatInput.removeEventListener("keydown", onChatKey);
+      clearChatButton.removeEventListener("click", onClearChat);
+    };
   };
-  const onClearChat = (): void => { void controller.clearChat(); };
-  const onRefreshPackages = (): void => { void controller.refreshPackages(); };
-  const onPackageToggle = (event: Event): void => {
-    const toggle = event.target as HTMLInputElement | null;
-    const contract = toggle?.dataset.contract;
-    if (contract) void controller.setPackage(contract, toggle.checked);
-  };
-  saveButton.addEventListener("click", onSave);
-  setKeyButton.addEventListener("click", onSetKey);
-  clearKeyButton.addEventListener("click", onClearKey);
-  bindButton.addEventListener("click", onBind);
-  unbindButton.addEventListener("click", onUnbind);
-  refreshButton.addEventListener("click", onRefresh);
-  tabList.addEventListener("click", onTabClick);
-  tabList.addEventListener("keydown", onTabKey);
-  chatForm.addEventListener("submit", onSendChat);
-  chatInput.addEventListener("keydown", onChatKey);
-  clearChatButton.addEventListener("click", onClearChat);
-  packageList.addEventListener("change", onPackageToggle);
-  refreshPackagesButton.addEventListener("click", onRefreshPackages);
 
-  await controller.start();
-
-  let unmounted = false;
-  return () => {
-    if (unmounted) return;
-    unmounted = true;
-    controller.dispose();
-    saveButton.removeEventListener("click", onSave);
-    setKeyButton.removeEventListener("click", onSetKey);
-    clearKeyButton.removeEventListener("click", onClearKey);
-    bindButton.removeEventListener("click", onBind);
-    unbindButton.removeEventListener("click", onUnbind);
-    refreshButton.removeEventListener("click", onRefresh);
-    tabList.removeEventListener("click", onTabClick);
-    tabList.removeEventListener("keydown", onTabKey);
-    chatForm.removeEventListener("submit", onSendChat);
-    chatInput.removeEventListener("keydown", onChatKey);
-    clearChatButton.removeEventListener("click", onClearChat);
-    packageList.removeEventListener("change", onPackageToggle);
-    refreshPackagesButton.removeEventListener("click", onRefreshPackages);
-    page.remove();
-    cleanupStyles();
-    cleanupKit();
-  };
+  return { element: chatSection, render, listen };
 }
