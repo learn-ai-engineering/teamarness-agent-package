@@ -271,8 +271,11 @@ describe("Agent Package UI controller", () => {
   it("describes chat failures as sentences and passes unknown codes through", () => {
     expect(describeChatError("agent.not_configured")).toBe("Add the endpoint, model and API key in the Agent's Configuration on its Package page first.");
     expect(describeChatError("agent.endpoint_unreachable")).toBe("The endpoint could not be reached. Try again.");
+    expect(describeChatError("agent.endpoint_timed_out")).toBe(
+      "The model took longer than 5 minutes to answer. Try again, or ask for something smaller.",
+    );
     expect(describeChatError("agent.chat_interrupted")).toBe("The reply was interrupted. Send the message again.");
-    expect(describeChatError("agent.turn_limit_exceeded")).toBe("The reply needed more steps than one turn allows. Ask for something smaller.");
+    expect(describeChatError("agent.turn_limit_exceeded")).toBe("The reply needed more steps or time than one turn allows. Ask for something smaller.");
     expect(describeChatError("agent.something_new")).toBe("agent.something_new");
   });
 

@@ -91,12 +91,14 @@ export function describeChatError(code: string): string {
       return "The reply was interrupted. Send the message again.";
     case "agent.endpoint_unreachable":
       return "The endpoint could not be reached. Try again.";
+    case "agent.endpoint_timed_out":
+      return "The model took longer than 5 minutes to answer. Try again, or ask for something smaller.";
     case "agent.endpoint_rejected":
       return "The endpoint rejected the request. Check the endpoint, model and API key.";
     case "agent.model_error":
       return "The model did not return a usable reply.";
     case "agent.turn_limit_exceeded":
-      return "The reply needed more steps than one turn allows. Ask for something smaller.";
+      return "The reply needed more steps or time than one turn allows. Ask for something smaller.";
     default:
       return code;
   }

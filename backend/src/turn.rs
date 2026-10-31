@@ -66,7 +66,7 @@ impl TurnBounds {
         tool_calls: 16,
         result_chars: 16_384,
         message_bytes: 96 * 1024,
-        deadline: Duration::from_secs(180),
+        deadline: Duration::from_secs(20 * 60),
     };
 }
 
@@ -644,7 +644,7 @@ mod tests {
         assert_eq!(bounds.tool_calls, 16);
         assert_eq!(bounds.result_chars, 16_384);
         assert_eq!(bounds.message_bytes, 96 * 1024);
-        assert_eq!(bounds.deadline, Duration::from_secs(180));
+        assert_eq!(bounds.deadline, Duration::from_secs(20 * 60));
     }
 
     #[tokio::test]

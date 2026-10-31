@@ -2,7 +2,7 @@
 //! OpenAI-compatible endpoint, optionally offering tools the model may call.
 //!
 //! The request is `POST {endpointBaseUrl}/chat/completions` with the key as a bearer token, a
-//! 60 s overall timeout and a 256 KiB response cap. Every failure is mapped to one of three
+//! 5 min overall timeout and a 256 KiB response cap. Every failure is mapped to one of four
 //! Package-owned codes here, so the harness never sees transport detail — and nothing in this
 //! module keeps the key, writes a log line or puts anything but a code in an error.
 //!
@@ -16,15 +16,19 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-/// The endpoint could not be reached or did not answer in time; a later attempt may succeed.
+/// The endpoint could not be reached or answered with a temporary failure; a later attempt may
+/// succeed.
 pub const ENDPOINT_UNREACHABLE: &str = "agent.endpoint_unreachable";
+/// The endpoint did not finish the completion within [`COMPLETION_TIMEOUT`]; a later attempt,
+/// or a smaller request, may succeed.
+pub const ENDPOINT_TIMED_OUT: &str = "agent.endpoint_timed_out";
 /// The endpoint refused the request (bad key, no access); the configuration must change.
 pub const ENDPOINT_REJECTED: &str = "agent.endpoint_rejected";
 /// The endpoint answered but not with a usable completion.
 pub const MODEL_ERROR: &str = "agent.model_error";
 
 /// How long one completion may take from connect to the last byte.
-pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
+pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The largest response body the client reads.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
@@ -167,6 +171,13 @@ pub struct ModelFailure {
 }
 
 impl ModelFailure {
+    const fn timed_out() -> Self {
+        Self {
+            code: ENDPOINT_TIMED_OUT,
+            retryable: true,
+        }
+    }
+
     const fn unreachable() -> Self {
         Self {
             code: ENDPOINT_UNREACHABLE,
@@ -247,8 +258,8 @@ impl ModelClient {
     ///
     /// # Errors
     ///
-    /// Returns the Package-owned failure: transport failures and timeouts are
-    /// `agent.endpoint_unreachable` (retryable); `401`/`403` are `agent.endpoint_rejected`;
+    /// Returns the Package-owned failure: a timeout is `agent.endpoint_timed_out` (retryable);
+    /// other transport failures are `agent.endpoint_unreachable` (retryable); `401`/`403` are `agent.endpoint_rejected`;
     /// `5xx`, `408` and `429` are `agent.endpoint_unreachable`; any other failure status, an
     /// oversized or malformed body, malformed tool calls, or a completion with neither text nor
     /// tool calls is `agent.model_error`.
@@ -359,6 +370,8 @@ fn transport_failure(error: reqwest::Error) -> ModelFailure {
     if error.is_builder() {
         // The configured endpoint cannot be turned into a request; no retry will change that.
         ModelFailure::rejected()
+    } else if error.is_timeout() {
+        ModelFailure::timed_out()
     } else {
         ModelFailure::unreachable()
     }
@@ -553,7 +566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_silent_endpoint_is_unreachable_after_the_timeout() {
+    async fn a_silent_endpoint_times_out() {
         let base = one_shot(None).await;
         let client = ModelClient::with_timeout(Duration::from_millis(200)).unwrap();
         let outcome = client
@@ -568,7 +581,7 @@ mod tests {
         assert_eq!(
             outcome,
             Err(ModelFailure {
-                code: ENDPOINT_UNREACHABLE,
+                code: ENDPOINT_TIMED_OUT,
                 retryable: true
             })
         );
