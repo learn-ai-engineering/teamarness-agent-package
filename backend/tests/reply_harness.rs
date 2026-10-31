@@ -1987,7 +1987,12 @@ async fn chat_refuses_an_oversized_file_put_before_it_reaches_the_host() {
     let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
     assert_eq!(result["error"], "agent.tool_arguments_too_large");
     assert_eq!(result["retryable"], false);
-    assert_eq!(result["argumentBytes"], arguments.len());
+    // Measured as the arguments take space in the messages, beyond the placeholder.
+    let stored = |text: &str| serde_json::to_string(text).unwrap().len();
+    assert_eq!(
+        result["argumentBytes"],
+        stored(&arguments) - stored(r#"{"elided":"agent.tool_arguments_too_large"}"#)
+    );
     assert!(result["remainingBytes"].as_u64().unwrap() < 96 * 1024);
 }
 

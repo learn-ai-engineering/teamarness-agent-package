@@ -26,7 +26,8 @@ pub use crate::model::{Assistant, ChatMessage, ModelFailure, ToolCall, ToolDefin
 
 /// A turn-level bound was exceeded: model calls, tool calls, message size or the deadline.
 pub const TURN_LIMIT_EXCEEDED: &str = "agent.turn_limit_exceeded";
-/// A tool result was over the per-result cap; the model sees this code instead of the result.
+/// A tool result was over the per-result cap, or would carry the turn past its message bound;
+/// the model sees this code instead of the result.
 pub const TOOL_RESULT_TOO_LARGE: &str = "agent.tool_result_too_large";
 /// A tool call's arguments are not JSON or fail the port's request schema; never dispatched.
 pub const TOOL_ARGUMENTS_INVALID: &str = "agent.tool_arguments_invalid";
@@ -41,7 +42,9 @@ pub const TOOL_ARGUMENTS_TOO_LARGE: &str = "agent.tool_arguments_too_large";
 /// inside the message bound.
 const ELIDED_ARGUMENTS: &str = r#"{"elided":"agent.tool_arguments_too_large"}"#;
 /// The share of `message_bytes` held back for each call's result when a batch's arguments are
-/// measured: 1/128, which is 768 bytes under the production bounds.
+/// measured: 1/128, which is 768 bytes under the production bounds. A result that does not fit
+/// the budget left becomes a coded error, which always fits this share, so a stored write is
+/// never followed by a turn that fails on its message bound.
 const RESULT_RESERVE_SHARE: usize = 128;
 
 /// The limits of one turn.
@@ -293,23 +296,24 @@ impl Turn {
         let reserve = calls
             .len()
             .saturating_mul(self.bounds.message_bytes / RESULT_RESERVE_SHARE);
-        let mut remaining = self
-            .bounds
-            .message_bytes
-            .saturating_sub(used.saturating_add(batch).saturating_add(reserve));
+        let needed = used.saturating_add(batch).saturating_add(reserve);
+        // When the batch itself, with its reserves, already crosses the bound, no call runs: the
+        // turn will end, and nothing may be stored before it does.
+        let over = needed > self.bounds.message_bytes;
+        let mut remaining = self.bounds.message_bytes.saturating_sub(needed);
         let elided_size = json_string_bytes(ELIDED_ARGUMENTS);
         calls
             .iter_mut()
             .map(|call| {
                 let extra = json_string_bytes(&call.arguments).saturating_sub(elided_size);
-                if extra <= remaining {
+                if !over && extra <= remaining {
                     remaining -= extra;
                     return None;
                 }
                 let refusal = serde_json::json!({
                     "error": TOOL_ARGUMENTS_TOO_LARGE,
                     "retryable": false,
-                    "argumentBytes": call.arguments.len(),
+                    "argumentBytes": extra,
                     "remainingBytes": remaining,
                 })
                 .to_string();
@@ -329,9 +333,29 @@ impl Turn {
             mut content,
             mut activity,
         } = outcome;
-        if content.chars().count() > self.bounds.result_chars {
-            content =
-                serde_json::json!({"error": TOOL_RESULT_TOO_LARGE, "retryable": false}).to_string();
+        // The calls still to answer in this batch keep their reserved share.
+        let available = self.bounds.message_bytes.saturating_sub(
+            self.pending
+                .len()
+                .saturating_mul(self.bounds.message_bytes / RESULT_RESERVE_SHARE),
+        );
+        let used = message_bytes(&self.messages).saturating_sub(self.baseline);
+        // The result as appended: its message plus the comma that joins it.
+        let cost =
+            message_bytes(&[ChatMessage::tool(call.id.clone(), content.clone())]).saturating_sub(1);
+        let refusal = if content.chars().count() > self.bounds.result_chars {
+            Some(serde_json::json!({"error": TOOL_RESULT_TOO_LARGE, "retryable": false}))
+        } else if used.saturating_add(cost) > available {
+            Some(serde_json::json!({
+                "error": TOOL_RESULT_TOO_LARGE,
+                "retryable": false,
+                "remainingBytes": available.saturating_sub(used),
+            }))
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            content = refusal.to_string();
             if let Some(activity) = &mut activity {
                 activity.ok = false;
                 activity.code = Some(TOOL_RESULT_TOO_LARGE.to_owned());
@@ -894,25 +918,31 @@ mod tests {
 
     #[tokio::test]
     async fn message_bound_exceeded() {
-        // A tool result pushes the turn's own messages over the bound before the next model
-        // call; the call that ran is kept.
-        let model = FakeModel::new(vec![calls(vec![call("c1", "t__a")]), text("never")]);
-        let tools = FakeTools::new(ok_result(&"y".repeat(2000)));
+        // The model's own text beside its calls crosses the bound: no call runs, and the turn
+        // ends before the next model call.
+        let model = FakeModel::new(vec![
+            Scripted::Answer(Ok(Assistant {
+                content: Some("y".repeat(2000)),
+                tool_calls: vec![call("c1", "t__a")],
+            })),
+            text("never"),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
         let bounds = TurnBounds {
             message_bytes: 1024,
             ..TurnBounds::PRODUCTION
         };
         let outcome = run(&model, &tools, bounds).await;
+        assert!(tools.names().is_empty());
         assert_eq!(
             outcome,
             TurnOutcome::Failed {
                 code: TURN_LIMIT_EXCEEDED,
                 retryable: false,
-                activity: vec![activity("t__a", true, None)],
+                activity: vec![activity("t__a", false, Some(TOOL_ARGUMENTS_TOO_LARGE))],
             }
         );
         assert_eq!(model.requests().len(), 1);
-        assert_eq!(tools.names().len(), 1);
 
         // Growth inside the bound is sent.
         let model = FakeModel::new(vec![calls(vec![call("c1", "t__a")]), text("done")]);
@@ -981,8 +1011,11 @@ mod tests {
         let refusal = refusal_of(&model.requests()[1][3]);
         assert_eq!(refusal["error"], TOOL_ARGUMENTS_TOO_LARGE);
         assert_eq!(refusal["retryable"], false);
-        assert_eq!(refusal["argumentBytes"], 5000);
+        // Both sizes are measured as the arguments take space in the turn's messages.
+        let measured = json_string_bytes(&big) - json_string_bytes(ELIDED_ARGUMENTS);
+        assert_eq!(refusal["argumentBytes"], measured);
         assert!(refusal["remainingBytes"].as_u64().unwrap() < 4096);
+        assert!(refusal["argumentBytes"].as_u64() > refusal["remainingBytes"].as_u64());
         assert_eq!(
             refusal.as_object().unwrap().len(),
             4,
@@ -1079,6 +1112,87 @@ mod tests {
         assert_eq!(
             model.requests()[1][2],
             ChatMessage::assistant_tool_calls(None, vec![call_with("c1", "t__a", arguments)])
+        );
+    }
+
+    // Quote-heavy arguments grow when stored as a JSON string; the refusal reports that size,
+    // so it never shows arguments smaller than the budget they crossed.
+    #[tokio::test]
+    async fn refusal_reports_the_escaped_argument_size() {
+        let bounds = TurnBounds {
+            message_bytes: 4096,
+            ..TurnBounds::PRODUCTION
+        };
+        let quoted = serde_json::json!({ "text": "\"".repeat(2000) }).to_string();
+        let model = FakeModel::new(vec![
+            calls(vec![call_with("c1", "t__a", quoted.clone())]),
+            text("done"),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        assert!(matches!(
+            run(&model, &tools, bounds).await,
+            TurnOutcome::Done(_)
+        ));
+        let refusal = refusal_of(&model.requests()[1][3]);
+        let argument_bytes = refusal["argumentBytes"].as_u64().unwrap();
+        assert!(argument_bytes > u64::try_from(quoted.len()).unwrap());
+        assert!(argument_bytes > refusal["remainingBytes"].as_u64().unwrap());
+    }
+
+    // AC7: once a call has run (a stored write, say), no later result in the turn can push it
+    // past its message bound. A result that does not fit becomes a coded error, and the model
+    // still answers.
+    #[tokio::test]
+    async fn a_result_that_would_cross_the_budget_becomes_an_error() {
+        let bounds = TurnBounds {
+            message_bytes: 8192,
+            ..TurnBounds::PRODUCTION
+        };
+        // A write that fits, then a read whose 6000-byte result would cross what is left.
+        let model = FakeModel::new(vec![
+            calls(vec![
+                call_with("c1", "t__write", "w".repeat(3000)),
+                call("c2", "t__read"),
+            ]),
+            text("Saved; the read-back was too large for this turn."),
+        ]);
+        let tools = FakeTools::new(|call: &ToolCall| ToolOutcome {
+            content: if call.name == "t__read" {
+                "r".repeat(6000)
+            } else {
+                "{}".into()
+            },
+            activity: Some(activity(&call.name, true, None)),
+        });
+        let outcome = run(&model, &tools, bounds).await;
+        assert_eq!(tools.names(), ["t__write", "t__read"]);
+        assert_eq!(
+            outcome,
+            TurnOutcome::Done(TurnResult {
+                text: "Saved; the read-back was too large for this turn.".into(),
+                activity: vec![
+                    activity("t__write", true, None),
+                    activity("t__read", false, Some(TOOL_RESULT_TOO_LARGE)),
+                ],
+            })
+        );
+        let second = &model.requests()[1];
+        let refusal = refusal_of(&second[4]);
+        assert_eq!(refusal["error"], TOOL_RESULT_TOO_LARGE);
+        assert_eq!(refusal["retryable"], false);
+        assert!(refusal["remainingBytes"].as_u64().unwrap() < 6000);
+        assert!(added_bytes(second) <= bounds.message_bytes);
+
+        // A result that fits is kept, even when it uses most of what is left.
+        let model = FakeModel::new(vec![calls(vec![call("c1", "t__read")]), text("done")]);
+        let tools = FakeTools::new(ok_result(&"r".repeat(6000)));
+        assert!(matches!(
+            run(&model, &tools, bounds).await,
+            TurnOutcome::Done(_)
+        ));
+        assert_eq!(
+            model.requests()[1][3],
+            ChatMessage::tool("c1".into(), "r".repeat(6000))
         );
     }
 

@@ -47,17 +47,18 @@ Before a chat or reply calls the model, one shared toolset preparation allowance
 
 Each chat or reply turn allows at most 32 model calls, 64 tool calls, 16,384 characters per tool result, 96 KiB of messages added by its own tool calls, and 20 minutes. Each model call may take up to 5 minutes; a call that takes longer fails with retryable `agent.endpoint_timed_out`, distinct from `agent.endpoint_unreachable`. The system message and history a turn starts with are not counted, so a long conversation with nothing enabled is sent as before.
 
-Before a batch of tool calls runs, the turn measures the arguments against the message bytes it has left, holding back 1/128 of the bound (768 bytes) for each call's result. A call whose arguments would cross that budget is not sent. The model gets `agent.tool_arguments_too_large` with `argumentBytes` and `remainingBytes`, and its arguments are replaced in the turn's messages by `{"elided":"agent.tool_arguments_too_large"}`, so the turn continues. Calls in the same batch that fit still run, in order. The budget is derived from the bounds, not from any Package. With the production bounds, this gives two effective ceilings:
+Before a batch of tool calls runs, the turn measures the arguments against the message bytes it has left, holding back 1/128 of the bound (768 bytes) for each call's result. A call whose arguments would cross that budget is not sent. The model gets `agent.tool_arguments_too_large` with `argumentBytes` (the arguments' size as stored in the messages, beyond the placeholder) and `remainingBytes`, and its arguments are replaced in the turn's messages by `{"elided":"agent.tool_arguments_too_large"}`, so the turn continues. Calls in the same batch that fit still run, in order. If the batch itself crosses the bound, for example because of the model's own text beside the calls, no call runs and the turn ends. A result that would cross the budget left, after the share reserved for the batch's later calls, reaches the model as `agent.tool_result_too_large` with `remainingBytes`, so once a call has run, no later result can end the turn on its message bound. The budget is derived from the bounds, not from any Package. With the production bounds, this gives these effective ceilings:
 
-- **Tool arguments:** about 96 KiB per turn, shared by every call and less what earlier results used. For Exhibits, that is about 70 KB of file content per turn, after the guide is read and once the content is base64-encoded. Each file must fit in one partial chunk.
-- **`file.read`:** about 12 KB of file content per call, because 16,384 result characters hold that much base64. A larger read gives `agent.tool_result_too_large`.
+- **Tool arguments:** about 96 KiB per turn, shared by every call and less what earlier results used, measured as JSON text (quotes, backslashes and newlines in file content take extra bytes). For Exhibits, `file.write` text therefore totals a little under 96 KiB per turn after the guide is read, although Exhibits itself accepts up to 98,304 bytes per write.
+- **`file.text`:** its default 8,192-byte page fits the 16,384-character result cap; larger `maxBytes` pages may give `agent.tool_result_too_large`.
+- **`file.read`** (binary): about 12 KB of content per call, because 16,384 result characters hold that much base64.
 
 These stable codes can appear:
 
 | Code | Meaning |
 |---|---|
 | `agent.turn_limit_exceeded` | A turn bound was exceeded. The turn ends; the chat or the status shows the code, and a reply posts nothing. |
-| `agent.tool_result_too_large` | One tool result was over the cap. The model sees this code instead of the result. |
+| `agent.tool_result_too_large` | One tool result was over the cap, or would cross the turn's remaining message budget (then with `remainingBytes`). The model sees this code instead of the result, and the turn continues. |
 | `agent.tool_arguments_too_large` | The call's arguments would cross the turn's remaining message budget. Not sent, not retryable; the model sees `argumentBytes` and `remainingBytes`, and the turn continues. |
 | `agent.tool_arguments_invalid` | The arguments are not JSON or fail the port's request schema. Not sent. |
 | `agent.tool_outcome_unknown` | A command was sent, but its outcome is unknown. Never re-sent. |
