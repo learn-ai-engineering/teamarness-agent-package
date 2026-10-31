@@ -27,7 +27,7 @@ pub const MAX_ENTRIES: usize = 64;
 pub const MAX_TRANSCRIPT_CHARS: usize = 65_536;
 /// The contract bound on one entry's activity. A turn's tool-call budget is never larger, so a
 /// turn's activity always fits whole.
-pub const MAX_ACTIVITY: usize = 16;
+pub const MAX_ACTIVITY: usize = 64;
 const _: () = assert!(crate::turn::TurnBounds::PRODUCTION.tool_calls <= MAX_ACTIVITY);
 
 /// A turn is already in flight; sending again after it settles may succeed.

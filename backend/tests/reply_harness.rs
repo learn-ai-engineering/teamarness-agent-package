@@ -2390,8 +2390,8 @@ async fn turn_limit_ends_reply_with_status_code_and_no_post() {
     let Fixture { harness, ports, .. } = &mut fixture;
     wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
 
-    // Seventeen calls in one answer cross the per-turn tool-call budget of sixteen.
-    let calls = (0..17)
+    // One call more than the per-turn tool-call budget, in one answer.
+    let calls = (0..=teamarness_agent_package::turn::TurnBounds::PRODUCTION.tool_calls)
         .map(|index| call(&format!("call-{index}"), "exhibits__exhibit_list", "{}"))
         .collect();
     stub.push(Behaviour::ToolCalls(calls));

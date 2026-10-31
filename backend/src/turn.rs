@@ -62,8 +62,8 @@ pub struct TurnBounds {
 
 impl TurnBounds {
     pub const PRODUCTION: Self = Self {
-        model_calls: 8,
-        tool_calls: 16,
+        model_calls: 32,
+        tool_calls: 64,
         result_chars: 16_384,
         message_bytes: 96 * 1024,
         deadline: Duration::from_secs(20 * 60),
@@ -640,8 +640,8 @@ mod tests {
     #[test]
     fn production_bounds_are_the_planned_ones() {
         let bounds = TurnBounds::PRODUCTION;
-        assert_eq!(bounds.model_calls, 8);
-        assert_eq!(bounds.tool_calls, 16);
+        assert_eq!(bounds.model_calls, 32);
+        assert_eq!(bounds.tool_calls, 64);
         assert_eq!(bounds.result_chars, 16_384);
         assert_eq!(bounds.message_bytes, 96 * 1024);
         assert_eq!(bounds.deadline, Duration::from_secs(20 * 60));
@@ -813,7 +813,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_budget_exceeded() {
-        // One call per round: the 17th call ends the turn before it runs.
+        // One call per round: the call after the production cap ends the turn before it runs.
         let model = FakeModel::repeating(Assistant {
             content: None,
             tool_calls: vec![call("c", "t__a")],
@@ -829,10 +829,10 @@ mod tests {
             TurnOutcome::Failed {
                 code: TURN_LIMIT_EXCEEDED,
                 retryable: false,
-                activity: vec![activity("t__a", true, None); 16],
+                activity: vec![activity("t__a", true, None); TurnBounds::PRODUCTION.tool_calls],
             }
         );
-        assert_eq!(tools.names().len(), 16);
+        assert_eq!(tools.names().len(), TurnBounds::PRODUCTION.tool_calls);
 
         // A batch that would cross the budget runs none of its calls.
         let model = FakeModel::new(vec![calls(vec![
