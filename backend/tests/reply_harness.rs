@@ -32,6 +32,9 @@ const SIDE: &str = "10000000000000000000000000000001";
 const SECRET: &str = "sk-or-v1-SENTINEL-NEVER-SHOWN-0123456789";
 const DEADLINE: Duration = Duration::from_secs(15);
 const EXHIBITS: &str = "dev.teamarness.exhibits";
+const DOCUMENTS: &str = "dev.teamarness.documents";
+const PLAN_DOC: &str = "d0c0000000000000000000000000000000000000000000000000000000000001";
+const COMMENTS_KEY: &str = "dev.teamarness.documents#comments";
 
 fn empty() -> Value {
     json!({})
@@ -268,6 +271,35 @@ struct ConversationsState {
     exhibits_calls: Vec<(String, String, Value)>,
     /// One-shot Provider errors, by Exhibits port.
     exhibits_errors: HashMap<String, VecDeque<BackendError>>,
+    /// The scripted Documents 1.3 Comment feed.
+    documents: DocumentsState,
+}
+
+/// One Comment of the scripted Documents Provider.
+#[derive(Clone, Debug)]
+struct FakeComment {
+    id: String,
+    document_id: String,
+    parent_id: Option<String>,
+    author: String,
+    markdown: String,
+    quote: Option<String>,
+    resolved: bool,
+}
+
+#[derive(Default)]
+struct DocumentsState {
+    epoch: u64,
+    next_id: u64,
+    head: u64,
+    comments: Vec<FakeComment>,
+    /// `(revision, commentId, kind)` in revision order.
+    changes: Vec<(u64, String, &'static str)>,
+    /// Comments whose text is not open yet.
+    pending: Vec<String>,
+    /// Every `comment.add` request the Agent issued, accepted or not.
+    adds: Vec<Value>,
+    add_error: Option<BackendError>,
 }
 
 #[derive(Clone, Default)]
@@ -288,8 +320,173 @@ impl FakeConversations {
             state.channels.push((SIDE.into(), "side".into()));
             state.post_mode = Some(PostMode::Accept);
             state.epoch = 1;
+            state.documents.epoch = 1;
         }
         fake
+    }
+
+    /// Offers Documents 1.3 to the Agent, as the Host would after admitting it.
+    fn with_documents(self) -> Self {
+        // A verbatim copy of the Host's `packages/documents-package/ports.json` at 1.3.
+        let document: Value =
+            serde_json::from_str(include_str!("fixtures/documents-1.3.ports.json")).unwrap();
+        self.catalog
+            .documents
+            .lock()
+            .unwrap()
+            .insert(DOCUMENTS.into(), document);
+        self
+    }
+
+    /// Adds a Comment on [`PLAN_DOC`] and returns its ID.
+    fn comment(
+        &self,
+        author: &str,
+        markdown: &str,
+        quote: Option<&str>,
+        parent: Option<&str>,
+    ) -> String {
+        let mut state = self.state.lock().unwrap();
+        let documents = &mut state.documents;
+        documents.next_id += 1;
+        let id = format!("{:064x}", 0xc000 + documents.next_id);
+        documents.comments.push(FakeComment {
+            id: id.clone(),
+            document_id: PLAN_DOC.into(),
+            parent_id: parent.map(str::to_owned),
+            author: author.into(),
+            markdown: markdown.into(),
+            quote: quote.map(str::to_owned),
+            resolved: false,
+        });
+        documents.head += 1;
+        let revision = documents.head;
+        documents.changes.push((revision, id.clone(), "add"));
+        id
+    }
+
+    /// Records a resolve or reopen of `id`.
+    fn comment_state(&self, id: &str, kind: &'static str) {
+        let mut state = self.state.lock().unwrap();
+        let documents = &mut state.documents;
+        let comment = documents
+            .comments
+            .iter_mut()
+            .find(|comment| comment.id == id)
+            .unwrap();
+        comment.resolved = kind == "resolve";
+        documents.head += 1;
+        let revision = documents.head;
+        documents.changes.push((revision, id.into(), kind));
+    }
+
+    fn comment_adds(&self) -> Vec<Value> {
+        self.state.lock().unwrap().documents.adds.clone()
+    }
+
+    fn comment_json(comment: &FakeComment) -> Value {
+        let mut value = json!({"id":comment.id,"documentId":comment.document_id,
+            "author":comment.author,"markdown":comment.markdown,"resolved":comment.resolved});
+        if let Some(parent) = &comment.parent_id {
+            value["parentId"] = json!(parent);
+        }
+        if let Some(quote) = &comment.quote {
+            value["quote"] = json!(quote);
+        }
+        value
+    }
+
+    /// The scripted Documents Provider: the 1.3 Comment Ports.
+    fn documents(&self, port: &str, request: &Value) -> Result<Value, BackendError> {
+        let mut state = self.state.lock().unwrap();
+        let documents = &mut state.documents;
+        let epoch = format!("{:032x}", documents.epoch);
+        match port {
+            "runtime.guide" => Ok(json!({"markdown": "Read Documents with document.markdown."})),
+            "comment.changes" => {
+                let head = documents.head.to_string();
+                if request.get("epoch").is_none() {
+                    assert!(request.get("after").is_none());
+                    return Ok(
+                        json!({"epoch":epoch,"events":[],"continuation":head,"highWater":head}),
+                    );
+                }
+                let after: u64 = request["after"].as_str().unwrap().parse().unwrap();
+                let limit = request["limit"].as_u64().unwrap_or(32) as usize;
+                assert!((1..=32).contains(&limit));
+                if request["epoch"] != epoch || after > documents.head {
+                    return Ok(
+                        json!({"epoch":epoch,"events":[],"continuation":head,"highWater":head,"resyncRequired":true}),
+                    );
+                }
+                let events = documents
+                    .changes
+                    .iter()
+                    .filter(|(revision, ..)| *revision > after)
+                    .take(limit)
+                    .map(|(revision, id, kind)| {
+                        let pending = documents.pending.contains(id);
+                        let mut event = json!({"revision":revision.to_string(),"id":id,"kind":kind,
+                            "status": if pending { "pending" } else { "ready" }});
+                        if !pending {
+                            let comment = documents.comments.iter().find(|c| &c.id == id).unwrap();
+                            event["comment"] = Self::comment_json(comment);
+                        }
+                        event
+                    })
+                    .collect::<Vec<_>>();
+                let continuation = events.last().map_or(head.clone(), |event| {
+                    event["revision"].as_str().unwrap().to_owned()
+                });
+                Ok(
+                    json!({"epoch":epoch,"events":events,"continuation":continuation,"highWater":head}),
+                )
+            }
+            "comment.thread" => {
+                let id = request["commentId"].as_str().unwrap();
+                let find = |id: &str| documents.comments.iter().find(|c| c.id == id).cloned();
+                let mut root = find(id).ok_or_else(|| {
+                    BackendError::new("documents.unknown_comment", false, empty())
+                })?;
+                while let Some(parent) = root.parent_id.clone() {
+                    root = find(&parent).unwrap();
+                }
+                let mut members = vec![root.id.clone()];
+                let comments = documents
+                    .comments
+                    .iter()
+                    .filter(|comment| {
+                        let member = comment.id == root.id
+                            || comment
+                                .parent_id
+                                .as_ref()
+                                .is_some_and(|p| members.contains(p));
+                        if member && comment.id != root.id {
+                            members.push(comment.id.clone());
+                        }
+                        member && !documents.pending.contains(&comment.id)
+                    })
+                    .map(Self::comment_json)
+                    .collect::<Vec<_>>();
+                Ok(
+                    json!({"documentId":root.document_id,"title":"Launch plan","comments":comments,"truncated":false}),
+                )
+            }
+            "comment.add" => {
+                documents.adds.push(request.clone());
+                if let Some(error) = documents.add_error.take() {
+                    return Err(error);
+                }
+                let markdown = request["markdown"].as_str().unwrap();
+                assert!(!markdown.is_empty() && markdown.len() <= 32_768);
+                let parent = request["parentId"].as_str().map(str::to_owned);
+                drop(state);
+                let id = self.comment(AGENT_KEY, markdown, None, parent.as_deref());
+                Ok(json!({"commentId": id}))
+            }
+            "document.markdown" => Ok(json!({"markdown":"# Launch plan\n","version":"v1"})),
+            _ => Err(BackendError::new("documents.unknown_port", false, empty())),
+        }
     }
 
     /// Appends a Message and returns its position.
@@ -411,6 +608,9 @@ impl FakeConversations {
             }
             if method == "invoke" && payload["contract"] == support::UNKNOWN {
                 return Ok(json!({"sample":"independent-fixture-answer"}));
+            }
+            if method == "invoke" && payload["contract"] == DOCUMENTS {
+                return fake.documents(payload["port"].as_str().unwrap_or_default(), &payload["request"]);
             }
             if method == "invoke" && payload["contract"] == EXHIBITS {
                 return fake.exhibits(
@@ -3366,5 +3566,421 @@ async fn schema_preparation_preserves_bounded_dag_exact_parameters_and_original_
         invokes[0].payload,
         json!({"access":"agent","contract":support::UNKNOWN,"major":3,"port":"sample.read","kind":"query","request":{}})
     );
+    fixture.harness.shutdown().await.unwrap();
+}
+
+// ------------------------------------------------------------------
+// Documents Comment mentions (Documents 1.3)
+// ------------------------------------------------------------------
+
+/// Configures and binds the Agent and enables only Documents; returns once the Comment feed is
+/// subscribed and baselined.
+async fn make_documents_ready(fixture: &mut Fixture, stub: &StubEndpoint, data: &Path) {
+    fixture.harness.activate().await.unwrap();
+    configure(&mut fixture.harness, stub).await;
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId": AGENT_ID}))
+        .await
+        .unwrap();
+    fixture
+        .harness
+        .request(
+            "agent.packages.set",
+            json!({"contract":DOCUMENTS,"enabled":true,"major":1}),
+        )
+        .await
+        .unwrap();
+    wait_status(&mut fixture.harness, "ready", None).await;
+    opened(&fixture.ports).await;
+    wait_until("the Comment feed baselines", || {
+        comments_acknowledged(data).is_some()
+    })
+    .await;
+}
+
+/// Waits, within the deadline, for the Package to open its event stream.
+async fn opened(ports: &ScriptedCapability) {
+    tokio::time::timeout(DEADLINE, ports.stream().opened())
+        .await
+        .expect("timed out waiting for the event stream to open");
+}
+
+fn comments_acknowledged(data: &Path) -> Option<(String, u64)> {
+    let value: Value =
+        serde_json::from_slice(&std::fs::read(data.join("progress.json")).ok()?).ok()?;
+    let cursor = &value["channels"][COMMENTS_KEY];
+    Some((
+        cursor["epoch"].as_str()?.to_owned(),
+        cursor["after"].as_u64()?,
+    ))
+}
+
+fn comment_change_calls(ports: &ScriptedCapability) -> usize {
+    ports
+        .recorded_calls()
+        .iter()
+        .filter(|call| call.payload["port"] == "comment.changes")
+        .count()
+}
+
+/// Wakes the Comment feed.
+async fn wake(ports: &ScriptedCapability) {
+    let sent = tokio::time::timeout(DEADLINE, ports.stream().send(empty()))
+        .await
+        .expect("timed out sending to the event stream");
+    assert!(sent, "the event stream is open");
+}
+
+/// Waits for one Comment pass after a wake, then a bounded window for any reply to start.
+async fn settle_comments(ports: &ScriptedCapability) {
+    let before = comment_change_calls(ports);
+    wake(ports).await;
+    wait_until("a Comment pass", || comment_change_calls(ports) > before).await;
+    // negative-wait: a reply would start after the scan; a bounded window is the only way to
+    // show that none did.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+/// The single user message of a Comment reply's model request.
+fn comment_prompt(request: &StubRequest) -> String {
+    let messages = request.body["messages"].as_array().unwrap();
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|message| message["role"] == "user")
+        .collect();
+    assert_eq!(users.len(), 1, "{messages:?}");
+    users[0]["content"].as_str().unwrap().to_owned()
+}
+
+fn last_comment_id(documents: &FakeConversations) -> String {
+    let state = documents.state.lock().unwrap();
+    state.documents.comments.last().unwrap().id.clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_comment_mention_runs_one_turn_and_replies_once_under_the_trigger() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+
+    let quote = "The launch is planned for a date we will decide later.";
+    let trigger = documents.comment(BOB_KEY, "@Scout make this more concise", Some(quote), None);
+    wake(ports).await;
+    wait_until("the Comment reply", || documents.comment_adds().len() == 1).await;
+    wait_status(harness, "ready", None).await;
+    assert_eq!(
+        documents.comment_adds()[0],
+        json!({"documentId":PLAN_DOC,"parentId":trigger,"markdown":"Hello from Scout"})
+    );
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1);
+    let prompt = comment_prompt(&requests[0]);
+    for expected in [
+        format!("You were mentioned in a Comment on Document \"Launch plan\" (id {PLAN_DOC})"),
+        format!("> {quote}"),
+        "Bob (person)".to_owned(),
+        "@Scout make this more concise".to_owned(),
+        "document.markdown".to_owned(),
+        "document.revise".to_owned(),
+    ] {
+        assert!(
+            prompt.contains(&expected),
+            "{expected:?} missing from {prompt}"
+        );
+    }
+    // The harness never reads the Document; the model decides whether to.
+    assert!(
+        ports
+            .recorded_calls()
+            .iter()
+            .all(|call| call.payload["port"] != "document.markdown")
+    );
+    let tools = offered(&requests[0].body).unwrap();
+    assert!(
+        tools.contains(&"documents__document_revise".to_owned()),
+        "{tools:?}"
+    );
+    assert!(
+        tools.iter().all(|name| name != "documents__comment_add"),
+        "{tools:?}"
+    );
+
+    // The Agent's own reply mentions its name but is never a trigger.
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 1);
+    assert_eq!(documents.comment_adds().len(), 1);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unquoted_mention_has_no_quote_and_a_reply_mention_sees_the_whole_thread() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+    let Fixture { ports, .. } = &mut fixture;
+
+    let root = documents.comment(BOB_KEY, "@Scout add a summary at the top", None, None);
+    wake(ports).await;
+    wait_until("the first reply", || documents.comment_adds().len() == 1).await;
+    let first = comment_prompt(&stub.requests()[0]);
+    assert!(!first.contains("Quoted"), "{first}");
+    assert!(!first.contains("\n> "), "{first}");
+
+    let answer = last_comment_id(&documents);
+    stub.push(Behaviour::Reply("Shortened.".into()));
+    let follow_up = documents.comment(STEWARD_KEY, "@Scout shorter please", None, Some(&answer));
+    wake(ports).await;
+    wait_until("the second reply", || documents.comment_adds().len() == 2).await;
+    assert_eq!(
+        documents.comment_adds()[1],
+        json!({"documentId":PLAN_DOC,"parentId":follow_up,"markdown":"Shortened."})
+    );
+    let second = comment_prompt(&stub.requests()[1]);
+    let root_at = second.find("Bob (person)").expect(&second);
+    let answer_at = second.find("Scout (agent)").expect(&second);
+    let follow_at = second.find("Alice (person)").expect(&second);
+    assert!(root_at < answer_at && answer_at < follow_at, "{second}");
+    assert!(second.contains("@Scout add a summary at the top"));
+    assert!(second.contains("Hello from Scout"));
+    assert!(second.contains("@Scout shorter please"));
+    assert_eq!(second.matches("mentioned you").count(), 1, "{second}");
+    assert!(
+        second[follow_at..].contains("mentioned you"),
+        "the trigger is marked: {second}"
+    );
+    assert!(!second.contains("Quoted"), "{second}");
+    let _ = root;
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_persons_new_mention_triggers_a_comment_reply() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+    let Fixture { ports, .. } = &mut fixture;
+
+    documents.comment(BOB_KEY, "Looks fine to me.", None, None);
+    documents.comment(AGENT_KEY, "@Scout note to self", None, None);
+    documents.comment(OTHER_KEY, "@Scout from another Agent", None, None);
+    documents.comment(STRANGER_KEY, "@Scout from someone unknown", None, None);
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 0);
+    assert!(documents.comment_adds().is_empty());
+    let head = documents.state.lock().unwrap().documents.head;
+    assert_eq!(comments_acknowledged(data.path()).unwrap().1, head);
+
+    let trigger = documents.comment(BOB_KEY, "@Scout tidy this", None, None);
+    wake(ports).await;
+    wait_until("one reply", || documents.comment_adds().len() == 1).await;
+    // Resolving and reopening the mentioning Comment are not new mentions.
+    documents.comment_state(&trigger, "resolve");
+    documents.comment_state(&trigger, "reopen");
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 1);
+    assert_eq!(documents.comment_adds().len(), 1);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pending_comment_is_retried_from_the_same_revision() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+    let Fixture { ports, .. } = &mut fixture;
+
+    let (_, before) = comments_acknowledged(data.path()).unwrap();
+    let trigger = documents.comment(BOB_KEY, "@Scout once it opens", None, None);
+    documents
+        .state
+        .lock()
+        .unwrap()
+        .documents
+        .pending
+        .push(trigger.clone());
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 0);
+    assert_eq!(comments_acknowledged(data.path()).unwrap().1, before);
+    documents.state.lock().unwrap().documents.pending.clear();
+    // The retry needs no new event.
+    wait_until("the reply after the text opens", || {
+        documents.comment_adds().len() == 1
+    })
+    .await;
+    assert_eq!(documents.comment_adds()[0]["parentId"], trigger);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_persisted_comment_trigger_is_never_replayed_after_a_restart() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+
+    let release = Arc::new(Notify::new());
+    stub.push(Behaviour::Hold(release.clone(), "never posted".into()));
+    documents.comment(BOB_KEY, "@Scout held", None, None);
+    wake(&fixture.ports).await;
+    wait_until("the held model request", || stub.request_count() == 1).await;
+    // The trigger is acknowledged before the model call.
+    let head = documents.state.lock().unwrap().documents.head;
+    assert_eq!(comments_acknowledged(data.path()).unwrap().1, head);
+    fixture.harness.shutdown().await.unwrap();
+    release.notify_one();
+
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    fixture.harness.activate().await.unwrap();
+    wait_status(&mut fixture.harness, "ready", None).await;
+    opened(&fixture.ports).await;
+    wait_until("the restarted pass", || {
+        comment_change_calls(&fixture.ports) >= 1
+    })
+    .await;
+    settle_comments(&fixture.ports).await;
+    assert_eq!(stub.request_count(), 1);
+    assert!(documents.comment_adds().is_empty());
+
+    documents.comment(BOB_KEY, "@Scout again", None, None);
+    wake(&fixture.ports).await;
+    wait_until("a reply after restart", || {
+        documents.comment_adds().len() == 1
+    })
+    .await;
+    assert_eq!(stub.request_count(), 2);
+    assert_no_secret(&fixture.ports, data.path());
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_comment_epoch_change_rebaselines_without_replay() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+
+    documents.state.lock().unwrap().documents.epoch = 2;
+    documents.comment(BOB_KEY, "@Scout from before the new epoch", None, None);
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 0);
+    let head = documents.state.lock().unwrap().documents.head;
+    assert_eq!(
+        comments_acknowledged(data.path()).unwrap(),
+        (format!("{:032x}", 2), head)
+    );
+    wait_status(harness, "ready", None).await;
+
+    let trigger = documents.comment(BOB_KEY, "@Scout in the new epoch", None, None);
+    wake(ports).await;
+    wait_until("one reply", || documents.comment_adds().len() == 1).await;
+    assert_eq!(documents.comment_adds()[0]["parentId"], trigger);
+    assert_eq!(stub.request_count(), 1);
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_comment_turn_or_add_posts_nothing_more_and_shows_its_code() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    make_documents_ready(&mut fixture, &stub, data.path()).await;
+    let Fixture { harness, ports, .. } = &mut fixture;
+
+    stub.push(Behaviour::Status(
+        401,
+        r#"{"error":{"message":"bad key"}}"#.into(),
+    ));
+    documents.comment(BOB_KEY, "@Scout fail please", None, None);
+    wake(ports).await;
+    wait_status(harness, "error", Some("agent.endpoint_rejected")).await;
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 1);
+    assert!(documents.comment_adds().is_empty());
+
+    documents.state.lock().unwrap().documents.add_error =
+        Some(BackendError::new("host_unavailable", true, empty()).with_outcome_uncertain(true));
+    documents.comment(BOB_KEY, "@Scout the add fails", None, None);
+    wake(ports).await;
+    wait_status(harness, "error", Some("agent.post_failed")).await;
+    settle_comments(ports).await;
+    assert_eq!(stub.request_count(), 2);
+    assert_eq!(documents.comment_adds().len(), 1, "never retried");
+    fixture.harness.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn comment_mentions_wait_for_documents_enablement() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let documents = FakeConversations::new().with_documents();
+    let mut fixture = start(data.path(), &roster, &documents).await;
+    fixture.harness.activate().await.unwrap();
+    configure(&mut fixture.harness, &stub).await;
+    fixture
+        .harness
+        .request("agent.binding.set", json!({"principalId": AGENT_ID}))
+        .await
+        .unwrap();
+    wait_status(&mut fixture.harness, "ready", None).await;
+    documents.comment(BOB_KEY, "@Scout before enablement", None, None);
+    // negative-wait: nothing to wait for when nothing may be subscribed or read.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(fixture.ports.recorded_opens().is_empty());
+    assert_eq!(comment_change_calls(&fixture.ports), 0);
+
+    fixture
+        .harness
+        .request(
+            "agent.packages.set",
+            json!({"contract":DOCUMENTS,"enabled":true,"major":1}),
+        )
+        .await
+        .unwrap();
+    opened(&fixture.ports).await;
+    assert_eq!(
+        fixture.ports.recorded_opens()[0]["port"],
+        "comments.changed",
+        "{:?}",
+        fixture.ports.recorded_opens()
+    );
+    wait_until("the baseline", || {
+        comments_acknowledged(data.path()).is_some()
+    })
+    .await;
+    // Comments from before the baseline are never answered.
+    settle_comments(&fixture.ports).await;
+    assert_eq!(stub.request_count(), 0);
+
+    fixture
+        .harness
+        .request(
+            "agent.packages.set",
+            json!({"contract":DOCUMENTS,"enabled":false}),
+        )
+        .await
+        .unwrap();
+    assert!(!fixture.ports.stream().is_open());
     fixture.harness.shutdown().await.unwrap();
 }

@@ -11,6 +11,7 @@ pub mod access;
 pub mod catalog;
 pub mod chat;
 pub mod command_ownership;
+pub mod comments;
 pub mod harness;
 pub mod mention;
 pub mod model;

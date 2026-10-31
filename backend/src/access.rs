@@ -16,10 +16,13 @@ use crate::tools::UsableContract;
 
 /// Ports never offered to the model, as `(contract, port)`.
 ///
-/// The harness posts replies itself. Exhibits file transfer is offered: the turn refuses a call
+/// The harness posts replies and adds reply Comments itself. Exhibits file transfer is offered: the turn refuses a call
 /// whose arguments would cross its message bound before it runs, and an oversized result reaches
 /// the model as a coded error (`crate::turn`).
-pub const WITHHELD: [(&str, &str); 1] = [("dev.teamarness.conversations", "message.post")];
+pub const WITHHELD: [(&str, &str); 2] = [
+    ("dev.teamarness.conversations", "message.post"),
+    ("dev.teamarness.documents", "comment.add"),
+];
 
 /// The contracts the Host reports available, by identity and major.
 #[cfg(test)]
@@ -367,6 +370,14 @@ mod tests {
             usable[0].description,
             "dev.teamarness.conversations contract"
         );
+    }
+
+    #[test]
+    fn comment_add_is_withheld() {
+        // The harness adds the reply Comment itself; the model may read threads but never add.
+        assert!(is_withheld("dev.teamarness.documents", "comment.add"));
+        assert!(!is_withheld("dev.teamarness.documents", "comment.thread"));
+        assert!(!is_withheld("dev.teamarness.documents", "document.revise"));
     }
 
     #[test]

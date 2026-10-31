@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "$defs": {
+    "recordId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "version": { "type": "string", "pattern": "^[A-Za-z0-9_-]{16,1024}$" },
+    "cursor": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "markdown": { "type": "string", "maxLength": 262144 },
+    "collection": { "type": "object", "additionalProperties": false, "required": ["id", "name", "archived"], "properties": {
+      "id": { "$ref": "#/$defs/recordId" },
+      "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+      "archived": { "type": "boolean" }
+    } },
+    "document": { "type": "object", "additionalProperties": false, "required": ["id", "collectionId", "title", "archived", "body"], "properties": {
+      "id": { "$ref": "#/$defs/recordId" },
+      "collectionId": { "$ref": "#/$defs/recordId" },
+      "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+      "archived": { "type": "boolean" },
+      "body": { "type": "string", "enum": ["available", "pending", "unavailable"] },
+      "version": { "$ref": "#/$defs/version" }
+    } },
+    "epoch": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "revision": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "maxLength": 20 },
+    "commentMarkdown": { "type": "string", "minLength": 1, "maxLength": 32768 },
+    "quote": { "type": "string", "minLength": 1, "maxLength": 2048 },
+    "comment": { "type": "object", "additionalProperties": false, "required": ["id", "documentId", "author", "markdown", "resolved"], "properties": {
+      "id": { "$ref": "#/$defs/recordId" },
+      "documentId": { "$ref": "#/$defs/recordId" },
+      "parentId": { "$ref": "#/$defs/recordId" },
+      "author": { "type": "string", "minLength": 1, "maxLength": 256 },
+      "markdown": { "$ref": "#/$defs/commentMarkdown" },
+      "quote": { "$ref": "#/$defs/quote" },
+      "resolved": { "type": "boolean" },
+      "createdAt": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$", "maxLength": 16 }
+    } },
+    "commentChange": { "type": "object", "additionalProperties": false, "required": ["revision", "id", "kind", "status"], "properties": {
+      "revision": { "$ref": "#/$defs/revision" },
+      "id": { "$ref": "#/$defs/recordId" },
+      "kind": { "type": "string", "enum": ["add", "resolve", "reopen"] },
+      "status": { "type": "string", "enum": ["ready", "pending"] },
+      "comment": { "$ref": "#/$defs/comment" }
+    } },
+    "page": { "type": "object", "additionalProperties": false, "required": ["collections", "documents"], "properties": {
+      "collections": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/collection" } },
+      "documents": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/document" } },
+      "next": { "$ref": "#/$defs/cursor" }
+    } }
+  },
+  "contracts": [{
+    "identity": "dev.teamarness.documents", "major": 1, "minor": 3,
+    "description": "Documents as Canonical Markdown with opaque version tokens: list, read, create (1.2) and base-versioned revise by the local Installation Person or a locally bound Workspace Agent (1.1), live change invalidation, runtime guidance (1.2), and Comments (1.3): a Workspace-wide Comment change feed, threads, and adding a Comment as the Host-derived actor.",
+    "ports": [
+      { "name": "runtime.guide", "kind": "query", "description": "Read bounded guidance for listing and reading Documents, creating then revising, base versions and merges, Host-derived authorship, errors and uncertain outcomes (1.2).",
+        "request": { "type": "object", "additionalProperties": false },
+        "response": { "type": "object", "additionalProperties": false, "required": ["markdown"], "properties": {
+          "markdown": { "type": "string", "maxLength": 32768 }
+        } }
+      },
+      { "name": "document.list", "kind": "query", "description": "List Collections and Documents in Order Key order, at most 64 per page; pass next as after for the following page. With collectionId, only that Collection's Documents. version is present only for an available body. Errors: documents.unknown_collection, documents.invalid_cursor.",
+        "request": { "type": "object", "additionalProperties": false, "properties": {
+          "collectionId": { "$ref": "#/$defs/recordId" },
+          "after": { "$ref": "#/$defs/cursor" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 64 }
+        } },
+        "response": { "$ref": "#/$defs/page" }
+      },
+      { "name": "document.markdown", "kind": "query", "description": "Read a Document body as Canonical Markdown with the version token it was exported at. Errors: documents.pending (records not yet opened; retry later), documents.unavailable (conflicted, failed import, or a version the token cannot carry), documents.too_large (the response exceeds the Host Port value bound, MAX_UI_PAYLOAD_BYTES), documents.unknown_document.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["documentId"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["markdown", "version"], "properties": {
+          "markdown": { "$ref": "#/$defs/markdown" }, "version": { "$ref": "#/$defs/version" }
+        } }
+      },
+      { "name": "document.create", "kind": "command", "description": "Create an empty Document in a Collection as one record signed by the local Person or the caller's bound Agent (1.2). Returns documentId and version; pass version as baseVersion to document.revise to add content. Errors: documents.unknown_collection, documents.collection_archived, documents.invalid_title, documents.actor_unauthorized, documents.principal_not_bound. Every accepted create makes a new Document: an uncertain command must not be retried automatically; list and reconcile first.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["collectionId", "title"], "properties": {
+          "collectionId": { "$ref": "#/$defs/recordId" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 256 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["documentId", "version"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "version": { "$ref": "#/$defs/version" }
+        } }
+      },
+      { "name": "document.revise", "kind": "command", "description": "Merge Markdown revised from the baseVersion export as one record signed by the local Person or (1.1) the caller's bound Agent; changed false appends nothing. Errors: documents.base_unavailable, documents.revision_too_large, documents.schema_violation, documents.unknown_document, documents.pending, documents.unavailable, documents.actor_unauthorized, documents.principal_not_bound. version may include concurrent edits; read again before revising. An uncertain command must not be retried automatically.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "baseVersion", "markdown"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "baseVersion": { "$ref": "#/$defs/version" },
+          "markdown": { "$ref": "#/$defs/markdown" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["changed", "normalised"], "properties": {
+          "version": { "$ref": "#/$defs/version" },
+          "changed": { "type": "boolean" },
+          "normalised": { "type": "boolean" }
+        } }
+      },
+      { "name": "documents.changed", "kind": "event", "description": "Live-only, at-most-once invalidation that may coalesce; no initial event or replay. documentIds names Documents whose body changed; without it, re-list. Re-query on receipt or reconnection.",
+        "event": { "type": "object", "additionalProperties": false, "properties": {
+          "documentIds": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/recordId" } }
+        } }
+      },
+      { "name": "comments.changed", "kind": "event", "description": "Live-only payload-free wake when a Comment is added, resolved or reopened anywhere in the Workspace (1.3). May coalesce; no initial event or replay. Read comment.changes on receipt and after reconnecting.",
+        "event": { "type": "object", "additionalProperties": false }
+      },
+      { "name": "comment.changes", "kind": "query", "description": "Read at most 32 Workspace-wide Comment changes (add, resolve, reopen) after a revision, in order (1.3). Pass epoch and after together; with neither, the response is the head with no events, a baseline. Retry a pending change from the same revision. Continue from continuation until highWater. resyncRequired: the epoch changed or after is past the head; save the returned epoch and continuation without acting on earlier Comments. Errors: documents.invalid_cursor.",
+        "request": { "type": "object", "additionalProperties": false, "properties": {
+          "epoch": { "$ref": "#/$defs/epoch" },
+          "after": { "$ref": "#/$defs/revision" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 32 }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["epoch", "events", "continuation", "highWater"], "properties": {
+          "epoch": { "$ref": "#/$defs/epoch" },
+          "events": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/commentChange" } },
+          "continuation": { "$ref": "#/$defs/revision" },
+          "highWater": { "$ref": "#/$defs/revision" },
+          "resyncRequired": { "type": "boolean" }
+        } }
+      },
+      { "name": "comment.thread", "kind": "query", "description": "Read the whole thread holding a Comment, with its Document's ID and title (1.3): the root first, then every nested reply in creation order. A thread that would exceed the Port value bound (MAX_UI_PAYLOAD_BYTES) drops its oldest replies after the root and sets truncated. A Comment whose text is not open yet is left out. Errors: documents.unknown_comment.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["commentId"], "properties": {
+          "commentId": { "$ref": "#/$defs/recordId" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["documentId", "title", "comments", "truncated"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "title": { "type": "string", "minLength": 1, "maxLength": 256 },
+          "comments": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/comment" } },
+          "truncated": { "type": "boolean" }
+        } }
+      },
+      { "name": "comment.add", "kind": "command", "description": "Add a Comment, optionally quoting an excerpt and replying to a parent on the same Document, as one record signed by the local Person or the caller's bound Agent (1.3). Errors: documents.unknown_document, documents.unknown_comment (parent unknown or on another Document), documents.invalid_markdown, documents.invalid_quote, documents.actor_unauthorized, documents.principal_not_bound. Every accepted add makes a new Comment: an uncertain command must not be retried automatically.",
+        "request": { "type": "object", "additionalProperties": false, "required": ["documentId", "markdown"], "properties": {
+          "documentId": { "$ref": "#/$defs/recordId" },
+          "parentId": { "$ref": "#/$defs/recordId" },
+          "quote": { "$ref": "#/$defs/quote" },
+          "markdown": { "$ref": "#/$defs/commentMarkdown" }
+        } },
+        "response": { "type": "object", "additionalProperties": false, "required": ["commentId"], "properties": {
+          "commentId": { "$ref": "#/$defs/recordId" }
+        } }
+      }
+    ]
+  }]
+}

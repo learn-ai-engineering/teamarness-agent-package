@@ -92,8 +92,15 @@ impl TaskHandle {
     }
 }
 
+/// Runs the Conversations and Documents Comment sources side by side. Each gates and
+/// subscribes on its own, so one Package being disabled or failing never stops the other.
 pub fn start(parent: &CancellationToken, inputs: HarnessInputs) -> TaskHandle {
-    TaskHandle::spawn(parent, move |cancellation| run(inputs, cancellation))
+    TaskHandle::spawn(parent, move |cancellation| async move {
+        tokio::join!(
+            run(inputs.clone(), cancellation.clone()),
+            crate::comments::run(inputs, cancellation),
+        );
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -164,7 +171,7 @@ impl Batch {
     }
 }
 
-fn revision(value: &str) -> Option<u64> {
+pub(crate) fn revision(value: &str) -> Option<u64> {
     if value.is_empty()
         || !value.bytes().all(|byte| byte.is_ascii_digit())
         || (value.len() > 1 && value.starts_with('0'))
@@ -178,12 +185,12 @@ fn revision(value: &str) -> Option<u64> {
 }
 
 #[derive(Default)]
-struct Slot {
-    in_flight: bool,
-    pending: bool,
+pub(crate) struct Slot {
+    pub(crate) in_flight: bool,
+    pub(crate) pending: bool,
 }
 
-enum ReplyOutcome {
+pub(crate) enum ReplyOutcome {
     Posted,
     Cancelled,
     Failed(&'static str, bool),
@@ -301,7 +308,7 @@ async fn run(inputs: HarnessInputs, cancellation: CancellationToken) {
     state.shutdown().await;
 }
 
-async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) -> bool {
+pub(crate) async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) -> bool {
     tokio::select! {
         () = cancellation.cancelled() => true,
         () = tokio::time::sleep(duration) => false,
@@ -660,7 +667,7 @@ fn system_message(agent: &BoundAgent, system_prompt: &str, tools: &ToolContext) 
     text
 }
 
-fn label(principal: Option<&Principal>, author: &str) -> String {
+pub(crate) fn label(principal: Option<&Principal>, author: &str) -> String {
     match principal {
         Some(principal) => {
             let kind = match principal.kind {
@@ -691,6 +698,41 @@ async fn reply(
     history: Vec<ChatMessage>,
     cancellation: &CancellationToken,
 ) -> ReplyOutcome {
+    let markdown = match final_text(client, inputs, history, cancellation, |tools| {
+        system_message(&prompt.agent, &prompt.system_prompt, tools)
+    })
+    .await
+    {
+        Ok(text) => truncate_chars(text, MAX_REPLY_CHARS),
+        Err(outcome) => return outcome,
+    };
+    // The trigger is already persisted, so a post is attempted at most once and never re-sent.
+    // If cancellation wins after the command was polled, its outcome is unknown; it is not
+    // retried either way.
+    let post = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
+        post = inputs.commands.command(
+            CONVERSATIONS_CONTRACT, 1,
+            "message.post",
+            json!({"channelId":channel,"markdown":markdown}),
+        ) => post,
+    };
+    match post {
+        Ok(_) => ReplyOutcome::Posted,
+        Err(_) => ReplyOutcome::Failed(POST_FAILED, false),
+    }
+}
+
+/// Runs one bounded turn over the tools usable now and returns its non-empty final text, which
+/// the caller posts once. The system message is built once the tools are known.
+pub(crate) async fn final_text(
+    client: &ModelClient,
+    inputs: &HarnessInputs,
+    history: Vec<ChatMessage>,
+    cancellation: &CancellationToken,
+    system: impl FnOnce(&ToolContext) -> String,
+) -> Result<String, ReplyOutcome> {
     let settings = inputs.settings.clone();
     let configured = teamarness_package_sdk::blocking(cancellation, move |cancel| {
         let store = settings.lock().map_err(|_| crate::storage_failed())?;
@@ -706,53 +748,38 @@ async fn reply(
     .await;
     let (endpoint, model, key) = match configured {
         Ok((endpoint, model, Some(key))) => (endpoint, model, key),
-        Err(_) if cancellation.is_cancelled() => return ReplyOutcome::Cancelled,
-        _ => return ReplyOutcome::Failed(crate::model::ENDPOINT_REJECTED, false),
+        Err(_) if cancellation.is_cancelled() => return Err(ReplyOutcome::Cancelled),
+        _ => return Err(ReplyOutcome::Failed(crate::model::ENDPOINT_REJECTED, false)),
     };
-    // `message.post` is withheld here, so the model can never post on its own.
+    // `message.post` and `comment.add` are withheld here, so the model can never post on its own.
     let usable = tokio::select! {
         biased;
-        () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
+        () = cancellation.cancelled() => return Err(ReplyOutcome::Cancelled),
         usable = access::usable_now(Some(&inputs.ports)) => match usable {
             Ok(usable) => usable,
-            Err(_) => return ReplyOutcome::Failed(crate::turn::TOOL_UNAVAILABLE, false),
+            Err(_) => return Err(ReplyOutcome::Failed(crate::turn::TOOL_UNAVAILABLE, false)),
         },
     };
     let tools = TurnTools::new(&usable, inputs.commands.clone(), skills::bundled());
-    let system = system_message(&prompt.agent, &prompt.system_prompt, tools.context());
+    let system = system(tools.context());
     let model = ConfiguredModel::new(client.clone(), endpoint, model, key);
     let outcome = tools.run(system, history, &model, cancellation).await;
     drop(model);
-    // A failed turn's activity never reaches the Channel; the status shows its code.
-    let markdown = match outcome {
-        TurnOutcome::Done(result) => truncate_chars(result.text, MAX_REPLY_CHARS),
+    // A failed turn's activity never reaches the Channel or Document; the status shows its code.
+    let text = match outcome {
+        TurnOutcome::Done(result) => result.text,
         TurnOutcome::Failed {
             code, retryable, ..
-        } => return ReplyOutcome::Failed(code, retryable),
-        TurnOutcome::Cancelled => return ReplyOutcome::Cancelled,
+        } => return Err(ReplyOutcome::Failed(code, retryable)),
+        TurnOutcome::Cancelled => return Err(ReplyOutcome::Cancelled),
     };
-    if markdown.trim().is_empty() {
-        return ReplyOutcome::Failed(crate::model::MODEL_ERROR, false);
+    if text.trim().is_empty() {
+        return Err(ReplyOutcome::Failed(crate::model::MODEL_ERROR, false));
     }
-    // The trigger is already persisted, so a post is attempted at most once and never re-sent.
-    // If cancellation wins after the command was polled, its outcome is unknown; it is not
-    // retried either way.
     if cancellation.is_cancelled() {
-        return ReplyOutcome::Cancelled;
+        return Err(ReplyOutcome::Cancelled);
     }
-    let post = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return ReplyOutcome::Cancelled,
-        post = inputs.commands.command(
-            CONVERSATIONS_CONTRACT, 1,
-            "message.post",
-            json!({"channelId":channel,"markdown":markdown}),
-        ) => post,
-    };
-    match post {
-        Ok(_) => ReplyOutcome::Posted,
-        Err(_) => ReplyOutcome::Failed(POST_FAILED, false),
-    }
+    Ok(text)
 }
 
 fn truncate_chars(text: String, limit: usize) -> String {

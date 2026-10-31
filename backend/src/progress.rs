@@ -94,6 +94,26 @@ impl Progress {
             Ok(())
         })
     }
+
+    /// Replaces a cursor with a Provider-declared baseline, possibly in a new epoch.
+    ///
+    /// Only for a Provider that answers `resyncRequired` with its current head, such as the
+    /// Documents Comment feed: the caller acts on nothing before the new baseline.
+    ///
+    /// # Errors
+    /// Returns storage failure, or `Corrupt` for an invalid cursor.
+    pub fn rebaseline(&mut self, key: &str, cursor: Cursor) -> Result<(), StorageError> {
+        if Cursor::new(cursor.epoch.clone(), cursor.after).is_none() {
+            return Err(StorageError::Corrupt);
+        }
+        if self.cursor(key) == Some(&cursor) {
+            return Ok(());
+        }
+        self.document.update(|document| {
+            document.channels.insert(key.to_owned(), cursor);
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +143,33 @@ mod tests {
         assert_eq!(progress.cursor("channel"), Some(&cursor));
         assert!(Cursor::new("wrong".into(), 0).is_none());
         assert!(Cursor::new("a".repeat(32), u64::MAX).is_none());
+    }
+
+    #[test]
+    fn an_explicit_rebaseline_may_change_epoch_or_move_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut progress = Progress::open(directory.path()).unwrap();
+        let key = "dev.teamarness.documents#comments";
+        progress
+            .advance(key, Cursor::new("a".repeat(32), 9).unwrap())
+            .unwrap();
+        let fresh = Cursor::new("b".repeat(32), 3).unwrap();
+        progress.rebaseline(key, fresh.clone()).unwrap();
+        assert_eq!(
+            Progress::open(directory.path()).unwrap().cursor(key),
+            Some(&fresh)
+        );
+        assert!(
+            progress
+                .rebaseline(
+                    key,
+                    Cursor {
+                        epoch: "x".into(),
+                        after: 1
+                    }
+                )
+                .is_err()
+        );
     }
 
     #[test]
