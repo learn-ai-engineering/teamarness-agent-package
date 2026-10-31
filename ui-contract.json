@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "$defs": {
     "empty": { "type": "object", "additionalProperties": false },
+    "draftText": { "type": "string", "maxLength": 32768 },
     "principalId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
     "name": { "anyOf": [{ "type": "string", "minLength": 1, "maxLength": 256 }, { "type": "null" }] },
     "settings": {
@@ -205,6 +206,24 @@
     "agent.chat.clear": {
       "request": { "$ref": "#/$defs/empty" },
       "response": { "$ref": "#/$defs/chat" }
+    },
+    "agent.chat.draft.get": {
+      "request": { "$ref": "#/$defs/empty" },
+      "response": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text"],
+        "properties": { "text": { "$ref": "#/$defs/draftText" } }
+      }
+    },
+    "agent.chat.draft.set": {
+      "request": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text"],
+        "properties": { "text": { "$ref": "#/$defs/draftText" } }
+      },
+      "response": { "$ref": "#/$defs/empty" }
     },
     "agent.packages.get": {
       "request": { "$ref": "#/$defs/empty" },

@@ -61,6 +61,7 @@ The Steward changes Host-owned selections in Configuration's Packages section. E
 | `backend/tests/` | Exercises Backend behavior through the SDK test harness, with no protocol frames. |
 | `ui/src/index.ts` | Mounts the Package UI and communicates through the supplied `PackageClient`. |
 | `ui/src/index.ts` | Also holds this Package's CSS, adopted into the mount and removed on unmount. |
+| `ui/src/markdown.ts` | The chat's sanitized Markdown renderer, copied from the Conversations Package UI. Packages share no code, so keep it a copy. |
 | `ui/src/contract.generated.ts` | Generated request and response types. Regenerate it; never edit it. |
 | `ui/src/index.test.ts` | Exercises UI behavior with the UI SDK's fake Package client. |
 | `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes into `dist/`. |

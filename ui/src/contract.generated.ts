@@ -42,6 +42,8 @@ export type ChatEntry = {
 
 export type ContractIdentity = string;
 
+export type DraftText = string;
+
 export type Empty = Record<string, never>;
 
 export type KeyView = {
@@ -97,6 +99,12 @@ export type AgentContract = {
         readonly "principalId": PrincipalId;
       }; readonly response: BindingView };
     readonly "agent.chat.clear": { readonly request: Empty; readonly response: Chat };
+    readonly "agent.chat.draft.get": { readonly request: Empty; readonly response: {
+        readonly "text": DraftText;
+      } };
+    readonly "agent.chat.draft.set": { readonly request: {
+        readonly "text": DraftText;
+      }; readonly response: Empty };
     readonly "agent.chat.get": { readonly request: Empty; readonly response: Chat };
     readonly "agent.chat.send": { readonly request: {
         readonly "content": string;

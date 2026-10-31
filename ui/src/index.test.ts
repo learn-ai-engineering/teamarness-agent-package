@@ -32,6 +32,14 @@ function fakeBackend(input?: {
   holdFirstPackageGet?: Promise<void>;
   /** Every `agent.packages.get` after the first fails with this code. */
   failLaterPackageGets?: string;
+  /** The draft the Backend remembers at mount. */
+  draft?: string;
+  /** Every `agent.chat.draft.get` fails. */
+  refuseDraftGet?: boolean;
+  /** Every `agent.chat.draft.get` waits for this before it answers. */
+  holdDraftGet?: Promise<void>;
+  /** Every `agent.chat.send` fails with this code. */
+  refuseSend?: string;
 }) {
   let settings = defaults();
   let hasKey = false;
@@ -40,6 +48,7 @@ function fakeBackend(input?: {
   let chat: Chat = { entries: [], pending: false };
   let packages: PackageView[] = input?.packages ?? [];
   let packageGets = 0;
+  let draft = input?.draft ?? "";
   const fake = createFakePackageClient({
     requests: {
       "agent.settings.get": () => ({ settings, hasKey }),
@@ -81,7 +90,17 @@ function fakeBackend(input?: {
       },
       "agent.status.get": () => status,
       "agent.chat.get": () => chat,
+      "agent.chat.draft.get": async () => {
+        await input?.holdDraftGet;
+        if (input?.refuseDraftGet) throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.storage_failed", retryable: true } });
+        return { text: draft };
+      },
+      "agent.chat.draft.set": (payload) => {
+        draft = (payload as { text: string }).text;
+        return {};
+      },
       "agent.chat.send": (payload) => {
+        if (input?.refuseSend) throw createPackageRequestError({ stage: "ui", packageError: { code: input.refuseSend, retryable: true } });
         if (status.state === "unconfigured") {
           throw createPackageRequestError({ stage: "ui", packageError: { code: "agent.not_configured" } });
         }
@@ -125,7 +144,7 @@ function fakeBackend(input?: {
     chat = { entries: [...chat.entries, { id: chat.entries.length + 1, role: "assistant", content }], pending: false };
     await fake.emit("agent.chat.changes", chat satisfies PackageValue);
   };
-  return { fake, client: fake.client, reply, updatePackages: (next: PackageView[]) => { packages = next; }, secretSeen: () => fake.calls.some((call) => JSON.stringify(call.payload).includes(SECRET)) };
+  return { fake, client: fake.client, reply, draft: () => draft, updatePackages: (next: PackageView[]) => { packages = next; }, secretSeen: () => fake.calls.some((call) => JSON.stringify(call.payload).includes(SECRET)) };
 }
 
 function lastState(states: AgentUiState[]): AgentUiState {
@@ -183,6 +202,7 @@ describe("Agent Package UI controller", () => {
     await controller.start();
 
     expect(fake.calls.map((call) => call.operation)).toEqual([
+      "agent.chat.draft.get",
       "agent.status.get",
       "agent.chat.get",
       "agent.status.changes",
@@ -487,7 +507,7 @@ describe("Agent Package UI views and chat", () => {
 
     await reply("I can answer questions.");
     const entries = Array.from(chat.querySelectorAll<HTMLElement>(".chat-entry"));
-    expect(entries.map((entry) => [entry.dataset.role, entry.querySelector(".chat-author")?.textContent, entry.querySelector(".chat-content")?.textContent])).toEqual([
+    expect(entries.map((entry) => [entry.dataset.role, entry.querySelector(".chat-author")?.textContent, entry.querySelector(".chat-content")?.textContent?.trim()])).toEqual([
       ["user", "You", "What can you do?"],
       ["assistant", "Scout", "I can answer questions."],
     ]);
@@ -543,7 +563,7 @@ describe("Agent Package UI chat activity", () => {
     expect(line?.textContent).toBe("Used Exhibits: runtime.guide, exhibit.list; Agent: skill_read");
     // Plain text after the answer, read by screen readers in order.
     expect(line?.getAttribute("aria-hidden")).toBeNull();
-    expect(line?.previousElementSibling?.className).toBe("chat-content");
+    expect(line?.previousElementSibling?.classList.contains("chat-content")).toBe(true);
     expect(line?.classList.contains("teamarness-section")).toBe(false);
     await cleanup();
   });
@@ -810,6 +830,212 @@ describe("Agent Package UI packages", () => {
     expect(section.querySelectorAll('[data-role="package"]')).toHaveLength(0);
     expect(section.querySelector('[data-role="packages-empty"]')?.textContent).toBe("No packages offer agent guidance yet.");
     await cleanup();
+  });
+});
+
+// Verifies: AC12 (better-doc-agent) — chat entries render the Conversations Markdown subset,
+// sanitized the same way; status and error text stays plain text.
+describe("Agent Package UI chat Markdown", () => {
+  async function chatWith(entries: Chat["entries"], failure?: Pick<Chat, "lastError">) {
+    const backend = fakeBackend({ status: { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } } });
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
+    await backend.fake.emit("agent.chat.changes", { entries, pending: false, ...failure } satisfies PackageValue);
+    const bodies = Array.from(root.querySelectorAll<HTMLElement>(".chat-entry .message-markdown"));
+    const cleanup = async () => {
+      await unmount();
+      host.remove();
+    };
+    return { root, bodies, cleanup };
+  }
+
+  it("renders user and Agent entries as Markdown: headings, lists, code and safe links", async () => {
+    const { bodies, cleanup } = await chatWith([
+      { id: 1, role: "user", content: "# Plan\n\n- one\n- **two**" },
+      { id: 2, role: "assistant", content: "1. first\n2. second\n\n```\nlet x = 1;\n```\n\nUse `x` and [docs](https://example.invalid/docs)." },
+    ]);
+    expect(bodies).toHaveLength(2);
+    const [user, agent] = bodies;
+    expect(user?.querySelector("h1")?.textContent).toBe("Plan");
+    expect(Array.from(user?.querySelectorAll("ul > li") ?? [], (item) => item.textContent)).toEqual(["one", "two"]);
+    expect(user?.querySelector("li strong")?.textContent).toBe("two");
+    expect(Array.from(agent?.querySelectorAll("ol > li") ?? [], (item) => item.textContent)).toEqual(["first", "second"]);
+    expect(agent?.querySelector("pre > code")?.textContent).toBe("let x = 1;\n");
+    expect(agent?.querySelector("p > code")?.textContent).toBe("x");
+    const link = agent?.querySelector("a");
+    expect(link?.getAttribute("href")).toBe("https://example.invalid/docs");
+    expect(link?.getAttribute("target")).toBe("_blank");
+    // `rel` is asked for too, but happy-dom's DOMPurify run drops it; the Conversations copy
+    // behaves the same here, so only the real-WebKit manual check (AC12) can show it.
+    await cleanup();
+  });
+
+  it("renders the supported formatting while escaping raw HTML", async () => {
+    const { bodies, cleanup } = await chatWith([
+      { id: 1, role: "assistant", content: "# Heading\n\n**bold** and *emphasis*\n\n<script>alert(1)</script>" },
+    ]);
+    const body = bodies[0];
+    expect(body?.querySelector("h1")?.textContent).toBe("Heading");
+    expect(body?.querySelector("strong")?.textContent).toBe("bold");
+    expect(body?.querySelector("em")?.textContent).toBe("emphasis");
+    expect(body?.querySelector("script")).toBeNull();
+    expect(body?.textContent).toContain("<script>alert(1)</script>");
+    await cleanup();
+  });
+
+  it("turns images into alt text and drops unsafe and encoded link schemes", async () => {
+    const { bodies, cleanup } = await chatWith([
+      { id: 1, role: "assistant", content: "![a & label](https://example.invalid/a.png) <img src=x onerror=alert(1)>" },
+      { id: 2, role: "assistant", content: "[bad](javascript:alert(1)) [also bad](%6a%61vascript:alert(1))" },
+    ]);
+    const [image, links] = bodies;
+    expect(image?.querySelector("img")).toBeNull();
+    expect(image?.innerHTML).not.toContain("<img");
+    expect(image?.textContent).toContain("a & label");
+    expect(links?.innerHTML).not.toContain("javascript:");
+    for (const anchor of links?.querySelectorAll("a") ?? []) {
+      expect(anchor.getAttribute("href")?.toLowerCase() ?? "").not.toContain("javascript");
+    }
+    await cleanup();
+  });
+
+  it("keeps status and error text as plain text", async () => {
+    const { root, cleanup } = await chatWith([], { lastError: { code: "**agent.odd**", retryable: false } });
+    const message = root.querySelector<HTMLElement>('[data-role="chat-message"]');
+    expect(message?.textContent).toBe("**agent.odd**");
+    expect(message?.querySelector("strong")).toBeNull();
+    await cleanup();
+  });
+});
+
+// Verifies: AC11 (better-doc-agent) — the chat draft survives a remount through the Backend's
+// memory, is cleared by a successful send and kept by a failed one.
+describe("Agent Package UI remembered chat draft", () => {
+  const READY: Status = { state: "ready", agent: { principalId: AGENT_ID, name: "Scout" } };
+  const WAIT = { timeout: 2000, interval: 10 };
+
+  async function mountOn(backend: ReturnType<typeof fakeBackend>) {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = host.attachShadow({ mode: "open" });
+    const unmount = await mount(createTestMountContext({ root, client: backend.client }));
+    const input = root.querySelector<HTMLTextAreaElement>('textarea[name="chatMessage"]');
+    if (!input) throw new Error("chat input missing");
+    const type = (text: string): void => {
+      input.value = text;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    };
+    const cleanup = async () => {
+      await unmount();
+      host.remove();
+    };
+    return { root, input, type, cleanup };
+  }
+
+  const draftSets = (backend: ReturnType<typeof fakeBackend>) =>
+    backend.fake.calls.filter((call) => call.operation === "agent.chat.draft.set").map((call) => call.payload);
+
+  it("restores the remembered draft on mount and saves a burst of typing once", async () => {
+    const backend = fakeBackend({ status: READY, draft: "half a *thought*" });
+    const first = await mountOn(backend);
+    await vi.waitFor(() => expect(first.input.value).toBe("half a *thought*"), WAIT);
+    expect(draftSets(backend)).toEqual([]);
+
+    first.type("half a *thought* and");
+    first.type("half a *thought* and more");
+    await vi.waitFor(() => expect(draftSets(backend)).toEqual([{ text: "half a *thought* and more" }]), WAIT);
+    await first.cleanup();
+
+    const second = await mountOn(backend);
+    await vi.waitFor(() => expect(second.input.value).toBe("half a *thought* and more"), WAIT);
+    await second.cleanup();
+  });
+
+  it("sends a pending save when unmounted", async () => {
+    const backend = fakeBackend({ status: READY });
+    const first = await mountOn(backend);
+    first.type("unsaved");
+    expect(draftSets(backend)).toEqual([]);
+    await first.cleanup();
+    await vi.waitFor(() => expect(backend.draft()).toBe("unsaved"), WAIT);
+    expect(draftSets(backend)).toEqual([{ text: "unsaved" }]);
+  });
+
+  it("clears the draft after a successful send, and clearing the chat leaves the draft alone", async () => {
+    const backend = fakeBackend({ status: READY });
+    const view = await mountOn(backend);
+    view.type("Send me");
+    await vi.waitFor(() => expect(backend.draft()).toBe("Send me"), WAIT);
+    view.input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await vi.waitFor(() => expect(backend.draft()).toBe(""), WAIT);
+    expect(view.input.value).toBe("");
+    await backend.reply("Done.");
+
+    view.type("next thought");
+    await vi.waitFor(() => expect(backend.draft()).toBe("next thought"), WAIT);
+    const before = draftSets(backend).length;
+    view.root.querySelector<HTMLButtonElement>('button[data-action="clear-chat"]')?.click();
+    await vi.waitFor(() => expect(backend.fake.calls.some((call) => call.operation === "agent.chat.clear")).toBe(true), WAIT);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(view.input.value).toBe("next thought");
+    expect(draftSets(backend)).toHaveLength(before);
+    expect(backend.draft()).toBe("next thought");
+    await view.cleanup();
+  });
+
+  it("keeps the draft after a failed send, also across a remount", async () => {
+    const backend = fakeBackend({ status: READY, refuseSend: "agent.endpoint_unreachable" });
+    const first = await mountOn(backend);
+    first.type("Keep me");
+    await vi.waitFor(() => expect(backend.draft()).toBe("Keep me"), WAIT);
+    first.input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await vi.waitFor(() => expect(first.root.querySelector('[data-role="chat-message"]')?.textContent)
+      .toBe("The endpoint could not be reached. Try again."), WAIT);
+    expect(first.input.value).toBe("Keep me");
+    expect(draftSets(backend)).toEqual([{ text: "Keep me" }]);
+    await first.cleanup();
+
+    const second = await mountOn(backend);
+    await vi.waitFor(() => expect(second.input.value).toBe("Keep me"), WAIT);
+    await second.cleanup();
+  });
+
+  it("forgets the draft when the Member empties the box", async () => {
+    const backend = fakeBackend({ status: READY, draft: "old" });
+    const view = await mountOn(backend);
+    await vi.waitFor(() => expect(view.input.value).toBe("old"), WAIT);
+    view.type("");
+    await vi.waitFor(() => expect(draftSets(backend)).toEqual([{ text: "" }]), WAIT);
+    await view.cleanup();
+  });
+
+  it("treats an unreadable draft as empty and never lets a late read overwrite typing", async () => {
+    const refused = fakeBackend({ status: READY, draft: "unreadable", refuseDraftGet: true });
+    const view = await mountOn(refused);
+    await flush();
+    expect(view.input.value).toBe("");
+    expect(view.root.querySelector('[data-role="chat-message"]')?.textContent).toBe("");
+    await view.cleanup();
+
+    let release = (): void => undefined;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const late = fakeBackend({ status: READY, draft: "stale", holdDraftGet: held });
+    const mounting = mountOn(late);
+    // The status and chat answer first; the draft read is still on its way.
+    await vi.waitFor(() => expect(late.fake.calls.some((call) => call.operation === "agent.chat.draft.get")).toBe(true), WAIT);
+    const root = document.body.lastElementChild?.shadowRoot;
+    const input = root?.querySelector<HTMLTextAreaElement>('textarea[name="chatMessage"]');
+    if (!input) throw new Error("chat input missing");
+    input.value = "typed first";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    release();
+    const mounted = await mounting;
+    await flush();
+    expect(mounted.input.value).toBe("typed first");
+    await vi.waitFor(() => expect(late.draft()).toBe("typed first"), WAIT);
+    await mounted.cleanup();
   });
 });
 

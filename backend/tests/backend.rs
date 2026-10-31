@@ -386,6 +386,105 @@ async fn settings_round_trip_without_the_key_and_survive_a_restart() {
     harness.shutdown().await.unwrap();
 }
 
+// Verifies: AC11 (better-doc-agent) — the chat draft round-trips through the Backend's memory,
+// is refused over 32 KiB of UTF-8 bytes, leaves the data directory alone and is gone after a
+// Backend restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_chat_draft_round_trips_in_memory_only() {
+    let data = tempfile::tempdir().unwrap();
+    let bindings = stewarded();
+    let Fixture { mut harness, .. } = start(data.path(), &bindings).await;
+    harness.activate().await.unwrap();
+    let files = || {
+        let mut names = std::fs::read_dir(data.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let before = files();
+
+    let empty_draft = harness
+        .request("agent.chat.draft.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(empty_draft, json!({"text": ""}));
+
+    let set = harness
+        .request("agent.chat.draft.set", json!({"text": "half a *thought*"}))
+        .await
+        .unwrap();
+    assert_eq!(set, empty());
+    let read = harness
+        .request("agent.chat.draft.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(read, json!({"text": "half a *thought*"}));
+
+    // Clearing the chat leaves the draft alone.
+    harness.request("agent.chat.clear", empty()).await.unwrap();
+    let kept = harness
+        .request("agent.chat.draft.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(kept, json!({"text": "half a *thought*"}));
+
+    // 32 KiB is counted in bytes: 8192 four-byte characters fit, one more byte does not.
+    let largest = "𝄞".repeat(8192);
+    assert_eq!(largest.len(), 32768);
+    harness
+        .request("agent.chat.draft.set", json!({"text": largest}))
+        .await
+        .unwrap();
+    let error = harness
+        .request(
+            "agent.chat.draft.set",
+            json!({"text": format!("{largest}x")}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "agent.invalid_request");
+    let unchanged = harness
+        .request("agent.chat.draft.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(unchanged, json!({"text": largest}));
+
+    // An unknown field is refused by the closed request.
+    let error = harness
+        .request("agent.chat.draft.set", json!({"text": "x", "extra": 1}))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "package.invalid_payload");
+
+    harness
+        .request("agent.chat.draft.set", json!({"text": ""}))
+        .await
+        .unwrap();
+    let emptied = harness
+        .request("agent.chat.draft.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(emptied, json!({"text": ""}));
+
+    harness
+        .request("agent.chat.draft.set", json!({"text": "before restart"}))
+        .await
+        .unwrap();
+    assert_eq!(files(), before, "a draft never reaches the data directory");
+    harness.shutdown().await.unwrap();
+
+    let Fixture { mut harness, .. } = start(data.path(), &bindings).await;
+    harness.activate().await.unwrap();
+    let after_restart = harness
+        .request("agent.chat.draft.get", empty())
+        .await
+        .unwrap();
+    assert_eq!(after_restart, json!({"text": ""}));
+    harness.shutdown().await.unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_key_file_is_owner_only_from_its_first_byte() {

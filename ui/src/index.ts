@@ -13,6 +13,7 @@ import {
   type PackageUnmount,
 } from "@teamarness/package-ui-sdk";
 import type { Activity, AgentContract, Candidate, Chat, PackageView, Settings, Status } from "./contract.generated";
+import { renderMarkdown } from "./markdown";
 
 export type { Activity, Candidate, Chat, PackageView, Settings, Status };
 
@@ -37,7 +38,17 @@ export type AgentUiState = Readonly<{
   packagesError: string | undefined;
   /** The change on its way, shown on its switch until the Backend answers. */
   pendingPackage: PendingPackage | undefined;
+  /** The remembered chat draft, as last restored by the controller; the Member's typing is not here. */
+  draft: string;
+  /** Changes whenever the controller replaces `draft`; the view then shows it in the composer. */
+  draftVersion: number;
 }>;
+
+/**
+ * How long a chat draft waits for more typing before it is saved. The Frame has no unmount hook
+ * to save on, so each change is saved soon after it settles.
+ */
+export const DRAFT_SAVE_DELAY_MS = 150;
 
 export type PendingPackage = Readonly<{ contract: string; enabled: boolean }>;
 
@@ -52,6 +63,10 @@ export type AgentController = Readonly<{
   unbind(): Promise<void>;
   /** Resolves `true` when the Backend accepted the message. */
   sendChat(content: string): Promise<boolean>;
+  /** Records the Member's chat draft, saved in the Backend's memory soon after it settles. */
+  editDraft(text: string): void;
+  /** Empties the chat draft at once, as after its message was sent. */
+  clearDraft(): void;
   clearChat(): Promise<void>;
   /** Enables or disables one agent-facing contract and shows the stored state it returns. */
   setPackage(contract: string, enabled: boolean): Promise<void>;
@@ -173,6 +188,8 @@ export function createAgentController(
     packagesBusy: false,
     packagesError: undefined,
     pendingPackage: undefined,
+    draft: "",
+    draftVersion: 0,
   };
 
   const update = (changes: Partial<AgentUiState>): void => {
@@ -229,12 +246,53 @@ export function createAgentController(
     }
   };
 
+  // The chat draft. `draftText` is the Member's latest text; `savedDraft` is the text last saved
+  // or read, `undefined` when unknown, so identical saves are skipped.
+  let draftText = "";
+  let savedDraft: string | undefined;
+  let draftEdits = 0;
+  let draftTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const saveDraft = (text: string): void => {
+    if (savedDraft === text) return;
+    savedDraft = text;
+    // Remembering is a convenience: a refused save changes nothing the Member can see.
+    Promise.resolve()
+      .then(() => typed.request("agent.chat.draft.set", { text }))
+      .catch(() => {
+        if (savedDraft === text) savedDraft = undefined;
+      });
+  };
+
+  const flushDraft = (): void => {
+    if (draftTimer !== undefined) clearTimeout(draftTimer);
+    draftTimer = undefined;
+    saveDraft(draftText);
+  };
+
+  const loadDraft = async (): Promise<void> => {
+    const edits = draftEdits;
+    let text = "";
+    try {
+      const response = await typed.request("agent.chat.draft.get", {});
+      if (typeof response?.text === "string") text = response.text;
+    } catch {
+      // A draft that cannot be read is treated as none.
+    }
+    // A read that lands after the Member typed never overwrites the typing.
+    if (disposed || draftEdits !== edits) return;
+    savedDraft = text;
+    draftText = text;
+    update({ draft: text, draftVersion: state.draftVersion + 1 });
+  };
+
   const loadCandidates = async (): Promise<readonly Candidate[]> =>
     (await typed.request("agent.binding.candidates", {})).agents;
 
   return Object.freeze({
     async start(): Promise<void> {
       if (view !== "settings") {
+        const draftLoad = loadDraft();
         // Chat follows the status too, so saving the configuration elsewhere enables it.
         await run(async () => {
           const status = await typed.request("agent.status.get", {});
@@ -247,6 +305,7 @@ export function createAgentController(
           });
           return { status, chat };
         });
+        await draftLoad;
         return;
       }
       await run(async () => {
@@ -309,6 +368,21 @@ export function createAgentController(
       return chatRequest(() => typed.request("agent.chat.send", { content }));
     },
 
+    editDraft(text: string): void {
+      draftText = text;
+      ++draftEdits;
+      if (disposed) return;
+      if (draftTimer !== undefined) clearTimeout(draftTimer);
+      draftTimer = setTimeout(flushDraft, DRAFT_SAVE_DELAY_MS);
+    },
+
+    clearDraft(): void {
+      draftText = "";
+      ++draftEdits;
+      if (disposed) return;
+      flushDraft();
+    },
+
     async clearChat(): Promise<void> {
       await chatRequest(() => typed.request("agent.chat.clear", {}));
     },
@@ -332,6 +406,7 @@ export function createAgentController(
     },
 
     dispose(): void {
+      if (draftTimer !== undefined && !disposed) flushDraft();
       disposed = true;
       for (const open of [subscription, chatSubscription]) {
         if (open) void open.close().catch(() => undefined);
@@ -384,7 +459,15 @@ const AGENT_CSS = `
   .chat-entry[data-role="user"] { align-self: flex-end; max-width: 75%; padding: .6rem .85rem; border-radius: var(--teamarness-radius-panel); background: var(--teamarness-color-panel); }
   .chat-entry[data-role="assistant"] { align-self: stretch; }
   .chat-author { display: block; font-size: .8em; font-weight: 600; color: var(--teamarness-color-text-muted); margin-bottom: .2rem; }
-  .chat-content { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .chat-content { margin: 0; overflow-wrap: anywhere; }
+  .chat-content > :first-child { margin-top: 0; }
+  .chat-content > :last-child { margin-bottom: 0; }
+  /* Copied from the Conversations Package's Message Markdown styles. */
+  .message-markdown { line-height: 1.55; overflow-wrap: anywhere; }
+  .message-markdown p { margin: .15rem 0 .4rem; }
+  .message-markdown pre { max-width: 100%; overflow: auto; padding: .6rem; background: var(--teamarness-color-panel); }
+  .message-markdown code { font-family: ui-monospace, monospace; }
+  .message-markdown a { color: var(--teamarness-color-accent); }
   .chat-activity { margin: .35rem 0 0; font-size: .8em; color: var(--teamarness-color-text-muted); overflow-wrap: anywhere; }
   .chat-empty { color: var(--teamarness-color-text-muted); }
   textarea.chat-input { min-height: 4.5rem; }
@@ -822,7 +905,14 @@ function chatView(): AgentView {
   chatSection.append(chatIntro, chatEmpty, chatLog, chatMessage, chatFailedActivity, chatForm);
 
   let renderedEntries = "";
+  /** The controller draft version the composer last showed. */
+  let shownDraftVersion = -1;
   const render = (state: AgentUiState): void => {
+    // A restored draft replaces the composer's text; the Member's typing never does.
+    if (state.draftVersion !== shownDraftVersion) {
+      shownDraftVersion = state.draftVersion;
+      if (chatInput.value !== state.draft) chatInput.value = state.draft;
+    }
     const chat = state.chat;
     const entries = chat?.entries ?? [];
     const agentName = state.status?.agent?.name ?? "Agent";
@@ -837,9 +927,9 @@ function chatView(): AgentView {
         const author = document.createElement("span");
         author.className = "chat-author";
         author.textContent = entry.role === "user" ? "You" : agentName;
-        const content = document.createElement("p");
-        content.className = "chat-content";
-        content.textContent = entry.content;
+        const content = document.createElement("div");
+        content.className = "chat-content message-markdown";
+        content.innerHTML = renderMarkdown(entry.content);
         item.append(author, content);
         if (entry.activity && entry.activity.length > 0) {
           const activity = document.createElement("p");
@@ -883,9 +973,12 @@ function chatView(): AgentView {
       const content = chatInput.value.trim();
       if (!content || sendButton.disabled) return;
       void controller.sendChat(content).then((accepted) => {
-        if (accepted && chatInput.value.trim() === content) chatInput.value = "";
+        if (!accepted || chatInput.value.trim() !== content) return;
+        chatInput.value = "";
+        controller.clearDraft();
       });
     };
+    const onDraftInput = (): void => { controller.editDraft(chatInput.value); };
     const onChatKey = (event: KeyboardEvent): void => {
       if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
@@ -895,10 +988,12 @@ function chatView(): AgentView {
     const onClearChat = (): void => { void controller.clearChat(); };
     chatForm.addEventListener("submit", onSendChat);
     chatInput.addEventListener("keydown", onChatKey);
+    chatInput.addEventListener("input", onDraftInput);
     clearChatButton.addEventListener("click", onClearChat);
     return () => {
       chatForm.removeEventListener("submit", onSendChat);
       chatInput.removeEventListener("keydown", onChatKey);
+      chatInput.removeEventListener("input", onDraftInput);
       clearChatButton.removeEventListener("click", onClearChat);
     };
   };

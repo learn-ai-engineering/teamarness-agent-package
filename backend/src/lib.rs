@@ -26,7 +26,7 @@ pub mod turn;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use teamarness_package_sdk::capabilities::agent_binding::{
     AgentBinding, AgentCandidate, BoundAgent,
 };
@@ -44,6 +44,9 @@ use model::{ConfiguredModel, ModelClient};
 use progress::Progress;
 use settings::{KeyError, Settings, SettingsStore};
 use status::{AgentSummary, Status, StatusCell};
+
+/// The largest chat draft the Backend remembers, in UTF-8 bytes.
+pub const MAX_DRAFT_BYTES: usize = 32 * 1024;
 
 fn error(code: &str, retryable: bool) -> BackendError {
     BackendError::new(code, retryable, json!({}))
@@ -102,6 +105,9 @@ pub struct AgentActive {
     /// Serializes mutations, reconciliation and readiness against harness replacement.
     transition: Arc<tokio::sync::Mutex<()>>,
     chat: Arc<ChatCell>,
+    /// The chat's unsent draft: held in memory only, so it survives a Package switch but never a
+    /// Backend restart.
+    draft: Arc<Mutex<String>>,
     identity: command_ownership::IdentityWork,
 }
 
@@ -549,6 +555,12 @@ struct ChatSendRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DraftSetRequest {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct BindingSetRequest {
     principal_id: String,
 }
@@ -678,6 +690,7 @@ pub fn router() -> Router<AgentActive> {
                 })),
                 transition: Arc::new(tokio::sync::Mutex::new(())),
                 chat: Arc::new(ChatCell::default()),
+                draft: Arc::new(Mutex::new(String::new())),
                 identity: command_ownership::IdentityWork::default(),
             };
             // Reconcile the startup roster before starting any reply work.
@@ -887,6 +900,32 @@ pub fn router() -> Router<AgentActive> {
             let ((), view) = state.chat.update(chat::ChatSession::clear);
             state.stop_chat().await;
             Ok::<ChatView, BackendError>(view)
+        },
+    )
+    .request(
+        "agent.chat.draft.get",
+        |context: Context<AgentActive>, _: Empty| async move {
+            let text = context
+                .state()
+                .draft
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            Ok::<Value, BackendError>(json!({ "text": text }))
+        },
+    )
+    .request(
+        "agent.chat.draft.set",
+        |context: Context<AgentActive>, request: DraftSetRequest| async move {
+            if request.text.len() > MAX_DRAFT_BYTES {
+                return Err(invalid_request());
+            }
+            *context
+                .state()
+                .draft
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = request.text;
+            Ok::<Value, BackendError>(json!({}))
         },
     )
     .request(
