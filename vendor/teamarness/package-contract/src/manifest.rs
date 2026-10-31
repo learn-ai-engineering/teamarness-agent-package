@@ -15,12 +15,17 @@
 //! | `manifest.identity` | `invalid_package_identity` | `identity` is not a Package Identity |
 //! | `manifest.version_not_strict` | `manifest_unsupported` | `version` is not an exact semantic version |
 //! | `manifest.display_name` | `manifest_malformed` | the display name is empty, padded, long or has control characters |
+//! | `manifest.description` | `manifest_malformed` | the description is empty, padded, long or has control characters other than newline |
+//! | `manifest.author` | `manifest_malformed` | the author is empty, long or has control characters |
+//! | `manifest.homepage` | `manifest_malformed` | the homepage is not an absolute `https:` URL of at most 2048 characters |
 //! | `manifest.protocol_unsupported` | `manifest_unsupported` | the protocol range is invalid or excludes 1.0 |
 //! | `manifest.extension_key` | `manifest_malformed` | an extension key is not a Package Identity |
 //! | `manifest.capability_identity` | `manifest_malformed` | a capability identity is malformed |
 //! | `manifest.capability_duplicate` | `manifest_malformed` | a capability is requested twice |
 //! | `manifest.capability_range` | `manifest_unsupported` | a capability version range is invalid |
 //! | `manifest.ui_bounds` | `manifest_malformed` | a declared UI size or count exceeds its bound |
+//! | `manifest.ui_view` | `manifest_malformed` | a declared UI view is not `"settings"` |
+//! | `manifest.ui_view_duplicate` | `manifest_malformed` | a UI view is declared twice |
 //! | `manifest.target_missing` | `target_unsupported` | no single backend artifact matches the target |
 //! | `manifest.duplicate_target` | `target_unsupported` | two backend artifacts declare the same target |
 //! | `manifest.backend_target` | `manifest_malformed` | a backend artifact has an empty target |
@@ -67,6 +72,10 @@ const MAX_UI_ASSET_BYTES: usize = 8 * 1024 * 1024;
 const MAX_UI_ASSETS: usize = 64;
 const MAX_UI_CONTRACT_BYTES: usize = 1024 * 1024;
 const MAX_UI_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const MAX_DISPLAY_NAME_CHARS: usize = 128;
+const MAX_DESCRIPTION_CHARS: usize = 1024;
+const MAX_AUTHOR_CHARS: usize = 128;
+const MAX_HOMEPAGE_CHARS: usize = 2048;
 
 /// A parsed, semantically validated manifest. No file has been read.
 #[derive(Debug, Clone)]
@@ -74,10 +83,15 @@ pub struct ManifestDocument {
     pub identity: String,
     pub version: Version,
     pub display_name: String,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub homepage: Option<String>,
     pub protocol: VersionRange,
     pub capabilities: Vec<CapabilityRequirement>,
     pub consumed_ports: Vec<ConsumedContract>,
     pub activation: ActivationPolicy,
+    /// The optional UI views declared beside the main view, in declaration order.
+    pub ui_views: Vec<UiView>,
     port_contract: Option<DigestFile>,
     backends: Vec<FileArtifact>,
     ui: UiDocument,
@@ -127,6 +141,9 @@ pub struct LoadedManifest {
     pub identity: String,
     pub version: Version,
     pub display_name: String,
+    pub description: Option<String>,
+    pub author: Option<String>,
+    pub homepage: Option<String>,
     pub protocol: VersionRange,
     pub backend: VerifiedFile,
     pub ui: LoadedUi,
@@ -170,6 +187,30 @@ pub struct LoadedUi {
     pub entrypoint: VerifiedFile,
     pub assets: Vec<LoadedAsset>,
     pub contract: VerifiedFile,
+    /// The optional views declared beside the main view, in declaration order.
+    pub views: Vec<UiView>,
+}
+
+/// An optional Package UI view a manifest declares in `ui.views`.
+///
+/// Every Package UI has a main view; it is never declared. Version 1 defines one optional view.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UiView {
+    /// A view where a person changes the Package's settings.
+    Settings,
+}
+
+impl UiView {
+    /// The wire name of the view.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Settings => "settings",
+        }
+    }
 }
 
 /// A verified UI asset and its declared media type.
@@ -256,6 +297,9 @@ struct RawManifest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Presentation {
     display_name: String,
+    description: Option<String>,
+    author: Option<String>,
+    homepage: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,6 +318,8 @@ struct UiDocument {
     #[serde(default)]
     assets: Vec<AssetDocument>,
     contract: DigestFile,
+    #[serde(default)]
+    views: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -338,7 +384,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
     if version.to_string() != document.version {
         return Err(unsupported("manifest.version_not_strict").at("/version"));
     }
-    validate_display_name(&document.presentation.display_name)?;
+    validate_presentation(&document.presentation)?;
     validate_range(document.protocol, "manifest.protocol_unsupported")
         .map_err(|error| error.at("/protocol"))?;
     if document.protocol.major != SUPPORTED_PROTOCOL.0
@@ -360,6 +406,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
     {
         return Err(malformed("manifest.ui_bounds").at("/ui"));
     }
+    let ui_views = validate_ui_views(&document.ui.views)?;
 
     let mut seen_targets = BTreeSet::new();
     for artifact in &document.backends {
@@ -427,10 +474,14 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<ManifestDocument, ContractError> {
         identity: document.identity,
         version,
         display_name: document.presentation.display_name,
+        description: document.presentation.description,
+        author: document.presentation.author,
+        homepage: document.presentation.homepage,
         protocol: document.protocol,
         capabilities: document.capabilities,
         consumed_ports: document.consumed_ports,
         activation: document.activation,
+        ui_views,
         port_contract: document.port_contract,
         backends: document.backends,
         ui: document.ui,
@@ -543,12 +594,16 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
         identity: document.identity,
         version: document.version,
         display_name: document.display_name,
+        description: document.description,
+        author: document.author,
+        homepage: document.homepage,
         protocol: document.protocol,
         backend,
         ui: LoadedUi {
             entrypoint,
             assets,
             contract,
+            views: document.ui_views,
         },
         capabilities: document.capabilities,
         consumed_ports: document.consumed_ports,
@@ -559,17 +614,90 @@ pub fn load_package_directory(root: &Path, target: &str) -> Result<LoadedManifes
     })
 }
 
+fn validate_presentation(presentation: &Presentation) -> Result<(), ContractError> {
+    validate_display_name(&presentation.display_name)?;
+    if let Some(description) = &presentation.description {
+        validate_description(description)?;
+    }
+    if let Some(author) = &presentation.author {
+        validate_author(author)?;
+    }
+    if let Some(homepage) = &presentation.homepage {
+        validate_homepage(homepage)?;
+    }
+    Ok(())
+}
+
+// The schema publishes each `maxLength`, which JSON Schema 2020-12 counts in
+// code points. Counting bytes would reject a value the schema admits.
 fn validate_display_name(value: &str) -> Result<(), ContractError> {
-    // The schema publishes `"maxLength": 128`, which JSON Schema 2020-12
-    // counts in code points. Counting bytes rejected a name the schema admits.
     if value.trim() != value
         || value.is_empty()
-        || value.chars().count() > 128
+        || value.chars().count() > MAX_DISPLAY_NAME_CHARS
         || value.chars().any(char::is_control)
     {
         return Err(malformed("manifest.display_name").at("/presentation/displayName"));
     }
     Ok(())
+}
+
+fn validate_description(value: &str) -> Result<(), ContractError> {
+    if value.trim() != value
+        || value.is_empty()
+        || value.chars().count() > MAX_DESCRIPTION_CHARS
+        || value
+            .chars()
+            .any(|character| character.is_control() && character != '\n')
+    {
+        return Err(malformed("manifest.description").at("/presentation/description"));
+    }
+    Ok(())
+}
+
+fn validate_author(value: &str) -> Result<(), ContractError> {
+    if value.is_empty()
+        || value.chars().count() > MAX_AUTHOR_CHARS
+        || value.chars().any(char::is_control)
+    {
+        return Err(malformed("manifest.author").at("/presentation/author"));
+    }
+    Ok(())
+}
+
+/// Accepts an absolute `https:` URL with a nonempty host and no user information,
+/// whitespace, or control characters. The schema publishes the same rule as a pattern.
+fn validate_homepage(value: &str) -> Result<(), ContractError> {
+    let refused = || malformed("manifest.homepage").at("/presentation/homepage");
+    if value.chars().count() > MAX_HOMEPAGE_CHARS
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err(refused());
+    }
+    let rest = value.strip_prefix("https://").ok_or_else(refused)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.split(':').next().unwrap_or_default();
+    if host.is_empty() || authority.contains('@') {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+/// Accepts each declared view once. Version 1 knows only `"settings"`; the main view is implicit.
+fn validate_ui_views(values: &[Value]) -> Result<Vec<UiView>, ContractError> {
+    let mut views = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let view = match value.as_str() {
+            Some("settings") => UiView::Settings,
+            _ => return Err(malformed("manifest.ui_view").at(format!("/ui/views/{index}"))),
+        };
+        if views.contains(&view) {
+            return Err(malformed("manifest.ui_view_duplicate").at(format!("/ui/views/{index}")));
+        }
+        views.push(view);
+    }
+    Ok(views)
 }
 
 fn validate_range(range: VersionRange, rule: &'static str) -> Result<(), ContractError> {

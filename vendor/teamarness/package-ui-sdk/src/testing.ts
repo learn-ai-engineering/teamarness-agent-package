@@ -8,9 +8,11 @@
 
 import {
   PACKAGE_REQUEST_ERROR_KIND,
+  PACKAGE_UI_HOST_VERSION,
   TEAMARNESS_THEME_TOKENS,
   type PackageClient,
   type PackageMountContext,
+  type PackageUiView,
   type PackageRequestError,
   type PackageSubscribeOptions,
   type PackageSubscription,
@@ -139,11 +141,12 @@ export function createFakePackageClient(handlers?: {
   });
 }
 
-/** Builds the mount context a Package UI's `mount` is given. */
+/** Builds the mount context a Package UI's `mount` is given. `view` defaults to `"main"`. */
 export function createTestMountContext(input: {
   root: unknown;
   client: PackageClient;
   displayName?: string;
+  view?: PackageUiView;
 }): PackageMountContext {
   return Object.freeze({
     root: input.root as ShadowRoot,
@@ -157,7 +160,8 @@ export function createTestMountContext(input: {
       processGeneration: "1",
     }),
     workspace: Object.freeze({ id: "workspace1", name: "Test Workspace" }),
-    uiHostVersion: 1,
+    view: input.view ?? "main",
+    uiHostVersion: PACKAGE_UI_HOST_VERSION,
     themeTokens: TEAMARNESS_THEME_TOKENS,
     client: input.client,
   });

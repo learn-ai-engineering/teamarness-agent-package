@@ -63,10 +63,10 @@ Each chat or reply turn allows at most 8 model calls, 16 tool calls, 16,384 char
 
 ### SDK provenance and retained fixtures
 
-The approved SDK snapshot comes from clean Host revision `4e0249b7e354f87586971aa4d8951613151906eb`. This controlled migration uses the canonical generator's complete production tree sets, dependency declarations, notices, and digest conventions:
+The approved SDK snapshot comes from clean Host revision `74d1f0bdfed48c8ddf35a0dfbcfa5a4fc7cc583d`. This controlled migration uses the canonical generator's complete production tree sets, dependency declarations, notices, and digest conventions:
 
 ```sh
-node scripts/refresh-sdk.mjs /path/to/clean/Host-at-4e0249b
+node scripts/refresh-sdk.mjs /path/to/clean/Host-at-74d1f0b
 node /path/to/Host/scripts/create-package.mjs --vendor-report "$PWD"
 npm run check:vendor
 ```

@@ -182,7 +182,7 @@ Treat vendored SDK files as external infrastructure. Do not modify them to imple
 
 `teamarness-authoring.json` records which checkout the copy came from — `sdkRevision`, `sdkRevisionDirty` — and a digest of every vendored tree. `npm run check:vendor` recomputes those digests as part of `npm test`, so a failure there means a vendored file was edited: restore it rather than weakening the check. From a Teamarness checkout, `npm run create:package -- --vendor-report <project>` reports which trees differ from that checkout, and changes nothing.
 
-There is no general supported in-place SDK upgrade. The approved package-ports 2.0 migration uses `scripts/refresh-sdk.mjs` to reproduce the exact clean canonical Host 4e0249b generator snapshot; it refuses other revisions and records every tree digest. Teamarness SDK fixes do not arrive in this repository automatically. Preserve source notices, license metadata, relative dependency paths, and `teamarness-authoring.json` provenance.
+There is no general supported in-place SDK upgrade. The approved package-ports 2.0 migration uses `scripts/refresh-sdk.mjs` to reproduce the exact clean canonical Host 74d1f0b generator snapshot; it refuses other revisions and records every tree digest. Teamarness SDK fixes do not arrive in this repository automatically. Preserve source notices, license metadata, relative dependency paths, and `teamarness-authoring.json` provenance.
 
 ## Security model
 

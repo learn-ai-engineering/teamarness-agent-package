@@ -395,10 +395,29 @@ export interface PackageClient {
   ): Promise<PackageSubscription>;
 }
 
+/**
+ * The view a Package UI mount shows.
+ *
+ * Every Package UI has `main`. The Shell mounts `settings` only for a Package whose manifest
+ * declares it in `ui.views`. A UI that declares no views can ignore the value.
+ */
+export type PackageUiView = "main" | "settings";
+
+/** Every Package UI view, in the order the mount contract defines them. */
+export const PACKAGE_UI_VIEWS: readonly PackageUiView[] = Object.freeze(["main", "settings"]);
+
+/**
+ * The version of the mount contract this SDK describes. Version 2 added `view`; a UI written for
+ * version 1 ignores it and keeps working.
+ */
+export const PACKAGE_UI_HOST_VERSION = 2;
+
 export type PackageMountContext = Readonly<{
   root: ShadowRoot;
   package: PackagePresentation;
   workspace: WorkspacePresentation;
+  /** The view this mount shows. `main` unless the Package declares and the Shell opened another. */
+  view: PackageUiView;
   uiHostVersion: number;
   themeTokens: readonly TeamarnessThemeToken[];
   client: PackageClient;

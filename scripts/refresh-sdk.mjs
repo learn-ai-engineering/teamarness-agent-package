@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const revision = "4e0249b7e354f87586971aa4d8951613151906eb";
+const revision = "74d1f0bdfed48c8ddf35a0dfbcfa5a4fc7cc583d";
 const source = resolve(process.argv[2] ?? "");
 const git = (...args) => execFileSync("git", ["-C", source, ...args], { encoding: "utf8" }).trim();
 if (git("rev-parse", "HEAD") !== revision || git("status", "--porcelain") !== "") {
