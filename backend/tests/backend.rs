@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use teamarness_agent_package::catalog::{BundledCatalog, Catalog, PortKind};
 use teamarness_agent_package::router;
 use teamarness_package_sdk::BackendError;
 use teamarness_package_sdk::testing::{
@@ -269,85 +268,12 @@ fn manifest() -> Value {
     serde_json::from_str(include_str!("../../teamarness.package.json")).expect("manifest is JSON")
 }
 
-/// A consumed contract: identity, major, minor range and `(port, kind)` pairs.
-type Consumed = (String, u64, u64, u64, Vec<(String, String)>);
-
+// Every Port the Agent uses, Conversations included, is reached through dynamic Agent access
+// (ADR 0035), gated by the Steward's enablement, so the manifest declares no consumed Ports.
 #[test]
-fn fixed_harness_declaration_matches_its_historical_fixture() {
+fn no_consumed_ports_are_declared_and_package_ports_negotiates_two() {
     let manifest = manifest();
-    let declared: Vec<Consumed> = manifest["consumedPorts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|contract| {
-            (
-                contract["identity"].as_str().unwrap().to_owned(),
-                contract["major"].as_u64().unwrap(),
-                contract["minMinor"].as_u64().unwrap(),
-                contract["maxMinor"].as_u64().unwrap(),
-                contract["ports"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|port| {
-                        (
-                            port["name"].as_str().unwrap().to_owned(),
-                            port["kind"].as_str().unwrap().to_owned(),
-                        )
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
-    let kind = |kind: PortKind| match kind {
-        PortKind::Command => "command",
-        PortKind::Query => "query",
-        PortKind::Event => "event",
-    };
-    let bundled: Vec<Consumed> = BundledCatalog::get()
-        .contracts()
-        .iter()
-        .filter(|contract| contract.identity == support::CONVERSATIONS)
-        .map(|contract| {
-            (
-                contract.identity.clone(),
-                u64::from(contract.major),
-                u64::from(contract.minor),
-                u64::from(contract.minor),
-                contract
-                    .ports
-                    .iter()
-                    .map(|port| (port.name.clone(), kind(port.kind).to_owned()))
-                    .collect(),
-            )
-        })
-        .collect();
-    // Only the built-in harness keeps a fixed dependency, with all five original ports.
-    let sorted = |mut contracts: Vec<Consumed>| {
-        for contract in &mut contracts {
-            contract.4.sort();
-        }
-        contracts.sort();
-        contracts
-    };
-    assert_eq!(sorted(declared), sorted(bundled));
-}
-
-#[test]
-fn fixed_consumed_ports_are_only_for_conversations_and_package_ports_negotiates_two() {
-    let manifest = manifest();
-    let required: Vec<(&str, bool)> = manifest["consumedPorts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|contract| {
-            (
-                contract["identity"].as_str().unwrap(),
-                contract["required"].as_bool().unwrap_or(true),
-            )
-        })
-        .collect();
-    assert_eq!(required, [("dev.teamarness.conversations", true)]);
+    assert!(manifest.get("consumedPorts").is_none());
     let ports = manifest["capabilities"]
         .as_array()
         .unwrap()

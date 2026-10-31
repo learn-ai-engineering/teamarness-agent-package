@@ -2736,13 +2736,7 @@ async fn host_unknown_metadata_becomes_a_major_pinned_tool_with_complete_schema_
     assert!(chunks.iter().all(|call| call.payload["access"] == "agent"));
     let manifest: Value =
         serde_json::from_str(include_str!("../../teamarness.package.json")).unwrap();
-    assert!(
-        manifest["consumedPorts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|contract| contract["identity"] != support::UNKNOWN)
-    );
+    assert!(manifest.get("consumedPorts").is_none());
     assert!(conversations.posts().is_empty());
     fixture.harness.shutdown().await.unwrap();
 }

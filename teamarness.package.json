@@ -57,21 +57,6 @@
       "maxMinor": 0
     }
   ],
-  "consumedPorts": [
-    {
-      "identity": "dev.teamarness.conversations",
-      "major": 1,
-      "minMinor": 2,
-      "maxMinor": 2,
-      "ports": [
-        { "name": "message.post", "kind": "command" },
-        { "name": "message.page", "kind": "query" },
-        { "name": "message.changes", "kind": "query" },
-        { "name": "channel.list", "kind": "query" },
-        { "name": "messages.changed", "kind": "event" }
-      ]
-    }
-  ],
   "extensions": {
     "dev.teamarness.build": {
       "generatedFields": [

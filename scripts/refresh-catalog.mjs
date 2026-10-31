@@ -5,8 +5,7 @@
 //
 // Each Provider's `ports.json` is copied byte for byte, and `provenance.json` records the
 // checkout's revision, whether it had local changes, and the SHA-256 of every copied file.
-// `npm run check:catalog` recomputes those digests. After a refresh, update the manifest's
-// `consumedPorts` to match; `manifest_and_catalog_agree` fails until they do.
+// `npm run check:catalog` recomputes those digests.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
