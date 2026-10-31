@@ -1936,6 +1936,62 @@ fn last_message(body: &Value) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_refuses_an_oversized_file_put_before_it_reaches_the_host() {
+    let data = tempfile::tempdir().unwrap();
+    let stub = StubEndpoint::start().await;
+    let roster = Roster::new();
+    let conversations = FakeConversations::new();
+    let mut fixture = start(data.path(), &roster, &conversations).await;
+    let harness = &mut fixture.harness;
+    harness.activate().await.unwrap();
+    configure(harness, &stub).await;
+    set_exhibits(harness, true).await;
+
+    // A put larger than the whole production message bound.
+    let arguments = json!({
+        "exhibitId": "e1",
+        "path": "index.html",
+        "chunk": "A".repeat(128 * 1024),
+    })
+    .to_string();
+    stub.push(Behaviour::ToolCalls(vec![call(
+        "call-1",
+        "exhibits__file_put",
+        &arguments,
+    )]));
+    stub.push(Behaviour::Reply(
+        "That file is too large for one turn.".into(),
+    ));
+    let answered = chat(harness, "make a big page").await;
+    assert_eq!(answered.get("lastError"), None, "{answered}");
+    assert_eq!(
+        answered["entries"][1],
+        json!({
+            "id": 2, "role": "assistant", "content": "That file is too large for one turn.",
+            "activity": [{
+                "package": "exhibits", "port": "file.put", "ok": false,
+                "code": "agent.tool_arguments_too_large",
+            }],
+        })
+    );
+    // Nothing reached the Host.
+    assert!(conversations.exhibits_calls().is_empty());
+
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1].body["messages"].as_array().unwrap();
+    assert_eq!(
+        messages[2]["tool_calls"][0]["function"]["arguments"],
+        r#"{"elided":"agent.tool_arguments_too_large"}"#
+    );
+    let result: Value = serde_json::from_str(messages[3]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(result["error"], "agent.tool_arguments_too_large");
+    assert_eq!(result["retryable"], false);
+    assert_eq!(result["argumentBytes"], arguments.len());
+    assert!(result["remainingBytes"].as_u64().unwrap() < 96 * 1024);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chat_uses_an_enabled_package_and_records_activity() {
     let data = tempfile::tempdir().unwrap();
     let stub = StubEndpoint::start().await;
@@ -1985,8 +2041,16 @@ async fn chat_uses_an_enabled_package_and_records_activity() {
             .all(|name| !name.starts_with("conversations__")),
         "{tools:?}"
     );
-    assert!(!tools.contains(&"exhibits__file_read".to_owned()));
-    assert!(!tools.contains(&"exhibits__file_put".to_owned()));
+    // File transfer is offered; the harness alone posts replies.
+    assert!(
+        tools.contains(&"exhibits__file_read".to_owned()),
+        "{tools:?}"
+    );
+    assert!(
+        tools.contains(&"exhibits__file_put".to_owned()),
+        "{tools:?}"
+    );
+    assert!(!tools.contains(&"conversations__message_post".to_owned()));
     let system = requests[0].body["messages"][0]["content"].as_str().unwrap();
     assert!(system.contains("`exhibits__runtime_guide`"), "{system}");
     assert!(system.contains("- teamarness-packages: "), "{system}");

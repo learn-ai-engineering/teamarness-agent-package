@@ -11,7 +11,9 @@
 //! activity of the tool calls that ran before it ended.
 //!
 //! The message bound covers only what a turn adds to its starting messages. The system message
-//! and history are sent whatever their size, as they were before tools existed.
+//! and history are sent whatever their size, as they were before tools existed. A tool call whose
+//! arguments would carry the turn past that bound is refused before it runs, so a call never
+//! takes effect only for the turn to fail on its size afterwards.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -32,6 +34,15 @@ pub const TOOL_ARGUMENTS_INVALID: &str = "agent.tool_arguments_invalid";
 pub const TOOL_OUTCOME_UNKNOWN: &str = "agent.tool_outcome_unknown";
 /// The model named a tool that is unknown or not usable now.
 pub const TOOL_UNAVAILABLE: &str = "agent.tool_unavailable";
+/// A tool call's arguments would carry the turn past its message bound; never dispatched.
+pub const TOOL_ARGUMENTS_TOO_LARGE: &str = "agent.tool_arguments_too_large";
+
+/// What a refused call's arguments become in the turn's messages, so later model calls stay
+/// inside the message bound.
+const ELIDED_ARGUMENTS: &str = r#"{"elided":"agent.tool_arguments_too_large"}"#;
+/// The share of `message_bytes` held back for each call's result when a batch's arguments are
+/// measured: 1/128, which is 768 bytes under the production bounds.
+const RESULT_RESERVE_SHARE: usize = 128;
 
 /// The limits of one turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +102,12 @@ pub enum Step<'a> {
     CallModel(&'a [ChatMessage]),
     /// Run this call; answer with [`Turn::tool_finished`].
     RunTool(ToolCall),
+    /// Do not run this call: the turn refused it with `code`. Answer with [`Turn::tool_refused`]
+    /// and the activity the call records.
+    RefuseTool {
+        call: ToolCall,
+        code: &'static str,
+    },
     Done(TurnResult),
     /// The turn ended with this code and retryability, keeping the activity of every tool call
     /// that ran before it ended.
@@ -132,6 +149,8 @@ enum Phase {
     NeedModel,
     AwaitingModel,
     AwaitingTool(ToolCall),
+    /// A call refused before it ran, and the result the model reads instead.
+    Refusing(ToolCall, String),
     Done(TurnResult),
     Failed(&'static str, bool),
 }
@@ -145,7 +164,8 @@ pub struct Turn {
     bounds: TurnBounds,
     model_calls: usize,
     tool_calls: usize,
-    pending: VecDeque<ToolCall>,
+    /// The batch's calls still to answer, each with the refusal it gets instead of running.
+    pending: VecDeque<(ToolCall, Option<String>)>,
     activity: Vec<Activity>,
     phase: Phase,
 }
@@ -197,6 +217,10 @@ impl Turn {
         match &self.phase {
             Phase::NeedModel | Phase::AwaitingModel => Step::CallModel(&self.messages),
             Phase::AwaitingTool(call) => Step::RunTool(call.clone()),
+            Phase::Refusing(call, _) => Step::RefuseTool {
+                call: call.clone(),
+                code: TOOL_ARGUMENTS_TOO_LARGE,
+            },
             Phase::Done(result) => Step::Done(result.clone()),
             Phase::Failed(code, retryable) => Step::Failed {
                 code,
@@ -237,12 +261,62 @@ impl Turn {
             return;
         }
         self.tool_calls += assistant.tool_calls.len();
-        self.pending = assistant.tool_calls.iter().cloned().collect();
+        let mut tool_calls = assistant.tool_calls;
+        let refusals = self.refuse_oversized(assistant.content.as_ref(), &mut tool_calls);
+        self.pending = tool_calls.iter().cloned().zip(refusals).collect();
         self.messages.push(ChatMessage::assistant_tool_calls(
             assistant.content,
-            assistant.tool_calls,
+            tool_calls,
         ));
         self.advance();
+    }
+
+    /// Refuses, in model order, each call whose arguments would carry the turn's own messages
+    /// past `message_bytes`, holding back a share of the bound for every call's result. A refused
+    /// call's arguments are elided in place; the returned list has its refusal at its position.
+    fn refuse_oversized(
+        &self,
+        content: Option<&String>,
+        calls: &mut [ToolCall],
+    ) -> Vec<Option<String>> {
+        let used = message_bytes(&self.messages).saturating_sub(self.baseline);
+        // The batch as stored with every argument elided, plus the comma that joins it.
+        let elided: Vec<ToolCall> = calls
+            .iter()
+            .map(|call| ToolCall {
+                arguments: ELIDED_ARGUMENTS.into(),
+                ..call.clone()
+            })
+            .collect();
+        let batch = message_bytes(&[ChatMessage::assistant_tool_calls(content.cloned(), elided)])
+            .saturating_sub(1);
+        let reserve = calls
+            .len()
+            .saturating_mul(self.bounds.message_bytes / RESULT_RESERVE_SHARE);
+        let mut remaining = self
+            .bounds
+            .message_bytes
+            .saturating_sub(used.saturating_add(batch).saturating_add(reserve));
+        let elided_size = json_string_bytes(ELIDED_ARGUMENTS);
+        calls
+            .iter_mut()
+            .map(|call| {
+                let extra = json_string_bytes(&call.arguments).saturating_sub(elided_size);
+                if extra <= remaining {
+                    remaining -= extra;
+                    return None;
+                }
+                let refusal = serde_json::json!({
+                    "error": TOOL_ARGUMENTS_TOO_LARGE,
+                    "retryable": false,
+                    "argumentBytes": call.arguments.len(),
+                    "remainingBytes": remaining,
+                })
+                .to_string();
+                call.arguments = ELIDED_ARGUMENTS.into();
+                Some(refusal)
+            })
+            .collect()
     }
 
     /// Records the result of the call [`Step::RunTool`] named. Ignored unless the turn is
@@ -268,10 +342,26 @@ impl Turn {
         self.advance();
     }
 
+    /// Records the refusal [`Step::RefuseTool`] named, with the `activity` the call records.
+    /// Ignored unless the turn is refusing a call.
+    pub fn tool_refused(&mut self, activity: Option<Activity>) {
+        if !matches!(self.phase, Phase::Refusing(..)) {
+            return;
+        }
+        let Phase::Refusing(call, content) = std::mem::replace(&mut self.phase, Phase::NeedModel)
+        else {
+            return;
+        };
+        self.messages.push(ChatMessage::tool(call.id, content));
+        self.activity.extend(activity);
+        self.advance();
+    }
+
     /// The next pending call, or another model call once the batch is done.
     fn advance(&mut self) {
         self.phase = match self.pending.pop_front() {
-            Some(call) => Phase::AwaitingTool(call),
+            Some((call, None)) => Phase::AwaitingTool(call),
+            Some((call, Some(refusal))) => Phase::Refusing(call, refusal),
             None => Phase::NeedModel,
         };
     }
@@ -289,6 +379,11 @@ impl Turn {
 fn message_bytes(messages: &[ChatMessage]) -> usize {
     // A message list that cannot be serialized cannot be sent either.
     serde_json::to_vec(messages).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The bytes `text` takes as a JSON string, quotes and escapes included.
+fn json_string_bytes(text: &str) -> usize {
+    serde_json::to_vec(text).map_or(usize::MAX, |bytes| bytes.len())
 }
 
 /// The model a turn calls.
@@ -311,6 +406,10 @@ pub trait ToolExecutor {
         call: &ToolCall,
         cancel: &CancellationToken,
     ) -> impl Future<Output = ToolOutcome> + Send;
+
+    /// The activity `call` records when the turn refused it with `code` without running it;
+    /// `None` when it names no tool offered here.
+    fn refused(&self, call: &ToolCall, code: &str) -> Option<Activity>;
 }
 
 /// Runs `turn` to its end under `cancel` and the turn's deadline.
@@ -339,6 +438,9 @@ pub async fn drive<M: Model, E: ToolExecutor>(
                 Step::RunTool(call) => {
                     let outcome = executor.run(&call, cancel).await;
                     turn.tool_finished(outcome);
+                }
+                Step::RefuseTool { call, code } => {
+                    turn.tool_refused(executor.refused(&call, code));
                 }
                 Step::Done(result) => return TurnOutcome::Done(result),
                 Step::Failed {
@@ -469,6 +571,10 @@ mod tests {
                 cancel.cancel();
             }
             (self.outcome)(call)
+        }
+
+        fn refused(&self, call: &ToolCall, code: &str) -> Option<Activity> {
+            Some(activity(&call.name, false, Some(code)))
         }
     }
 
@@ -814,6 +920,198 @@ mod tests {
         let outcome = run(&model, &tools, bounds).await;
         assert!(matches!(outcome, TurnOutcome::Done(_)), "{outcome:?}");
         assert_eq!(model.requests().len(), 2);
+    }
+
+    fn call_with(id: &str, name: &str, arguments: String) -> ToolCall {
+        ToolCall {
+            arguments,
+            ..call(id, name)
+        }
+    }
+
+    fn refusal_of(message: &ChatMessage) -> serde_json::Value {
+        let ChatMessage::Tool { content, .. } = message else {
+            panic!("not a tool result: {message:?}");
+        };
+        serde_json::from_str(content).unwrap()
+    }
+
+    /// What `messages` adds to the turn's two starting messages, as the bound counts it.
+    fn added_bytes(messages: &[ChatMessage]) -> usize {
+        message_bytes(messages) - message_bytes(&messages[..2])
+    }
+
+    /// The `remainingBytes` a refusal of one oversized `t__a` call reports under `bounds`.
+    async fn remaining_for_one_call(bounds: TurnBounds) -> usize {
+        let model = FakeModel::new(vec![
+            calls(vec![call_with("c1", "t__a", "x".repeat(1 << 20))]),
+            text("done"),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        assert!(matches!(
+            run(&model, &tools, bounds).await,
+            TurnOutcome::Done(_)
+        ));
+        let remaining = refusal_of(&model.requests()[1][3])["remainingBytes"].clone();
+        usize::try_from(remaining.as_u64().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_arguments_are_refused_and_the_turn_continues() {
+        let bounds = TurnBounds {
+            message_bytes: 4096,
+            ..TurnBounds::PRODUCTION
+        };
+        let big = "x".repeat(5000);
+        let model = FakeModel::new(vec![
+            calls(vec![call_with("c1", "t__a", big.clone())]),
+            text("That file is too large for one turn."),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let outcome = run(&model, &tools, bounds).await;
+        // Never dispatched, recorded as a failed call, and the model answers.
+        assert!(tools.names().is_empty());
+        assert_eq!(
+            outcome,
+            TurnOutcome::Done(TurnResult {
+                text: "That file is too large for one turn.".into(),
+                activity: vec![activity("t__a", false, Some(TOOL_ARGUMENTS_TOO_LARGE))],
+            })
+        );
+        let refusal = refusal_of(&model.requests()[1][3]);
+        assert_eq!(refusal["error"], TOOL_ARGUMENTS_TOO_LARGE);
+        assert_eq!(refusal["retryable"], false);
+        assert_eq!(refusal["argumentBytes"], 5000);
+        assert!(refusal["remainingBytes"].as_u64().unwrap() < 4096);
+        assert_eq!(
+            refusal.as_object().unwrap().len(),
+            4,
+            "{refusal}: only the code, retryability and the two sizes"
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_arguments_are_elided_so_the_next_request_fits() {
+        let bounds = TurnBounds {
+            message_bytes: 4096,
+            ..TurnBounds::PRODUCTION
+        };
+        let model = FakeModel::new(vec![
+            calls(vec![call_with("c1", "t__a", "x".repeat(50_000))]),
+            calls(vec![call("c2", "t__b")]),
+            text("done"),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let outcome = run(&model, &tools, bounds).await;
+        assert!(matches!(outcome, TurnOutcome::Done(_)), "{outcome:?}");
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1][2],
+            ChatMessage::assistant_tool_calls(
+                None,
+                vec![call_with("c1", "t__a", ELIDED_ARGUMENTS.into())]
+            )
+        );
+        for request in &requests[1..] {
+            assert!(added_bytes(request) <= bounds.message_bytes);
+        }
+        // A later call in the same turn still runs.
+        assert_eq!(tools.names(), ["t__b"]);
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_runs_the_calls_that_fit() {
+        let bounds = TurnBounds {
+            message_bytes: 4096,
+            ..TurnBounds::PRODUCTION
+        };
+        let small = r#"{"path":"index.html"}"#.to_owned();
+        let model = FakeModel::new(vec![
+            calls(vec![
+                call_with("c1", "t__a", small.clone()),
+                call_with("c2", "t__b", "x".repeat(8000)),
+                call_with("c3", "t__a", small.clone()),
+            ]),
+            text("done"),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let outcome = run(&model, &tools, bounds).await;
+        assert_eq!(
+            outcome,
+            TurnOutcome::Done(TurnResult {
+                text: "done".into(),
+                activity: vec![
+                    activity("t__a", true, None),
+                    activity("t__b", false, Some(TOOL_ARGUMENTS_TOO_LARGE)),
+                    activity("t__a", true, None),
+                ],
+            })
+        );
+        let ran = tools.calls.lock().unwrap().clone();
+        assert_eq!(
+            ran,
+            [
+                call_with("c1", "t__a", small.clone()),
+                call_with("c3", "t__a", small)
+            ]
+        );
+        let second = &model.requests()[1];
+        assert_eq!(second[3], ChatMessage::tool("c1".into(), "{}".into()));
+        assert_eq!(refusal_of(&second[4])["error"], TOOL_ARGUMENTS_TOO_LARGE);
+        assert_eq!(second[5], ChatMessage::tool("c3".into(), "{}".into()));
+    }
+
+    #[tokio::test]
+    async fn fitting_arguments_are_unaffected() {
+        let arguments = format!(r#"{{"content":"{}"}}"#, "y".repeat(2000));
+        let model = FakeModel::new(vec![
+            calls(vec![call_with("c1", "t__a", arguments.clone())]),
+            text("done"),
+        ]);
+        let tools = FakeTools::new(ok_result("{}"));
+        let outcome = run(&model, &tools, TurnBounds::PRODUCTION).await;
+        assert!(matches!(outcome, TurnOutcome::Done(_)), "{outcome:?}");
+        assert_eq!(
+            *tools.calls.lock().unwrap(),
+            [call_with("c1", "t__a", arguments.clone())]
+        );
+        assert_eq!(
+            model.requests()[1][2],
+            ChatMessage::assistant_tool_calls(None, vec![call_with("c1", "t__a", arguments)])
+        );
+    }
+
+    #[tokio::test]
+    async fn argument_budget_follows_the_bounds() {
+        let small = TurnBounds {
+            message_bytes: 16_384,
+            ..TurnBounds::PRODUCTION
+        };
+        let large = TurnBounds {
+            message_bytes: 32_768,
+            ..TurnBounds::PRODUCTION
+        };
+        let remaining = remaining_for_one_call(small).await;
+        // The extra 16,384 bytes of bound less the extra 1/128 reserved for the call's result.
+        assert_eq!(
+            remaining_for_one_call(large).await,
+            remaining + 16_384 - 16_384 / 128
+        );
+
+        // Exactly the remaining budget runs; one byte more is refused.
+        let elided = json_string_bytes(ELIDED_ARGUMENTS);
+        for (extra, runs) in [(0, true), (1, false)] {
+            let arguments = "x".repeat(remaining + elided - 2 + extra);
+            let model = FakeModel::new(vec![
+                calls(vec![call_with("c1", "t__a", arguments)]),
+                text("done"),
+            ]);
+            let tools = FakeTools::new(ok_result("{}"));
+            let outcome = run(&model, &tools, small).await;
+            assert!(matches!(outcome, TurnOutcome::Done(_)), "{outcome:?}");
+            assert_eq!(tools.names().len(), usize::from(runs), "extra {extra}");
+        }
     }
 
     #[tokio::test]

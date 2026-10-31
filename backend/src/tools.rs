@@ -517,6 +517,10 @@ impl<P: PortCaller> ToolExecutor for PortTools<P> {
         &self.definitions
     }
 
+    fn refused(&self, call: &ToolCall, code: &str) -> Option<Activity> {
+        self.tools.get(&call.name)?.activity(Some(code))
+    }
+
     async fn run(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolOutcome {
         let Some(tool) = self.tools.get(&call.name) else {
             return ToolOutcome {
@@ -689,6 +693,18 @@ impl<P: PortCaller> ToolExecutor for Toolset<P> {
         }
         // Not offered, it is an unknown name to the port tools too.
         self.ports.run(call, cancel).await
+    }
+
+    fn refused(&self, call: &ToolCall, code: &str) -> Option<Activity> {
+        if call.name == SKILL_READ && !self.skills.is_empty() {
+            return Some(Activity {
+                package: AGENT_PACKAGE.into(),
+                port: SKILL_READ.into(),
+                ok: false,
+                code: Some(code.to_owned()),
+            });
+        }
+        self.ports.refused(call, code)
     }
 }
 
@@ -1483,6 +1499,23 @@ mod tests {
             .iter()
             .map(|definition| definition.name.clone())
             .collect()
+    }
+
+    #[test]
+    fn a_refused_call_records_its_tool_activity() {
+        let ports = FakePorts::ok();
+        let tools = Toolset::for_turn(&usable(&[EXHIBITS]), ports.clone(), &skills()).unwrap();
+        let code = crate::turn::TOOL_ARGUMENTS_TOO_LARGE;
+        assert_eq!(
+            tools.refused(&call("exhibits__file_put", "{}"), code),
+            activity("file.put", Some(code))
+        );
+        assert_eq!(
+            tools.refused(&call(SKILL_READ, "{}"), code),
+            skill_activity(Some(code))
+        );
+        assert_eq!(tools.refused(&call("unknown__tool", "{}"), code), None);
+        assert!(ports.calls().is_empty());
     }
 
     #[tokio::test]

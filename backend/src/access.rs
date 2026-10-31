@@ -16,13 +16,10 @@ use crate::tools::UsableContract;
 
 /// Ports never offered to the model, as `(contract, port)`.
 ///
-/// The harness posts replies itself. Exhibits file transfer waits for blob references: a full
-/// chunk is larger than one tool result or a turn's message bound can carry.
-pub const WITHHELD: [(&str, &str); 3] = [
-    ("dev.teamarness.conversations", "message.post"),
-    ("dev.teamarness.exhibits", "file.read"),
-    ("dev.teamarness.exhibits", "file.put"),
-];
+/// The harness posts replies itself. Exhibits file transfer is offered: the turn refuses a call
+/// whose arguments would cross its message bound before it runs, and an oversized result reaches
+/// the model as a coded error (`crate::turn`).
+pub const WITHHELD: [(&str, &str); 1] = [("dev.teamarness.conversations", "message.post")];
 
 /// The contracts the Host reports available, by identity and major.
 #[cfg(test)]
@@ -373,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn file_transfer_ports_are_withheld() {
+    fn file_transfer_ports_are_offered() {
         const EXHIBITS: &str = "dev.teamarness.exhibits";
         let catalog = BundledCatalog::get();
         let bundled: Vec<&str> = catalog
@@ -393,10 +390,8 @@ mod tests {
             .iter()
             .map(|port| port.name.as_str())
             .collect();
-        assert!(!ports.contains(&"file.read"), "{ports:?}");
-        assert!(!ports.contains(&"file.put"), "{ports:?}");
-        // Everything else Exhibits declares is still offered.
-        assert_eq!(ports.len(), bundled.len() - 2);
+        // Everything Exhibits declares is offered, file transfer included.
+        assert_eq!(ports, bundled);
         assert!(ports.contains(&GUIDE_PORT));
     }
 
