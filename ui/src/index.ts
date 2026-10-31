@@ -348,6 +348,8 @@ const AGENT_CSS = `
   :host { color: var(--teamarness-color-text); font-family: var(--teamarness-font-body); }
   .agent-page { width: max(75%, min(100%, 40rem)); margin-inline: auto; }
   .agent-page > * + * { margin-top: 1.5rem; }
+  /* The Shell sizes the settings frame to its About column, so the view fills it unpadded. */
+  .agent-page[data-view="settings"] { width: 100%; padding: 0 0 clamp(1.25rem, 4vw, 3rem); }
   .agent-settings { display: grid; }
   .agent-group { display: grid; grid-template-columns: minmax(10rem, 1fr) minmax(0, 2.2fr); gap: 1rem 3rem; padding-block: 2rem; border-top: 1px solid var(--teamarness-color-border); }
   .agent-group:first-child { border-top: 0; padding-top: .5rem; }
@@ -488,18 +490,11 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
   page.className = "teamarness-page agent-page";
   // The chat fills the pane so only its transcript scrolls; configuration scrolls as a page.
   page.dataset.view = context.view;
-  const header = document.createElement("header");
-  header.className = "teamarness-page-header";
-  const title = document.createElement("h1");
-  title.className = "teamarness-page-title";
-  title.textContent = context.package.displayName;
-  const subtitle = document.createElement("p");
-  subtitle.className = "teamarness-page-subtitle";
-  subtitle.textContent = "Run one of your Workspace Agents against an OpenAI-compatible endpoint.";
-  header.append(title, subtitle);
-
   const view = context.view === "settings" ? configurationView(context) : chatView();
-  page.append(header, view.element);
+  // The Package page already names the Package above its tabs, so the settings view starts
+  // with its first section, laid out like the page's About tab.
+  if (context.view === "main") page.append(pageHeader(context));
+  page.append(view.element);
   context.root.append(page);
 
   const controller = createAgentController(context.client, view.render, context.view);
@@ -517,6 +512,19 @@ export async function mount(context: PackageMountContext): Promise<PackageUnmoun
     cleanupStyles();
     cleanupKit();
   };
+}
+
+function pageHeader(context: PackageMountContext): HTMLElement {
+  const header = document.createElement("header");
+  header.className = "teamarness-page-header";
+  const title = document.createElement("h1");
+  title.className = "teamarness-page-title";
+  title.textContent = context.package.displayName;
+  const subtitle = document.createElement("p");
+  subtitle.className = "teamarness-page-subtitle";
+  subtitle.textContent = "Run one of your Workspace Agents against an OpenAI-compatible endpoint.";
+  header.append(title, subtitle);
+  return header;
 }
 
 /** The settings view: status, Agent binding, model endpoint, API key and Packages. */

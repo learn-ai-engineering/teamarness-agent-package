@@ -353,7 +353,7 @@ describe("Agent Package UI mount", () => {
 
     const unmount = await mount(context);
     expect(root.querySelectorAll("form.agent-settings")).toHaveLength(1);
-    expect(root.querySelector("h1")?.textContent).toBe("Agent");
+    expect(root.querySelector("h1")).toBeNull();
     expect(root.querySelector('[data-role="status"]')?.textContent).toBe(
       "Not configured: add the endpoint, model and API key.",
     );
@@ -412,6 +412,7 @@ describe("Agent Package UI views and chat", () => {
     const { fake, root, cleanup } = await mounted();
     expect(root.querySelector('[role="tab"], [role="tablist"]')).toBeNull();
     expect(root.querySelector("article.agent-page")?.getAttribute("data-view")).toBe("main");
+    expect(root.querySelector("header.teamarness-page-header h1")?.textContent).toBe("Test Package");
     expect(root.querySelector('section.agent-chat textarea[name="chatMessage"]')).not.toBeNull();
     expect(root.querySelector("form.agent-settings")).toBeNull();
     for (const name of ["agent", "endpointBaseUrl", "model", "apiKey"]) {
@@ -428,6 +429,9 @@ describe("Agent Package UI views and chat", () => {
     const { fake, root, cleanup } = await mounted(undefined, "settings");
     expect(root.querySelector('[role="tab"], [role="tablist"]')).toBeNull();
     expect(root.querySelector("article.agent-page")?.getAttribute("data-view")).toBe("settings");
+    // The Package page names the Package above its tabs; the view starts with its first section.
+    expect(root.querySelector(".teamarness-page-header, h1")).toBeNull();
+    expect(root.querySelector("form.agent-settings > .agent-group:first-child h2")?.textContent).toBe("Status");
     expect(root.querySelector("form.agent-settings")).not.toBeNull();
     expect(root.querySelector('select[name="agent"]')).not.toBeNull();
     expect(root.querySelector('input[name="apiKey"]')).not.toBeNull();
