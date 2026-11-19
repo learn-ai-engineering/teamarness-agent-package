@@ -166,6 +166,20 @@ test("refuses when the targeted Backend is missing, even beside an untargeted bu
   }
 });
 
+test("reports why cargo metadata could not run, and leaves the previous output unchanged", async () => {
+  const root = await fixtureRoot();
+  try {
+    await writeFile(builtBackend(root, MAC), "#!/bin/sh\nexit 0\n");
+    const output = await previousOutput(root);
+    const before = await snapshot(output);
+    const env = { ...withoutCargoTarget(), PATH: "/nonexistent" };
+    await assert.rejects(assemblePackage({ projectRoot: root, env, target: MAC, native: MAC }), /^Error: cargo metadata failed: .*ENOENT/);
+    assert.deepEqual(await snapshot(output), before);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 const refusals = [
   { name: "a requested target that is not native", options: { target: MAC, native: LINUX }, code: "target.not_native" },
   { name: "an unsupported native target", options: { native: "x86_64-apple-darwin" }, code: "target.unsupported" },

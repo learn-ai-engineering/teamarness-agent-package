@@ -44,8 +44,7 @@ export function nativeTarget({ env = process.env, cwd } = {}) {
   const rustc = env.RUSTC || "rustc";
   const result = spawnSync(rustc, ["-vV"], { cwd, env, encoding: "utf8", shell: false });
   if (result.error || result.status !== 0) {
-    const reason = result.error ? result.error.message : `status ${result.status ?? "unknown"}`;
-    throw new TargetError("target.native_unknown", `could not run ${rustc} -vV: ${reason}`);
+    throw new TargetError("target.native_unknown", `could not run ${rustc} -vV: ${failureReason(result)}`);
   }
   return parseHostTarget(result.stdout);
 }
@@ -67,6 +66,13 @@ export function selectTarget({ requested, native }) {
     );
   }
   return target;
+}
+
+/** Why a `spawnSync` child failed: its spawn error, the signal that ended it, or its status. */
+export function failureReason(result) {
+  if (result.error) return result.error.message;
+  if (result.signal) return `signal ${result.signal}`;
+  return `status ${result.status ?? "unknown"}`;
 }
 
 /** Exit status for a script failure: 2 for a target refusal or usage error, 1 otherwise. */

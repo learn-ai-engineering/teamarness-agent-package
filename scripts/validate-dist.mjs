@@ -12,7 +12,7 @@ import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { exitCodeFor, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
+import { exitCodeFor, failureReason, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
@@ -41,9 +41,9 @@ try {
     ],
     { cwd: projectRoot, stdio: "inherit" },
   );
-  if (result.error) throw result.error;
-  // A validator killed by a signal has no status; that is a failure, not a target refusal.
-  process.exitCode = result.status ?? 1;
+  // A validator that could not start or was killed has no status: a failure, not a target refusal.
+  if (result.error || result.status === null) throw new Error(`validator failed: ${failureReason(result)}`);
+  process.exitCode = result.status;
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
   process.exitCode = exitCodeFor(error);

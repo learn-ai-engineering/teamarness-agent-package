@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { nativeTarget, parseHostTarget, parseTargetArgs, selectTarget, supportedTargets } from "./targets.mjs";
+import { failureReason, nativeTarget, parseHostTarget, parseTargetArgs, selectTarget, supportedTargets } from "./targets.mjs";
 
 const MAC = "aarch64-apple-darwin";
 const LINUX = "x86_64-unknown-linux-gnu";
@@ -123,4 +123,11 @@ test("reports why rustc could not run", () => {
     assert.match(error.message, /\/nonexistent\/rustc -vV: .*ENOENT/);
     return true;
   });
+});
+
+test("describes why a child process failed", () => {
+  assert.equal(failureReason({ error: new Error("spawnSync cargo ENOENT"), status: null, signal: null }), "spawnSync cargo ENOENT");
+  assert.equal(failureReason({ status: null, signal: "SIGKILL" }), "signal SIGKILL");
+  assert.equal(failureReason({ status: 101, signal: null }), "status 101");
+  assert.equal(failureReason({ status: null, signal: null }), "status unknown");
 });

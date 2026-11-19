@@ -4,13 +4,13 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { TargetError, nativeTarget, selectTarget } from "./targets.mjs";
+import { TargetError, failureReason, nativeTarget, selectTarget } from "./targets.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
- * Assembles the Package Directory for one native target. `scripts/build-package.mjs` and the
- * tests import it; it has no command line of its own.
+ * Assembles the Package Directory for one native target. `scripts/build-package.mjs` and
+ * `scripts/assemble-package.test.mjs` import it; it has no command line of its own.
  *
  * The source manifest declares one placeholder Backend per supported target. The assembled
  * manifest declares only the selected target's Backend, so it never claims an artifact it does
@@ -66,10 +66,7 @@ function cargoTargetDirectory(projectRoot, env) {
     maxBuffer: 16 * 1024 * 1024,
     shell: false,
   });
-  if (result.error || result.status !== 0) {
-    const reason = result.error ? result.error.message : `status ${result.status ?? "unknown"}`;
-    throw new Error(`cargo metadata failed: ${reason}`);
-  }
+  if (result.error || result.status !== 0) throw new Error(`cargo metadata failed: ${failureReason(result)}`);
   return JSON.parse(result.stdout).target_directory;
 }
 

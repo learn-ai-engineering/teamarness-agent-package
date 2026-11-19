@@ -14,15 +14,14 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { assemblePackage } from "./assemble-package.mjs";
-import { exitCodeFor, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
+import { exitCodeFor, failureReason, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
 function run(command, args) {
   const result = spawnSync(command, args, { cwd: projectRoot, stdio: "inherit", shell: false });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`${command} ${args.join(" ")} failed with status ${result.status ?? "unknown"}`);
+  if (result.error || result.status !== 0) {
+    throw new Error(`${command} ${args.join(" ")} failed: ${failureReason(result)}`);
   }
 }
 
