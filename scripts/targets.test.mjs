@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { supportedTargets, parseHostTarget, selectTarget } from "./targets.mjs";
+import { parseHostTarget, parseTargetArgs, selectTarget, supportedTargets } from "./targets.mjs";
 
 const MAC = "aarch64-apple-darwin";
 const LINUX = "x86_64-unknown-linux-gnu";
@@ -51,5 +52,34 @@ test("refuses unsupported, malformed, and empty targets", () => {
   }
   for (const requested of ["", " ", "x86_64", `${LINUX} `, "X86_64-UNKNOWN-LINUX-GNU", "../x86_64-unknown-linux-gnu"]) {
     assert.throws(() => selectTarget({ requested, native: LINUX }), { code: "target.unsupported" }, JSON.stringify(requested));
+  }
+});
+
+test("accepts no arguments or exactly --target <triple>", () => {
+  assert.equal(parseTargetArgs([]), undefined);
+  assert.equal(parseTargetArgs(["--target", LINUX]), LINUX);
+});
+
+test("refuses every other argument shape as a usage error", () => {
+  for (const argv of [
+    ["--target"],
+    [`--target=${LINUX}`],
+    ["--target", LINUX, "--target", MAC],
+    ["--target", LINUX, "extra"],
+    [LINUX],
+    ["--release"],
+    ["--target", ""],
+  ]) {
+    assert.throws(() => parseTargetArgs(argv), { code: "target.usage" }, JSON.stringify(argv));
+  }
+});
+
+test("the source manifest declares one placeholder Backend per supported target", async () => {
+  const manifest = JSON.parse(await readFile(new URL("../teamarness.package.json", import.meta.url), "utf8"));
+  assert.deepEqual(manifest.backends.map((artifact) => artifact.target), [...supportedTargets]);
+  for (const artifact of manifest.backends) {
+    assert.ok(artifact.path.endsWith(`-${artifact.target}`), artifact.path);
+    assert.equal(artifact.size, 0, artifact.target);
+    assert.equal(artifact.sha256, "0".repeat(64), artifact.target);
   }
 });

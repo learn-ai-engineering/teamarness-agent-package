@@ -4,7 +4,9 @@
 //   npm run build                      # the native target
 //   npm run build -- --target <triple> # the same, refusing any other target
 //
-// The target is checked before Cargo runs or dist/ is touched.
+// The target is checked before Cargo runs or dist/ is touched. Cargo builds with an explicit
+// `--target`, so a `CARGO_BUILD_TARGET` or `build.target` setting cannot leave a stale binary
+// where the assembler reads.
 
 import { spawnSync } from "node:child_process";
 import { dirname } from "node:path";
@@ -12,15 +14,9 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 import { assemblePackage } from "./assemble-package.mjs";
-import { nativeTarget, selectTarget } from "./targets.mjs";
+import { exitCodeFor, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-
-function requestedTarget(argv) {
-  if (argv.length === 0) return undefined;
-  if (argv.length === 2 && argv[0] === "--target") return argv[1];
-  throw new Error(`usage: npm run build [-- --target <triple>]; got ${JSON.stringify(argv)}`);
-}
 
 function run(command, args) {
   const result = spawnSync(command, args, { cwd: projectRoot, stdio: "inherit", shell: false });
@@ -31,14 +27,15 @@ function run(command, args) {
 }
 
 try {
+  const requested = parseTargetArgs(process.argv.slice(2));
   const native = nativeTarget();
-  const target = selectTarget({ requested: requestedTarget(process.argv.slice(2)), native });
+  const target = selectTarget({ requested, native });
   process.stdout.write(`Building dev.teamarness.agent for ${target}\n`);
-  run("cargo", ["build", "--release", "--locked"]);
+  run("cargo", ["build", "--release", "--locked", "--target", target]);
   run("npm", ["--workspace", "@teamarness/agent-package-ui", "run", "build"]);
   await assemblePackage({ projectRoot, target, native });
   run("node", ["scripts/validate-dist.mjs", "--target", target]);
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
-  process.exitCode = error.code?.startsWith("target.") ? 2 : 1;
+  process.exitCode = exitCodeFor(error);
 }

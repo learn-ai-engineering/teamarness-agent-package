@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 
 export const supportedTargets = Object.freeze(["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]);
 
+/** A refusal with a stable `target.*` code; scripts exit 2 for it. */
 export class TargetError extends Error {
   constructor(code, message) {
     super(`${code}: ${message}`);
@@ -15,7 +16,14 @@ export class TargetError extends Error {
   }
 }
 
-/// The `host:` triple from `rustc -vV` output.
+/** The requested target from a script's arguments: none, or exactly `--target <triple>`. */
+export function parseTargetArgs(argv) {
+  if (argv.length === 0) return undefined;
+  if (argv.length === 2 && argv[0] === "--target" && argv[1] !== "") return argv[1];
+  throw new TargetError("target.usage", `expected no arguments or --target <triple>; got ${JSON.stringify(argv)}`);
+}
+
+/** The `host:` triple from `rustc -vV` output. */
 export function parseHostTarget(output) {
   const hosts = String(output)
     .split(/\r?\n/)
@@ -27,16 +35,17 @@ export function parseHostTarget(output) {
   return hosts[0];
 }
 
-/// The target this machine's Rust toolchain builds by default.
+/** The host triple of the compiler Cargo uses: `$RUSTC` when set, otherwise `rustc`. */
 export function nativeTarget({ env = process.env } = {}) {
-  const result = spawnSync("rustc", ["-vV"], { env, encoding: "utf8", shell: false });
+  const rustc = env.RUSTC || "rustc";
+  const result = spawnSync(rustc, ["-vV"], { env, encoding: "utf8", shell: false });
   if (result.error || result.status !== 0) {
-    throw new TargetError("target.native_unknown", `rustc -vV failed with status ${result.status ?? "unknown"}`);
+    throw new TargetError("target.native_unknown", `${rustc} -vV failed with status ${result.status ?? "unknown"}`);
   }
   return parseHostTarget(result.stdout);
 }
 
-/// The target to build: the native one, which a request may only confirm.
+/** The target to build: the native one, which a request may only confirm. */
 export function selectTarget({ requested, native }) {
   const target = requested ?? native;
   if (!supportedTargets.includes(target)) {
@@ -52,4 +61,9 @@ export function selectTarget({ requested, native }) {
     );
   }
   return target;
+}
+
+/** Exit status for a script failure: 2 for a target refusal or usage error, 1 otherwise. */
+export function exitCodeFor(error) {
+  return error instanceof TargetError ? 2 : 1;
 }

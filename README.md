@@ -22,7 +22,7 @@ npm ci
 npm run build
 ```
 
-The build is native only. It builds for the target that `rustc -vV` reports as its host, and the Package Directory declares only that target's Backend. `npm run build -- --target <triple>` confirms the target: it refuses any other target before it runs Cargo or changes `dist/`. Cross-compilation is not supported, so build each target on its own machine.
+The build is native only. It builds for the target that `rustc -vV` reports as its host, and the Package Directory declares only that target's Backend. `npm run build -- --target <triple>` confirms the target: it refuses any other target, or any other argument, with exit status 2 before it runs Cargo or changes `dist/`. Cargo always builds with that explicit `--target`, and the Package takes the Backend from `target/<triple>/release/`, so a Cargo `build.target` setting cannot leave a stale binary in its place. Cross-compilation is not supported, so build each target on its own machine.
 
 Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies historical Provider fixtures; both run as part of `npm test`.
 

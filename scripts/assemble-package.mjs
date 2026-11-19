@@ -4,29 +4,35 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { TargetError, nativeTarget, selectTarget } from "./targets.mjs";
+import { TargetError, exitCodeFor, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const root = dirname(dirname(scriptPath));
 
-/// Assembles the Package Directory for one native target.
-///
-/// The source manifest declares one placeholder Backend per supported target. The assembled
-/// manifest declares only the selected target's Backend, so it never claims an artifact it does
-/// not ship. Every refusal happens before the previous output is removed.
+/**
+ * Assembles the Package Directory for one native target.
+ *
+ * The source manifest declares one placeholder Backend per supported target. The assembled
+ * manifest declares only the selected target's Backend, so it never claims an artifact it does
+ * not ship. The Backend is read from Cargo's `--target <triple>` output, never from an untargeted
+ * build that may be stale. Every refusal happens before the previous output is removed.
+ */
 export async function assemblePackage({ projectRoot = root, env = process.env, target, native } = {}) {
   const selected = selectTarget({ requested: target, native: native ?? nativeTarget({ env }) });
   const manifestFile = join(projectRoot, "teamarness.package.json");
   const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
   const declared = manifest.backends.filter((artifact) => artifact.target === selected);
-  if (declared.length !== 1) {
+  if (declared.length === 0) {
+    throw new TargetError("target.not_declared", `teamarness.package.json declares no Backend for ${selected}`);
+  }
+  if (declared.length > 1) {
     throw new TargetError(
-      "target.not_declared",
-      `teamarness.package.json must declare exactly one Backend for ${selected}, found ${declared.length}`,
+      "target.declared_twice",
+      `teamarness.package.json declares ${declared.length} Backends for ${selected}; it must declare exactly one`,
     );
   }
   manifest.backends = declared;
-  const backendSource = join(cargoTargetDirectory(projectRoot, env), "release/teamarness-agent-package");
+  const backendSource = join(cargoTargetDirectory(projectRoot, env), selected, "release/teamarness-agent-package");
   const uiSource = join(projectRoot, "ui/dist/index.js");
   const contractSource = join(projectRoot, "ui-contract.json");
   const destination = join(projectRoot, "dist", manifest.identity);
@@ -51,7 +57,7 @@ export async function assemblePackage({ projectRoot = root, env = process.env, t
   return destination;
 }
 
-// Ask Cargo so CARGO_TARGET_DIR and build.target-dir are honoured.
+/** Asks Cargo, so `CARGO_TARGET_DIR` and `build.target-dir` are honoured. */
 function cargoTargetDirectory(projectRoot, env) {
   const result = spawnSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
     cwd: projectRoot,
@@ -69,6 +75,10 @@ function digest(bytes) {
 }
 
 if (process.argv[1] === scriptPath) {
-  const flag = process.argv.indexOf("--target");
-  await assemblePackage({ target: flag === -1 ? undefined : process.argv[flag + 1] });
+  try {
+    await assemblePackage({ target: parseTargetArgs(process.argv.slice(2)) });
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    process.exitCode = exitCodeFor(error);
+  }
 }
