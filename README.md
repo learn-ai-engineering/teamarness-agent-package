@@ -15,6 +15,8 @@ Supported Backend targets:
 
 On Linux, also install a C toolchain (`build-essential` on Ubuntu), which the `ring` TLS dependency needs to compile. The Backend reads the system CA certificates (`ca-certificates`) when it connects to an HTTPS model endpoint.
 
+The two Backends ship slightly different third-party Rust crates, all permissively licensed. The Linux Backend adds `linux-raw-sys` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT), `openssl-probe` (MIT OR Apache-2.0) and `rustls-native-certs` (Apache-2.0 OR ISC OR MIT). The macOS Backend instead includes `core-foundation`, `core-foundation-sys`, `security-framework` and `security-framework-sys` (all MIT OR Apache-2.0). To see the full set for a target, run `cargo tree -p teamarness-agent-package -e normal --target <triple>`.
+
 ```sh
 npm ci
 npm run build
