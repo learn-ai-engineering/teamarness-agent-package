@@ -35,12 +35,16 @@ export function parseHostTarget(output) {
   return hosts[0];
 }
 
-/** The host triple of the compiler Cargo uses: `$RUSTC` when set, otherwise `rustc`. */
-export function nativeTarget({ env = process.env } = {}) {
+/**
+ * The host triple of the compiler Cargo uses: `$RUSTC` when set, otherwise `rustc`, run in `cwd`
+ * so that a rustup directory override or toolchain file resolves as it does for Cargo.
+ */
+export function nativeTarget({ env = process.env, cwd } = {}) {
   const rustc = env.RUSTC || "rustc";
-  const result = spawnSync(rustc, ["-vV"], { env, encoding: "utf8", shell: false });
+  const result = spawnSync(rustc, ["-vV"], { cwd, env, encoding: "utf8", shell: false });
   if (result.error || result.status !== 0) {
-    throw new TargetError("target.native_unknown", `${rustc} -vV failed with status ${result.status ?? "unknown"}`);
+    const reason = result.error ? result.error.message : `status ${result.status ?? "unknown"}`;
+    throw new TargetError("target.native_unknown", `could not run ${rustc} -vV: ${reason}`);
   }
   return parseHostTarget(result.stdout);
 }
@@ -49,9 +53,10 @@ export function nativeTarget({ env = process.env } = {}) {
 export function selectTarget({ requested, native }) {
   const target = requested ?? native;
   if (!supportedTargets.includes(target)) {
+    const machine = requested === undefined ? "" : `; this machine builds ${native}`;
     throw new TargetError(
       "target.unsupported",
-      `${JSON.stringify(target)} is not a supported Backend target (supported: ${supportedTargets.join(", ")})`,
+      `${JSON.stringify(target)} is not a supported Backend target (supported: ${supportedTargets.join(", ")})${machine}`,
     );
   }
   if (target !== native) {

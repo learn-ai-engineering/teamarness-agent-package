@@ -15,39 +15,35 @@ import { fileURLToPath } from "node:url";
 import { exitCodeFor, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const manifest = JSON.parse(await readFile(join(projectRoot, "teamarness.package.json"), "utf8"));
 
-let target;
 try {
-  target = selectTarget({ requested: parseTargetArgs(process.argv.slice(2)), native: nativeTarget() });
+  const manifest = JSON.parse(await readFile(join(projectRoot, "teamarness.package.json"), "utf8"));
+  const target = selectTarget({
+    requested: parseTargetArgs(process.argv.slice(2)),
+    native: nativeTarget({ cwd: projectRoot }),
+  });
+  const result = spawnSync(
+    "cargo",
+    [
+      "run",
+      "--quiet",
+      "--locked",
+      "-p",
+      "teamarness-package-contract",
+      "--bin",
+      "teamarness-package-validate",
+      "--",
+      "directory",
+      join("dist", manifest.identity),
+      "--target",
+      target,
+      "--smoke",
+    ],
+    { cwd: projectRoot, stdio: "inherit" },
+  );
+  if (result.error) throw result.error;
+  process.exitCode = result.status ?? 2;
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
-  process.exit(exitCodeFor(error));
-}
-
-const result = spawnSync(
-  "cargo",
-  [
-    "run",
-    "--quiet",
-    "--locked",
-    "-p",
-    "teamarness-package-contract",
-    "--bin",
-    "teamarness-package-validate",
-    "--",
-    "directory",
-    join("dist", manifest.identity),
-    "--target",
-    target,
-    "--smoke",
-  ],
-  { cwd: projectRoot, stdio: "inherit" },
-);
-
-if (result.error) {
-  process.stderr.write(`${result.error.message}\n`);
-  process.exitCode = 2;
-} else {
-  process.exitCode = result.status ?? 2;
+  process.exitCode = exitCodeFor(error);
 }

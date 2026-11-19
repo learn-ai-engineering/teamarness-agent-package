@@ -28,7 +28,7 @@ function run(command, args) {
 
 try {
   const requested = parseTargetArgs(process.argv.slice(2));
-  const native = nativeTarget();
+  const native = nativeTarget({ cwd: projectRoot });
   const target = selectTarget({ requested, native });
   process.stdout.write(`Building dev.teamarness.agent for ${target}\n`);
   run("cargo", ["build", "--release", "--locked", "--target", target]);

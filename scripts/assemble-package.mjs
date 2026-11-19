@@ -4,13 +4,13 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { TargetError, exitCodeFor, nativeTarget, parseTargetArgs, selectTarget } from "./targets.mjs";
+import { TargetError, nativeTarget, selectTarget } from "./targets.mjs";
 
-const scriptPath = fileURLToPath(import.meta.url);
-const root = dirname(dirname(scriptPath));
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
- * Assembles the Package Directory for one native target.
+ * Assembles the Package Directory for one native target. `scripts/build-package.mjs` is its only
+ * caller; there is no separate command line.
  *
  * The source manifest declares one placeholder Backend per supported target. The assembled
  * manifest declares only the selected target's Backend, so it never claims an artifact it does
@@ -18,7 +18,7 @@ const root = dirname(dirname(scriptPath));
  * build that may be stale. Every refusal happens before the previous output is removed.
  */
 export async function assemblePackage({ projectRoot = root, env = process.env, target, native } = {}) {
-  const selected = selectTarget({ requested: target, native: native ?? nativeTarget({ env }) });
+  const selected = selectTarget({ requested: target, native: native ?? nativeTarget({ env, cwd: projectRoot }) });
   const manifestFile = join(projectRoot, "teamarness.package.json");
   const manifest = JSON.parse(await readFile(manifestFile, "utf8"));
   const declared = manifest.backends.filter((artifact) => artifact.target === selected);
@@ -72,13 +72,4 @@ function cargoTargetDirectory(projectRoot, env) {
 
 function digest(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-if (process.argv[1] === scriptPath) {
-  try {
-    await assemblePackage({ target: parseTargetArgs(process.argv.slice(2)) });
-  } catch (error) {
-    process.stderr.write(`${error.message}\n`);
-    process.exitCode = exitCodeFor(error);
-  }
 }

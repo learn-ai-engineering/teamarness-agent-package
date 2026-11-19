@@ -153,11 +153,14 @@ test("reads the targeted Backend from a custom CARGO_TARGET_DIR", async () => {
   }
 });
 
-test("refuses to assemble when the targeted Backend is missing, even beside an untargeted build", async () => {
+test("refuses when the targeted Backend is missing, even beside an untargeted build, and leaves the previous output unchanged", async () => {
   const root = await fixtureRoot();
   try {
     await writeFile(join(root, "target/release/teamarness-agent-package"), "stale untargeted build");
+    const output = await previousOutput(root);
+    const before = await snapshot(output);
     await assert.rejects(assemblePackage({ projectRoot: root, env: withoutCargoTarget(), target: MAC, native: MAC }), /ENOENT/);
+    assert.deepEqual(await snapshot(output), before);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

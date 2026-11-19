@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-import { parseHostTarget, parseTargetArgs, selectTarget, supportedTargets } from "./targets.mjs";
+import { nativeTarget, parseHostTarget, parseTargetArgs, selectTarget, supportedTargets } from "./targets.mjs";
 
 const MAC = "aarch64-apple-darwin";
 const LINUX = "x86_64-unknown-linux-gnu";
@@ -82,4 +84,43 @@ test("the source manifest declares one placeholder Backend per supported target"
     assert.equal(artifact.size, 0, artifact.target);
     assert.equal(artifact.sha256, "0".repeat(64), artifact.target);
   }
+});
+
+test("an unsupported requested target names this machine's target", () => {
+  assert.throws(() => selectTarget({ requested: "x86_64", native: LINUX }), (error) => {
+    assert.equal(error.code, "target.unsupported");
+    assert.match(error.message, new RegExp(`this machine builds ${LINUX}$`));
+    return true;
+  });
+  assert.throws(() => selectTarget({ native: "x86_64-apple-darwin" }), (error) => {
+    assert.doesNotMatch(error.message, /this machine builds/);
+    return true;
+  });
+});
+
+test("reads the host triple from $RUSTC run in the given directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "teamarness-native-test-"));
+  try {
+    const stub = join(root, "fake-rustc");
+    // The stub answers with the triple stored in its working directory, so the result proves both
+    // that $RUSTC was used and that it ran in `cwd`.
+    await writeFile(stub, "#!/bin/sh\nprintf 'rustc 1.0.0\\nhost: %s\\n' \"$(cat host.txt)\"\n");
+    await chmod(stub, 0o755);
+    for (const triple of [MAC, LINUX]) {
+      const directory = join(root, triple);
+      await mkdir(directory);
+      await writeFile(join(directory, "host.txt"), triple);
+      assert.equal(nativeTarget({ env: { ...process.env, RUSTC: stub }, cwd: directory }), triple);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reports why rustc could not run", () => {
+  assert.throws(() => nativeTarget({ env: { ...process.env, RUSTC: "/nonexistent/rustc" } }), (error) => {
+    assert.equal(error.code, "target.native_unknown");
+    assert.match(error.message, /\/nonexistent\/rustc -vV: .*ENOENT/);
+    return true;
+  });
 });
