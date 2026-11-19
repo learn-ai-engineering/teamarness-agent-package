@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { SUPPORTED_TARGETS, parseHostTarget, selectTarget } from "./targets.mjs";
+import { supportedTargets, parseHostTarget, selectTarget } from "./targets.mjs";
 
 const MAC = "aarch64-apple-darwin";
 const LINUX = "x86_64-unknown-linux-gnu";
 
 test("supports exactly the two native Backend targets", () => {
-  assert.deepEqual([...SUPPORTED_TARGETS], [MAC, LINUX]);
-  assert.ok(Object.isFrozen(SUPPORTED_TARGETS));
+  assert.deepEqual([...supportedTargets], [MAC, LINUX]);
+  assert.ok(Object.isFrozen(supportedTargets));
 });
 
 test("reads the host triple from rustc -vV", () => {

@@ -174,7 +174,7 @@ If you add UI assets, another Backend, or another target platform, update all of
 
 - `teamarness.package.json`;
 - `scripts/assemble-package.mjs`;
-- `scripts/targets.mjs` (`SUPPORTED_TARGETS`), for another target platform;
+- `scripts/targets.mjs` (`supportedTargets`), for another target platform;
 - build dependencies and commands; and
 - tests that verify final paths, permissions, sizes, and digests.
 

@@ -5,7 +5,7 @@
 
 import { spawnSync } from "node:child_process";
 
-export const SUPPORTED_TARGETS = Object.freeze(["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]);
+export const supportedTargets = Object.freeze(["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]);
 
 export class TargetError extends Error {
   constructor(code, message) {
@@ -39,10 +39,10 @@ export function nativeTarget({ env = process.env } = {}) {
 /// The target to build: the native one, which a request may only confirm.
 export function selectTarget({ requested, native }) {
   const target = requested ?? native;
-  if (!SUPPORTED_TARGETS.includes(target)) {
+  if (!supportedTargets.includes(target)) {
     throw new TargetError(
       "target.unsupported",
-      `${JSON.stringify(target)} is not a supported Backend target (supported: ${SUPPORTED_TARGETS.join(", ")})`,
+      `${JSON.stringify(target)} is not a supported Backend target (supported: ${supportedTargets.join(", ")})`,
     );
   }
   if (target !== native) {
