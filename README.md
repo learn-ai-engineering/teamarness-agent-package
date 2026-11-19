@@ -4,12 +4,23 @@ Runs a stewarded Workspace Agent against an OpenAI-compatible completion endpoin
 
 ## Build
 
-Requires Node/npm, Rust 1.96 and macOS arm64. SDK, protocol and admission-validator source are vendored; no Teamarness checkout is needed to build.
+Requires Node/npm and Rust 1.96 or later. SDK, protocol and admission-validator source are vendored; no Teamarness checkout is needed to build.
+
+Supported Backend targets:
+
+| Machine | Target |
+|---|---|
+| macOS on Apple Silicon | `aarch64-apple-darwin` |
+| Linux on x86_64 with glibc (qualified on Ubuntu 26.04) | `x86_64-unknown-linux-gnu` |
+
+On Linux, also install a C toolchain (`build-essential` on Ubuntu), which the `ring` TLS dependency needs to compile. The Backend reads the system CA certificates (`ca-certificates`) when it connects to an HTTPS model endpoint.
 
 ```sh
 npm ci
 npm run build
 ```
+
+The build is native only. It builds for the target that `rustc -vV` reports as its host, and the Package Directory declares only that target's Backend. `npm run build -- --target <triple>` confirms the target: it refuses any other target before it runs Cargo or changes `dist/`. Cross-compilation is not supported, so build each target on its own machine.
 
 Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies historical Provider fixtures; both run as part of `npm test`.
 

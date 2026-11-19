@@ -33,7 +33,7 @@ Package UI
 
 `ui-contract.json` defines the requests that may cross this path. Treat it as the shared boundary between the UI and Backend. Change the contract before implementing a new request on either side.
 
-The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It also acts on Documents Comments that mention it and replies under them through Documents 1.3 Ports (`backend/src/comments.rs`), with the same mention, exactly-once and post-once rules. It declares workspace-context, principals, agent-binding and package-ports 2.0 capabilities. It declares no consumed Ports: the reply harness's Conversations and Documents Comment calls and every model tool use dynamic Agent access, gated by the Steward's enablement (ADR 0035). It also offers the Steward a direct, in-memory chat with the configured model in its main UI view; configuration is in the `settings` view (`ui.views`) that the Package page shows as **Configuration**. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It targets `aarch64-apple-darwin`. Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
+The Agent configures an OpenAI-compatible model endpoint and replies to addressed Workspace Messages through Conversations 1.2 Ports. It also acts on Documents Comments that mention it and replies under them through Documents 1.3 Ports (`backend/src/comments.rs`), with the same mention, exactly-once and post-once rules. It declares workspace-context, principals, agent-binding and package-ports 2.0 capabilities. It declares no consumed Ports: the reply harness's Conversations and Documents Comment calls and every model tool use dynamic Agent access, gated by the Steward's enablement (ADR 0035). It also offers the Steward a direct, in-memory chat with the configured model in its main UI view; configuration is in the `settings` view (`ui.views`) that the Package page shows as **Configuration**. It has one Backend, one ESM UI entrypoint, a UI contract with status and chat subscriptions, and no UI assets. It supports `aarch64-apple-darwin` and `x86_64-unknown-linux-gnu`. The source manifest declares a placeholder Backend for each, and a native-only build assembles a Package Directory that declares only the target it built (`scripts/targets.mjs`). Personal registration changes distribution, not Workspace authority or data scope. Read README.md for setup and unresolved findings.
 
 Chat and reply turns can call tools of Host-enabled Packages through package-ports 2.0. `backend/src/turn.rs` bounds the model/tool loop; `access::usable_now` obtains complete Host metadata for available selections pinned to the offered major. Discovery uses the existing Catalog seam and canonical SDK page/chunk/hash/schema checks. Tool preparation preflights one shared 16,384-value-visit/1 MiB allocation-work allowance across all tools, including repeated expansion, both parameter copies and per-tool original validator inputs. Excess ends the turn with nonretryable `agent.tool_unavailable` before model/Port dispatch, without partial tools or identity uncertainty. The byte allowance is not a peak-RSS guarantee. Events and streaming queries remain distinct and are not ordinary model tools. A turn snapshot is not a grant: every call/subscription uses explicit Agent access and contract major, and the Host authorizes dispatch.
 
@@ -64,8 +64,10 @@ The Steward changes Host-owned selections in Configuration's Packages section. E
 | `ui/src/markdown.ts` | The chat's sanitized Markdown renderer, copied from the Conversations Package UI. Packages share no code, so keep it a copy. |
 | `ui/src/contract.generated.ts` | Generated request and response types. Regenerate it; never edit it. |
 | `ui/src/index.test.ts` | Exercises UI behavior with the UI SDK's fake Package client. |
-| `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes into `dist/`. |
-| `scripts/validate-dist.mjs` | Applies Package Admission's rules to `dist/` and smoke-launches the Backend. |
+| `scripts/build-package.mjs` | Runs `npm run build`: selects the native target, then builds, assembles and validates it. |
+| `scripts/targets.mjs` | Lists the supported Backend targets, reads the native target from `rustc -vV`, and refuses a non-native or unsupported target. |
+| `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes for one native target into `dist/`. |
+| `scripts/validate-dist.mjs` | Applies Package Admission's rules to `dist/` for the native target and smoke-launches the Backend. |
 | `scripts/verify-vendor.mjs` | Fails when a vendored SDK file no longer matches recorded provenance. |
 | `scripts/verify-catalog.mjs` | Fails when a bundled catalog file no longer matches `backend/catalog/provenance.json` (`npm run check:catalog`). |
 | `scripts/refresh-catalog.mjs` | Copies Provider `ports.json` files from a Teamarness checkout and rewrites catalog provenance. |
@@ -172,6 +174,7 @@ If you add UI assets, another Backend, or another target platform, update all of
 
 - `teamarness.package.json`;
 - `scripts/assemble-package.mjs`;
+- `scripts/targets.mjs` (`SUPPORTED_TARGETS`), for another target platform;
 - build dependencies and commands; and
 - tests that verify final paths, permissions, sizes, and digests.
 

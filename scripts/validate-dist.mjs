@@ -2,7 +2,9 @@
 // Applies Package Admission's rules to the assembled Package Directory, and smoke-launches it.
 //
 // This is the same verdict the Package Host reaches when it admits the Package, so a build that
-// passes here is one Teamarness will accept.
+// passes here is one Teamarness will accept. It validates against this machine's native target,
+// or against `--target <triple>` when that is the native one. The validator's own default target
+// is never relied on.
 
 import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
@@ -10,8 +12,22 @@ import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { nativeTarget, selectTarget } from "./targets.mjs";
+
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const manifest = JSON.parse(await readFile(join(projectRoot, "teamarness.package.json"), "utf8"));
+
+let target;
+try {
+  const argv = process.argv.slice(2);
+  if (argv.length !== 0 && !(argv.length === 2 && argv[0] === "--target")) {
+    throw new Error(`usage: node scripts/validate-dist.mjs [--target <triple>]; got ${JSON.stringify(argv)}`);
+  }
+  target = selectTarget({ requested: argv[1], native: nativeTarget() });
+} catch (error) {
+  process.stderr.write(`${error.message}\n`);
+  process.exit(2);
+}
 
 const result = spawnSync(
   "cargo",
@@ -26,6 +42,8 @@ const result = spawnSync(
     "--",
     "directory",
     join("dist", manifest.identity),
+    "--target",
+    target,
     "--smoke",
   ],
   { cwd: projectRoot, stdio: "inherit" },
