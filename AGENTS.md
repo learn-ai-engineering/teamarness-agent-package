@@ -66,7 +66,7 @@ The Steward changes Host-owned selections in Configuration's Packages section. E
 | `ui/src/index.test.ts` | Exercises UI behavior with the UI SDK's fake Package client. |
 | `scripts/build-package.mjs` | Runs `npm run build`: selects the native target, then builds, assembles and validates it. |
 | `scripts/targets.mjs` | Lists the supported Backend targets, parses the shared `--target <triple>` argument, reads the native target from `rustc -vV` (or `$RUSTC`), and refuses a non-native or unsupported target. |
-| `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes for one native target into `dist/`. Called only by `build-package.mjs`. |
+| `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes for one native target into `dist/`. Imported by `build-package.mjs` and its tests; it has no command line of its own. |
 | `scripts/validate-dist.mjs` | Applies Package Admission's rules to `dist/` for the native target and smoke-launches the Backend. |
 | `scripts/verify-vendor.mjs` | Fails when a vendored SDK file no longer matches recorded provenance. |
 | `scripts/verify-catalog.mjs` | Fails when a bundled catalog file no longer matches `backend/catalog/provenance.json` (`npm run check:catalog`). |

@@ -36,8 +36,9 @@ export function parseHostTarget(output) {
 }
 
 /**
- * The host triple of the compiler Cargo uses: `$RUSTC` when set, otherwise `rustc`, run in `cwd`
- * so that a rustup directory override or toolchain file resolves as it does for Cargo.
+ * The host triple of `$RUSTC` when set, otherwise of `rustc` on PATH, run in `cwd` so that a
+ * rustup directory override or toolchain file resolves as it does for Cargo. Cargo's
+ * `build.rustc` and `CARGO_BUILD_RUSTC` settings are not consulted.
  */
 export function nativeTarget({ env = process.env, cwd } = {}) {
   const rustc = env.RUSTC || "rustc";

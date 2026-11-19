@@ -104,12 +104,12 @@ test("reads the host triple from $RUSTC run in the given directory", async () =>
     const stub = join(root, "fake-rustc");
     // The stub answers with the triple stored in its working directory, so the result proves both
     // that $RUSTC was used and that it ran in `cwd`.
-    await writeFile(stub, "#!/bin/sh\nprintf 'rustc 1.0.0\\nhost: %s\\n' \"$(cat host.txt)\"\n");
+    await writeFile(stub, "#!/bin/sh\nIFS= read -r host < host.txt\nprintf 'rustc 1.0.0\\nhost: %s\\n' \"$host\"\n");
     await chmod(stub, 0o755);
     for (const triple of [MAC, LINUX]) {
       const directory = join(root, triple);
       await mkdir(directory);
-      await writeFile(join(directory, "host.txt"), triple);
+      await writeFile(join(directory, "host.txt"), `${triple}\n`);
       assert.equal(nativeTarget({ env: { ...process.env, RUSTC: stub }, cwd: directory }), triple);
     }
   } finally {

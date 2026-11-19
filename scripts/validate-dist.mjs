@@ -42,7 +42,8 @@ try {
     { cwd: projectRoot, stdio: "inherit" },
   );
   if (result.error) throw result.error;
-  process.exitCode = result.status ?? 2;
+  // A validator killed by a signal has no status; that is a failure, not a target refusal.
+  process.exitCode = result.status ?? 1;
 } catch (error) {
   process.stderr.write(`${error.message}\n`);
   process.exitCode = exitCodeFor(error);
