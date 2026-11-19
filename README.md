@@ -26,6 +26,10 @@ The build is native only. It builds for the target that `rustc -vV` reports as i
 
 Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies historical Provider fixtures; both run as part of `npm test`.
 
+## Run headless
+
+To configure the Agent on a headless Teamarness node, follow [Run the Agent on a headless Teamarness node](docs/headless-onboarding.md). It covers creating the Workspace Agent, installing with consent, setting the model and key, binding, enabling Packages, and verifying.
+
 ## Register and configure
 
 1. Start the desired Teamarness profile once, then stop it.
