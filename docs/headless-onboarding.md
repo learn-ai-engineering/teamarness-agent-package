@@ -107,7 +107,9 @@ The response names the bound Agent. Binding changes refuse while earlier command
 
 ## 6. Enable the Packages the Agent uses
 
-The Agent works only in the Packages you enable for it. List what the Host offers:
+The Agent works only in the Packages you enable for it. Bind the Agent (step 5) first. Without a binding, `agent.packages.get` and `agent.packages.set` fail with `agent.binding_required`, and nothing changes.
+
+List what the Host offers:
 
 ```sh
 printf '{}\n' | agent_request agent.packages.get -
