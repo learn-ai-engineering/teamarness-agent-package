@@ -15,6 +15,7 @@ const KEY = "sk-or-test-SECRET-4f9c1e";
 const MUTATIONS = ["packages install", "agent add", "agent.settings.set", "agent.key.set", "agent.binding.set", "agent.packages.set"];
 
 const offered = () => [
+  { available: true, contract: "dev.teamarness.backlog", enabled: false, enabledMajor: null, major: 1, name: "Backlog" },
   { available: true, contract: "dev.teamarness.conversations", enabled: false, enabledMajor: null, major: 1, name: "Conversations" },
   { available: true, contract: "dev.teamarness.documents", enabled: false, enabledMajor: null, major: 1, name: "Documents" },
   { available: true, contract: "dev.teamarness.exhibits", enabled: false, enabledMajor: null, major: 1, name: "Exhibits" },
@@ -257,6 +258,11 @@ test("--print-template writes a valid, private template and never overwrites", a
   assert.match(again.stderr, /already exists/);
   assert.equal(await readFile(path, "utf8"), template);
 
+  assert.deepEqual(JSON.parse(parsed.stdout).packages.enable, [
+    "dev.teamarness.backlog", "dev.teamarness.conversations", "dev.teamarness.documents", "dev.teamarness.exhibits",
+  ]);
+  assert.match(template, /^# Remove the Packages this Agent should not access\.$/m);
+
   const stdout = spawnSync("bash", [setup, "--print-template"], { encoding: "utf8" });
   assert.equal(stdout.stdout, template);
 });
@@ -268,4 +274,28 @@ test("an unfilled template is refused with exit 2", async () => {
   const result = spawnSync("bash", [setup, "--answers", path], { encoding: "utf8" });
   assert.equal(result.status, 2);
   assert.match(result.stdout, /^invalid: /m);
+});
+
+test("the template's full Package list enables every offered Package", async () => {
+  const f = await fixture({ answers: { packages: `enable = [\n  "dev.teamarness.backlog",\n  "dev.teamarness.conversations",\n  "dev.teamarness.documents",\n  "dev.teamarness.exhibits",\n]` } });
+  const result = run(f);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /^summary: 9 changed, 1 unchanged$/m);
+  assert.ok((await state(f)).packages.every((p) => p.enabled === true && p.enabledMajor === 1));
+});
+
+test("a listed Package that is missing or unavailable stops before any Package is enabled", async () => {
+  const packages = offered().filter((p) => p.contract !== "dev.teamarness.backlog");
+  packages.find((p) => p.contract === "dev.teamarness.exhibits").available = false;
+  const f = await fixture({
+    state: { packages },
+    answers: { packages: `enable = ["dev.teamarness.conversations", "dev.teamarness.backlog", "dev.teamarness.exhibits"]` },
+  });
+  const result = run(f);
+  assert.equal(result.code, 1, result.stdout);
+  assert.match(result.stdout, /^stopped: packages \(not installed in this Workspace: dev\.teamarness\.backlog; installed but not available now: dev\.teamarness\.exhibits\)\. No Package was enabled\. Remove them from \[packages\] enable, or install them, then rerun setup\. Inspect with: .*agent\.packages\.get/m);
+  assert.match(result.stdout, /^summary: \d+ changed, \d+ unchanged, stopped$/m);
+  assert.doesNotMatch(result.stdout, /^ready:/m);
+  assert.ok(!(await mutations(f)).includes("agent.packages.set"));
+  assert.ok((await state(f)).packages.every((p) => p.enabled === false));
 });

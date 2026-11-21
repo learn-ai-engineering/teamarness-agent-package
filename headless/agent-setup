@@ -81,8 +81,20 @@ context_messages = 20
 
 [packages]
 # Contracts the Agent may use, enabled at the major the Host offers.
-# Contracts not listed here are left as they are.
-enable = ["dev.teamarness.conversations", "dev.teamarness.documents"]
+# These are every Package the Agent can currently be enabled for.
+# Remove the Packages this Agent should not access.
+#   Backlog        Epics and Tickets: list, read, create and change Tickets
+#   Conversations  the Agent replies to Messages that mention it
+#   Documents      the Agent replies to Comments that mention it, and can edit Documents
+#   Exhibits       the Agent can author Exhibits (static websites)
+# Every listed Package must be installed in this Workspace, or setup stops
+# before it enables any of them. Contracts not listed here are left as they are.
+enable = [
+  "dev.teamarness.backlog",
+  "dev.teamarness.conversations",
+  "dev.teamarness.documents",
+  "dev.teamarness.exhibits",
+]
 """
 
 TOP_KEYS = {"host_app", "host_data_dir", "package_dir", "accept_native_code_risks",
@@ -509,11 +521,19 @@ def ensure_packages(host, enable, report):
     if not enable:
         return
     offered = {p.get("contract"): p for p in host.get("agent.packages.get").get("packages") or []}
+    missing = [c for c in enable if c not in offered]
+    unavailable = [c for c in enable if c in offered and offered[c].get("available") is not True]
+    if missing or unavailable:
+        problems = []
+        if missing:
+            problems.append(f"not installed in this Workspace: {', '.join(missing)}")
+        if unavailable:
+            problems.append(f"installed but not available now: {', '.join(unavailable)}")
+        raise Stop(f"stopped: packages ({'; '.join(problems)}). No Package was enabled. "
+                   f"Remove them from [packages] enable, or install them, then rerun setup. "
+                   f"Inspect with: {host.inspect_command('agent.packages.get')}")
     for contract in enable:
-        entry = offered.get(contract)
-        if entry is None or entry.get("available") is not True:
-            raise Stop(f"stopped: the Host does not offer {contract} to the Agent. "
-                       f"Inspect with: {host.inspect_command('agent.packages.get')}")
+        entry = offered[contract]
         major = entry.get("major")
         if entry.get("enabled") is True and entry.get("enabledMajor") == major:
             report.line("unchanged", f"package {contract} {major}")

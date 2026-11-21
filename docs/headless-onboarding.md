@@ -69,7 +69,7 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    "$S" --print-template ~/agent-setup.toml
    ```
 
-2. Fill it in. Set `workspace_id` to the ID from `workspace list`, choose `agent_name`, set `[model]`, and list the contracts the Agent may use under `[packages]`. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets.
+2. Fill it in. Set `workspace_id` to the ID from `workspace list`, choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets.
 
 3. Put the API key in a private file. It holds only the key:
 
@@ -94,10 +94,12 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    changed: settings (endpointBaseUrl, model, systemPrompt)
    changed: api key (key file /home/you/agent-api-key deleted)
    changed: binding to Factory
+   changed: package dev.teamarness.backlog enabled at major 1
    changed: package dev.teamarness.conversations enabled at major 1
    changed: package dev.teamarness.documents enabled at major 1
+   changed: package dev.teamarness.exhibits enabled at major 1
    ready: agent Factory in Workspace aad43be122caa818738f763c373ba820
-   summary: 7 changed, 1 unchanged
+   summary: 9 changed, 1 unchanged
    ```
 
 5. Test it: from the desktop app in the same Workspace, mention the Agent in a Conversation, for example "@Factory, are you there?". Exactly one reply should arrive, authored by the Agent.
@@ -108,6 +110,7 @@ Setup uses these rules:
 
 - An Agent with exactly `agent_name` is reused. Otherwise setup creates it.
 - Contracts not listed under `[packages]` are left as they are. Setup never disables one.
+- Every Package listed under `[packages]` must be installed and available in the Workspace. Otherwise setup stops before it enables any of them and names each missing one. Remove it from the list, or install it, then rerun setup.
 - If a different Agent is already bound, setup stops and prints the unbind command. It does not rebind, because rebinding cancels the Agent's work.
 - If the Package is registered from a different directory, setup stops. It does not reinstall.
 - If a change's outcome is unknown, setup stops at once and prints `stopped: <step> outcome unknown — inspect with: <command>, then rerun setup`. It never retries. Run the inspect command, then rerun setup, which reads the state again and continues from there.
