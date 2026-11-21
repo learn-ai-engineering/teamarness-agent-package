@@ -6,7 +6,7 @@ This guide builds, installs and configures the Agent Package (`dev.teamarness.ag
 
 ## Prerequisite: a running headless Host
 
-You need a headless Teamarness Host that is installed, running, named and joined to a Workspace. Complete the Host's guide, "Install headless Teamarness on Linux" (`docs/headless/install-linux.md` in the Teamarness repository), through step 5, "Join the Workspace", first.
+You need a headless Teamarness Host that is installed, running, named and joined to a Workspace. Complete the Host's guide, "Install headless Teamarness on Linux" (`docs/headless/install-linux.md` in the Teamarness repository), first: run its setup with a Workspace Invitation, or join later with its "Join another Workspace" section.
 
 You also need:
 
@@ -47,7 +47,7 @@ rsync -a --delete /path/to/agent-package/dist/dev.teamarness.agent/ \
 rsync -a /path/to/agent-package/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
 ```
 
-From a separate build machine, use `target:.local/lib/teamarness-packages/…` as each destination instead. Every directory above the Package Directory must not be group- or other-writable. Step 1 of the Host's guide already removes that access from `~`, `~/.local` and `~/.local/lib`.
+From a separate build machine, use `target:.local/lib/teamarness-packages/…` as each destination instead. Every directory above the Package Directory must not be group- or other-writable. The Host's setup already removes that access from the directories you own above its install location, including `~/.local/lib`.
 
 To record what you installed, save the digests:
 
@@ -112,7 +112,13 @@ Setup uses these rules:
 
 ## Manual setup (reference)
 
-These are the steps that `agent-setup` performs, one request at a time. Use them to inspect state or when you can't run setup. They use the `tm` and `tm_req` helpers from step 3, "Define the shell helpers", of the Host's guide:
+These are the steps that `agent-setup` performs, one request at a time. Use them to inspect state or when you can't run setup. They use the `tm` and `tm_req` operator helpers that the Host's setup writes. Load them in each shell first:
+
+```sh
+source ~/.config/teamarness-headless/helpers.sh
+```
+
+The helpers are:
 
 - `tm …` runs the Host's operator client against its data directory.
 - `tm_req WORKSPACE PACKAGE OPERATION` sends one Package request. It reads the JSON request on stdin and looks up the current contract digest for you.
