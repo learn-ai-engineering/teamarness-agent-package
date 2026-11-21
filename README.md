@@ -28,7 +28,7 @@ Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests an
 
 ## Run headless
 
-To configure the Agent on a headless Teamarness node, follow [Run the Agent on a headless Teamarness node](docs/headless-onboarding.md). It covers creating the Workspace Agent, installing with consent, setting the model and key, binding, enabling Packages, and verifying.
+To run the Agent on a headless Teamarness Host, follow [Run the Agent on a headless Teamarness Host](docs/headless-onboarding.md). It covers building, copying and installing the Package once per machine, then, for each Workspace, creating the Agent, setting the model and key, binding, enabling Packages, verifying, and updating.
 
 ## Register and configure
 
