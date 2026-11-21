@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+# Sets up the Agent Package (dev.teamarness.agent) on a headless Teamarness Host from one
+# answers file. See docs/headless-onboarding.md.
+#
+#   agent-setup --print-template [<path>]   write a commented answers template
+#   agent-setup --answers <file>            apply it; safe to run again
+#   agent-setup --help
+#
+# The build ships this file as dist/agent-setup, beside dist/dev.teamarness.agent/. It needs
+# Bash and Python 3.11 or later. It drives only the Host's operator CLI and this Package's
+# declared requests. Exit codes: 0 ok, 1 operational failure or unknown outcome, 2 invalid
+# answers or input.
+set -euo pipefail
+
+IFS= read -r -d '' PROGRAM <<'PYTHON' || true
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+IDENTITY = "dev.teamarness.agent"
+CONSENT = {"acceptedRisks": ["filesystem", "network", "process"]}
+USAGE = """usage: agent-setup --print-template [<path>]
+       agent-setup --answers <file>
+       agent-setup --help
+
+Sets up the Agent Package (dev.teamarness.agent) in one Workspace of a running
+headless Teamarness Host. --print-template writes a commented answers file to
+stdout, or to <path>, which must not exist yet. Fill it in, then run
+--answers <file>. Setup reads the current state first and changes only what
+differs, so running it again with the same answers changes nothing.
+
+Exit codes: 0 ok, 1 operational failure or unknown outcome, 2 invalid answers.
+"""
+
+TEMPLATE = """\
+# Agent Package setup answers for agent-setup --answers <this file>.
+# Secrets never go in this file. The API key comes from key_file below.
+# Setup is safe to run again: it changes only what differs from these answers.
+
+# The headless Host. The defaults match the Host's install guide.
+host_app = "~/.local/lib/teamarness-headless/teamarness-headless"
+host_data_dir = "~/.local/share/teamarness-headless"
+
+# The copied Package Directory. Setup installs from it if the Host has not
+# registered the Agent Package yet. Setup does not copy or build it.
+package_dir = "~/.local/lib/teamarness-packages/dev.teamarness.agent"
+
+# Installing runs the Agent's Backend as native code with your account's
+# filesystem, network and process authority. It is not sandboxed. Set this to
+# true to accept those risks. Setup never installs while it is false.
+accept_native_code_risks = false
+
+# The Workspace to configure: its name as shown in the desktop app (or its
+# 32-character ID from `tm workspace list`, after
+# `source ~/.config/teamarness-headless/helpers.sh`). If several joined Workspaces
+# have this name, setup stops and lists their IDs; use one of those instead.
+# Run setup once per Workspace, each with its own answers file.
+workspace = ""
+
+# The Workspace Agent's name. People mention this name to get a reply. An
+# Agent with exactly this name is reused; otherwise setup creates it.
+agent_name = ""
+
+# The API key for the model endpoint. Either a path to a private file that
+# holds only the key (a regular file, not a symlink, owned by you, mode 0600),
+# or "-" to read it from stdin. Setup deletes the file after the key is saved.
+# On a later run, a missing file is fine once the key is set. To rotate the
+# key, write a new file and run setup again.
+key_file = "~/agent-api-key"
+
+[model]
+# An OpenAI-compatible endpoint base URL and model ID.
+endpoint_base_url = "https://openrouter.ai/api/v1"
+model = ""
+system_prompt = "You are a member of the team."
+# How many earlier Messages the Agent reads for context: 0-64.
+context_messages = 20
+
+[packages]
+# The Agent can use every tool in each Package listed here. Packages not
+# listed here are not available to this Agent: on every run, setup enables
+# exactly these, at the major the Host offers, and turns off any other
+# Package that is enabled for this Agent. Turning one off cancels the
+# Agent's work in it. This list is every Package the Agent can currently
+# be enabled for.
+# Remove the Packages this Agent should not access.
+#   Backlog        Epics and Tickets: list, read, create and change Tickets
+#   Conversations  the Agent replies to Messages that mention it
+#   Documents      the Agent replies to Comments that mention it, and can edit Documents
+#   Exhibits       the Agent can author Exhibits (static websites)
+# Every listed Package must be installed in this Workspace, or setup stops
+# before it changes any of them. An empty list turns every Package off.
+enable = [
+  "dev.teamarness.backlog",
+  "dev.teamarness.conversations",
+  "dev.teamarness.documents",
+  "dev.teamarness.exhibits",
+]
+"""
+
+TOP_KEYS = {"host_app", "host_data_dir", "package_dir", "accept_native_code_risks",
+            "workspace", "workspace_id", "agent_name", "key_file", "model", "packages"}
+MODEL_KEYS = {"endpoint_base_url", "model", "system_prompt", "context_messages"}
+PACKAGES_KEYS = {"enable"}
+
+
+class Invalid(Exception):
+    """Invalid answers or input: exit 2, nothing changed."""
+
+
+class Stop(Exception):
+    def __init__(self, line, code=1):
+        super().__init__(line)
+        self.line = line
+        self.code = code
+
+
+def fail_invalid(message):
+    raise Invalid(message)
+
+
+def text(table, key, where, *, max_length, required=True, default=None):
+    if key not in table:
+        if required:
+            fail_invalid(f"{where}{key} is required")
+        return default
+    value = table[key]
+    if not isinstance(value, str):
+        fail_invalid(f"{where}{key} must be a string")
+    if len(value) > max_length:
+        fail_invalid(f"{where}{key} is longer than {max_length} characters")
+    return value
+
+
+def path_answer(table, key, default):
+    value = text(table, key, "", max_length=4096, required=False, default=default)
+    if value == "":
+        fail_invalid(f"{key} must not be empty")
+    value = os.path.expanduser(value)
+    if not os.path.isabs(value):
+        fail_invalid(f"{key} must be an absolute path or start with ~")
+    return os.path.normpath(value)
+
+
+def load_answers(path):
+    import tomllib
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except FileNotFoundError:
+        fail_invalid(f"answers file not found: {path}")
+    except tomllib.TOMLDecodeError as error:
+        fail_invalid(f"answers file is not valid TOML: {error}")
+    except OSError as error:
+        fail_invalid(f"cannot read answers file: {error.strerror}")
+    unknown = sorted(set(data) - TOP_KEYS)
+    if unknown:
+        fail_invalid(f"unknown answers key: {', '.join(unknown)}")
+    answers = {}
+    answers["host_app"] = path_answer(data, "host_app", "~/.local/lib/teamarness-headless/teamarness-headless")
+    answers["host_data_dir"] = path_answer(data, "host_data_dir", "~/.local/share/teamarness-headless")
+    answers["package_dir"] = path_answer(data, "package_dir", "~/.local/lib/teamarness-packages/dev.teamarness.agent")
+    consent = data.get("accept_native_code_risks", False)
+    if not isinstance(consent, bool):
+        fail_invalid("accept_native_code_risks must be true or false")
+    answers["accept"] = consent
+    if ("workspace" in data) == ("workspace_id" in data):
+        fail_invalid("set exactly one of workspace (a name or ID) and workspace_id")
+    if "workspace_id" in data:
+        workspace = text(data, "workspace_id", "", max_length=32)
+        if not re.fullmatch(r"[0-9a-f]{32}", workspace):
+            fail_invalid("workspace_id must be the 32-character lowercase hex ID from `tm workspace list`; "
+                         "use workspace for a name")
+    else:
+        workspace = text(data, "workspace", "", max_length=256)
+        if workspace.strip() == "":
+            fail_invalid("workspace must be a Workspace name or ID")
+    answers["workspace"] = workspace
+    name = text(data, "agent_name", "", max_length=256)
+    if name.strip() == "":
+        fail_invalid("agent_name must not be empty")
+    answers["agent_name"] = name
+    key_file = text(data, "key_file", "", max_length=4096)
+    if key_file == "":
+        fail_invalid('key_file must be a path or "-"')
+    answers["key_file"] = key_file if key_file == "-" else os.path.normpath(os.path.expanduser(key_file))
+    if key_file != "-" and not os.path.isabs(answers["key_file"]):
+        fail_invalid("key_file must be an absolute path, start with ~, or be -")
+
+    model = data.get("model")
+    if not isinstance(model, dict):
+        fail_invalid("[model] is required")
+    unknown = sorted(set(model) - MODEL_KEYS)
+    if unknown:
+        fail_invalid(f"unknown answers key: model.{', model.'.join(unknown)}")
+    endpoint = text(model, "endpoint_base_url", "model.", max_length=2048)
+    if endpoint.strip() == "":
+        fail_invalid("model.endpoint_base_url must not be empty")
+    model_id = text(model, "model", "model.", max_length=256)
+    if model_id.strip() == "":
+        fail_invalid("model.model must not be empty")
+    prompt = text(model, "system_prompt", "model.", max_length=16384)
+    context = model.get("context_messages")
+    if isinstance(context, bool) or not isinstance(context, int) or not 0 <= context <= 64:
+        fail_invalid("model.context_messages must be an integer from 0 to 64")
+    answers["settings"] = {"endpointBaseUrl": endpoint, "model": model_id,
+                           "systemPrompt": prompt, "contextMessages": context}
+
+    packages = data.get("packages")
+    if not isinstance(packages, dict):
+        fail_invalid("[packages] is required")
+    unknown = sorted(set(packages) - PACKAGES_KEYS)
+    if unknown:
+        fail_invalid(f"unknown answers key: packages.{', packages.'.join(unknown)}")
+    enable = packages.get("enable")
+    if not isinstance(enable, list) or not all(isinstance(c, str) and 0 < len(c) <= 256 for c in enable):
+        fail_invalid("packages.enable must be a list of contract identities")
+    if len(set(enable)) != len(enable):
+        fail_invalid("packages.enable lists a contract twice")
+    answers["enable"] = enable
+    return answers
+
+
+def read_key_file(path):
+    """Returns the key from a private key file, or None when the file does not exist."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        fail_invalid("key_file must not be a symlink")
+    if not stat.S_ISREG(info.st_mode):
+        fail_invalid("key_file must be a regular file")
+    if info.st_uid != os.getuid():
+        fail_invalid("key_file must be owned by you")
+    if info.st_mode & 0o077:
+        fail_invalid("key_file must not be readable or writable by group or others (chmod 600)")
+    with open(path, "rb") as handle:
+        raw = handle.read(16385)
+    return checked_key(raw)
+
+
+def checked_key(raw):
+    try:
+        key = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail_invalid("the API key must be UTF-8 text")
+    key = key.rstrip("\r\n")
+    if key == "" or len(key) > 4096 or "\n" in key:
+        fail_invalid("the API key must be one line of 1 to 4096 characters")
+    return key
+
+
+class Host:
+    def __init__(self, answers):
+        self.app = answers["host_app"]
+        self.data = answers["host_data_dir"]
+        self.workspace = answers["workspace"]
+        self.digest = None
+
+    def command(self, args):
+        return [self.app, "--data-dir", self.data, *args]
+
+    def shown(self, args, stdin_json=None):
+        command = shlex.join(self.command(args))
+        if stdin_json is None:
+            return command
+        return f"printf '%s\\n' {shlex.quote(stdin_json)} | {command}"
+
+    def run(self, args, stdin_bytes=None):
+        """Runs the client, draining stdout and stderr into separate files. Never echoes either."""
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            try:
+                completed = subprocess.run(
+                    self.command(args),
+                    input=stdin_bytes,
+                    stdin=None if stdin_bytes is not None else subprocess.DEVNULL,
+                    stdout=out, stderr=err, check=False)
+            except OSError as error:
+                return None, None, {"code": f"cannot run host_app ({error.strerror})"}
+            out.seek(0)
+            err.seek(0)
+            stdout = out.read().decode("utf-8", "replace")
+            stderr = err.read().decode("utf-8", "replace")
+        return completed.returncode, parse(stdout), parse(stderr) or {}
+
+    def read(self, step, args, stdin_json=None):
+        code, result, error = self.run(args, None if stdin_json is None else stdin_json.encode())
+        if code != 0 or result is None:
+            raise Stop(f"stopped: {step} failed ({describe(code, result, error)})")
+        return result
+
+    def mutate(self, step, args, stdin_bytes, inspect):
+        code, result, error = self.run(args, stdin_bytes)
+        if code == 0 and result is not None:
+            return result
+        uncertain = error.get("outcomeUncertain")
+        if code is None or uncertain is False and code in (1, 2):
+            exit_code = 2 if code == 2 else 1
+            raise Stop(f"stopped: {step} refused, nothing changed ({describe(code, result, error)})", exit_code)
+        raise Stop(f"stopped: {step} outcome unknown ({describe(code, result, error)}) — "
+                   f"inspect with: {inspect}, then rerun setup")
+
+    def request_args(self, operation):
+        return ["package", "request", "--workspace", self.workspace, "--package", IDENTITY,
+                "--operation", operation, "--contract-digest", self.digest, "--input", "-"]
+
+    def get(self, operation):
+        return self.read(operation, self.request_args(operation), "{}")
+
+    def inspect_command(self, operation):
+        return self.shown(self.request_args(operation), "{}")
+
+    def post(self, operation, payload, inspect_operation):
+        return self.mutate(operation, self.request_args(operation),
+                           json.dumps(payload).encode(), self.inspect_command(inspect_operation))
+
+
+def parse(output):
+    try:
+        return json.loads(output) if output.strip() else None
+    except ValueError:
+        return None
+
+
+def describe(code, result, error):
+    names = []
+    if isinstance(error, dict) and isinstance(error.get("code"), str):
+        names.append(error["code"])
+    details = result.get("details") if isinstance(result, dict) else None
+    envelope = details.get("envelope") if isinstance(details, dict) else None
+    if isinstance(envelope, dict):
+        package_error = envelope.get("packageError")
+        if isinstance(package_error, dict) and isinstance(package_error.get("code"), str):
+            names.append(package_error["code"])
+        elif isinstance(envelope.get("code"), str):
+            names.append(envelope["code"])
+    if not names:
+        names.append("no result" if code is None else f"exit {code}")
+    return ", ".join(names)
+
+
+class Report:
+    def __init__(self):
+        self.changed = 0
+        self.unchanged = 0
+
+    def line(self, kind, item):
+        if kind == "changed":
+            self.changed += 1
+        else:
+            self.unchanged += 1
+        print(f"{kind}: {item}", flush=True)
+
+    def summary(self, stopped=False):
+        tail = ", stopped" if stopped else ""
+        print(f"summary: {self.changed} changed, {self.unchanged} unchanged{tail}", flush=True)
+
+
+def apply(answers, report):
+    host = Host(answers)
+    key_file = answers["key_file"]
+    file_key = None if key_file == "-" else read_key_file(key_file)
+
+    status = host.read("status", ["status"])
+    if status.get("readiness") != "ready":
+        raise Stop(f"stopped: the Host is not ready (readiness {status.get('readiness')!r})")
+    workspaces = host.read("workspace list", ["workspace", "list"])
+    host.workspace, workspace_name = resolve_workspace(answers["workspace"], workspaces, host)
+    report.line("unchanged", f"host ready, Workspace {workspace_name} ({host.workspace}) joined")
+
+    package_dir = answers["package_dir"]
+    registration = next((r for r in status.get("host", {}).get("registrations", [])
+                         if r.get("expectedIdentity") == IDENTITY), None)
+    if registration is None:
+        if not answers["accept"]:
+            raise Stop("stopped: the Agent Package is not installed. To install it, set "
+                       "accept_native_code_risks = true after reading the risks in the template", 2)
+        if not os.path.isdir(package_dir):
+            raise Stop(f"stopped: package_dir is not a directory: {package_dir}", 2)
+        inspected = host.read("packages inspect", ["packages", "inspect", "--directory", package_dir])
+        if inspected.get("identity") != IDENTITY:
+            raise Stop(f"stopped: package_dir holds {inspected.get('identity')!r}, not {IDENTITY}", 2)
+        host.mutate("packages install",
+                    ["packages", "install", "--directory", package_dir, "--package", IDENTITY, "--input", "-"],
+                    json.dumps(CONSENT).encode(), host.shown(["packages", "list"]))
+        report.line("changed", f"package installed from {package_dir} (version {inspected.get('version')})")
+    else:
+        registered = registration.get("directory")
+        if os.path.realpath(registered or "") != os.path.realpath(package_dir):
+            raise Stop(f"stopped: the Agent Package is registered from {registered}, not {package_dir}. "
+                       "Change package_dir, or remove it with: "
+                       f"{host.shown(['packages', 'remove', '--package', IDENTITY])}")
+        kind = registration.get("status", {}).get("kind")
+        if kind != "admitted":
+            raise Stop(f"stopped: the Agent Package registration is {kind!r}, not admitted. "
+                       f"Inspect with: {host.shown(['packages', 'list'])}")
+        report.line("unchanged", f"package installed from {registered}")
+
+    wait_for_instance(host)
+    operations = host.read("package operations", ["package", "operations", "--workspace", host.workspace,
+                                                  "--package", IDENTITY])
+    host.digest = operations.get("contractDigest")
+    if not isinstance(host.digest, str) or not re.fullmatch(r"[0-9a-f]{64}", host.digest):
+        raise Stop("stopped: package operations returned no contract digest")
+
+    agent_id = ensure_agent(host, answers["agent_name"], report)
+    settings = ensure_settings(host, answers["settings"], report)
+    ensure_key(host, key_file, file_key, settings.get("hasKey") is True, report)
+    ensure_binding(host, agent_id, answers["agent_name"], report)
+    ensure_packages(host, answers["enable"], report)
+
+    final = host.get("agent.status.get")
+    state = final.get("state")
+    if state != "ready":
+        last = final.get("lastError")
+        code = f", lastError {last.get('code')}" if isinstance(last, dict) else ""
+        raise Stop(f"stopped: agent status is {state!r}{code}. "
+                   f"Inspect with: {host.inspect_command('agent.status.get')}")
+    print(f"ready: agent {final.get('agent', {}).get('name')} in Workspace {host.workspace}", flush=True)
+
+
+def resolve_workspace(wanted, workspaces, host):
+    """Matches an ID first, then an exact name. No match or several are invalid answers."""
+    joined = [w for w in workspaces or [] if isinstance(w, dict) and isinstance(w.get("id"), str)]
+    by_id = [w for w in joined if w["id"] == wanted]
+    matches = by_id or [w for w in joined if w.get("name") == wanted]
+    if len(matches) == 1:
+        return matches[0]["id"], matches[0].get("name")
+    listed = ", ".join(f"{w.get('name')!r} ({w['id']})" for w in (matches or joined)) or "none"
+    if not matches:
+        raise Stop(f"stopped: this Installation has not joined a Workspace named or with ID {wanted!r}. "
+                   f"Joined Workspaces: {listed}. Inspect with: {host.shown(['workspace', 'list'])}", 2)
+    raise Stop(f"stopped: {len(matches)} joined Workspaces are named {wanted!r}: {listed}. "
+               "Set workspace to one of these IDs, then rerun setup", 2)
+
+
+def wait_for_instance(host, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        status = host.read("status", ["status"])
+        for instance in status.get("host", {}).get("instances", []):
+            key = instance.get("key", {})
+            if key.get("packageIdentity") == IDENTITY and key.get("workspaceId") == host.workspace \
+                    and instance.get("lifecycle") == "active":
+                return
+        if time.monotonic() >= deadline:
+            raise Stop(f"stopped: the Agent Package has no active Instance in Workspace {host.workspace} "
+                       f"yet. Inspect with: {host.shown(['status'])}, then rerun setup")
+        time.sleep(1)
+
+
+def ensure_agent(host, name, report):
+    listing = ["agent", "list", "--workspace", host.workspace]
+    agents = [a for a in host.read("agent list", listing) or []
+              if isinstance(a, dict) and a.get("kind", "agent") == "agent" and a.get("name") == name]
+    if len(agents) > 1:
+        raise Stop(f"stopped: {len(agents)} Agents are named {name!r}; rename one so the name is unique")
+    if agents:
+        report.line("unchanged", f"agent {name}")
+        return agents[0]["id"]
+    host.mutate("agent add", ["agent", "add", "--workspace", host.workspace, "--name", name], None,
+                host.shown(listing))
+    agents = [a for a in host.read("agent list", listing) or []
+              if isinstance(a, dict) and a.get("name") == name]
+    if len(agents) != 1 or not isinstance(agents[0].get("id"), str):
+        raise Stop(f"stopped: agent add succeeded but {name!r} is not listed once. "
+                   f"Inspect with: {host.shown(listing)}, then rerun setup")
+    report.line("changed", f"agent {name} created")
+    return agents[0]["id"]
+
+
+def ensure_settings(host, wanted, report):
+    current = host.get("agent.settings.get")
+    have = current.get("settings") or {}
+    differing = [field for field in wanted if have.get(field) != wanted[field]]
+    if not differing:
+        report.line("unchanged", "settings")
+        return current
+    saved = host.post("agent.settings.set", {"settings": wanted}, "agent.settings.get")
+    report.line("changed", f"settings ({', '.join(differing)})")
+    return saved
+
+
+def ensure_key(host, key_file, file_key, has_key, report):
+    if key_file == "-":
+        if has_key:
+            report.line("unchanged", "api key (already set; stdin not read)")
+            return
+        if sys.stdin.isatty():
+            print("Paste the API key, then press Enter (it is not echoed):", file=sys.stderr, flush=True)
+            import termios
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] &= ~termios.ECHO
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, new)
+                raw = sys.stdin.buffer.readline()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                print(file=sys.stderr)
+        else:
+            raw = sys.stdin.buffer.read(16385)
+        key = checked_key(raw)
+    elif file_key is None:
+        if has_key:
+            report.line("unchanged", "api key (already set; key file absent)")
+            return
+        raise Stop(f"stopped: no API key is set and key_file does not exist: {key_file}", 2)
+    else:
+        key = file_key
+    saved = host.post("agent.key.set", {"apiKey": key}, "agent.settings.get")
+    del key
+    if saved.get("hasKey") is not True:
+        raise Stop("stopped: agent.key.set did not report hasKey. "
+                   f"Inspect with: {host.inspect_command('agent.settings.get')}, then rerun setup")
+    if key_file != "-":
+        os.unlink(key_file)
+        report.line("changed", f"api key (key file {key_file} deleted)")
+    else:
+        report.line("changed", "api key")
+
+
+def ensure_binding(host, agent_id, name, report):
+    agents = host.get("agent.binding.candidates").get("agents") or []
+    bound = [a for a in agents if a.get("bound") is True]
+    if any(a.get("principalId") == agent_id for a in bound):
+        report.line("unchanged", f"binding to {name}")
+        return
+    if bound:
+        other = bound[0]
+        raise Stop(f"stopped: Agent {other.get('name')!r} is bound, not {name!r}. Setup does not rebind, "
+                   "because rebinding cancels the Agent's work. To unbind, run: "
+                   f"{host.shown(host.request_args('agent.binding.clear'), '{}')}, then rerun setup")
+    if not any(a.get("principalId") == agent_id for a in agents):
+        raise Stop(f"stopped: Agent {name!r} is not a binding candidate. "
+                   f"Inspect with: {host.inspect_command('agent.binding.candidates')}")
+    host.post("agent.binding.set", {"principalId": agent_id}, "agent.binding.candidates")
+    report.line("changed", f"binding to {name}")
+
+
+def ensure_packages(host, enable, report):
+    """Makes the enabled set exactly `enable`. Validates the whole list before any change."""
+    offered = {p.get("contract"): p for p in host.get("agent.packages.get").get("packages") or []}
+    missing = [c for c in enable if c not in offered]
+    unavailable = [c for c in enable if c in offered and offered[c].get("available") is not True]
+    if missing or unavailable:
+        problems = []
+        if missing:
+            problems.append(f"not installed in this Workspace: {', '.join(missing)}")
+        if unavailable:
+            problems.append(f"installed but not available now: {', '.join(unavailable)}")
+        raise Stop(f"stopped: packages ({'; '.join(problems)}). No Package was changed. "
+                   f"Remove them from [packages] enable, or install them, then rerun setup. "
+                   f"Inspect with: {host.inspect_command('agent.packages.get')}")
+    for contract in enable:
+        entry = offered[contract]
+        major = entry.get("major")
+        if entry.get("enabled") is True and entry.get("enabledMajor") == major:
+            report.line("unchanged", f"package {contract} {major}")
+            continue
+        host.post("agent.packages.set", {"contract": contract, "enabled": True, "major": major},
+                  "agent.packages.get")
+        report.line("changed", f"package {contract} enabled at major {major}")
+    for contract, entry in sorted(offered.items(), key=lambda item: str(item[0])):
+        if contract in enable or entry.get("enabled") is not True:
+            continue
+        host.post("agent.packages.set", {"contract": contract, "enabled": False}, "agent.packages.get")
+        report.line("changed", f"package {contract} turned off (not listed)")
+
+
+def print_template(path):
+    if path is None:
+        sys.stdout.write(TEMPLATE)
+        return 0
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        print(f"agent-setup: {path} already exists; not overwriting it", file=sys.stderr)
+        return 2
+    except OSError as error:
+        print(f"agent-setup: cannot create {path}: {error.strerror}", file=sys.stderr)
+        return 1
+    with os.fdopen(fd, "w") as handle:
+        handle.write(TEMPLATE)
+    print(f"wrote {path}", file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    if sys.version_info < (3, 11):
+        print("agent-setup: Python 3.11 or later is required", file=sys.stderr)
+        return 1
+    if argv in (["--help"], ["-h"]):
+        sys.stdout.write(USAGE)
+        return 0
+    if argv[:1] == ["--print-template"] and len(argv) <= 2:
+        return print_template(argv[1] if len(argv) == 2 else None)
+    if len(argv) != 2 or argv[0] != "--answers":
+        sys.stderr.write(USAGE)
+        return 2
+    report = Report()
+    try:
+        answers = load_answers(argv[1])
+        if not os.access(answers["host_app"], os.X_OK):
+            fail_invalid(f"host_app is not an executable file: {answers['host_app']}")
+        apply(answers, report)
+    except Invalid as error:
+        print(f"invalid: {error}", flush=True)
+        print("summary: nothing changed", flush=True)
+        return 2
+    except Stop as stop:
+        print(stop.line, flush=True)
+        report.summary(stopped=True)
+        return stop.code
+    report.summary()
+    return 0
+
+
+sys.exit(main(sys.argv[1:]))
+PYTHON
+
+command -v python3 >/dev/null 2>&1 || { echo "agent-setup: python3 is required" >&2; exit 1; }
+exec python3 -I -c "$PROGRAM" "$@"

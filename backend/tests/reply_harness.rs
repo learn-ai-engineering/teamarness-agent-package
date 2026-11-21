@@ -794,7 +794,7 @@ impl Roster {
             "lookup" => {
                 if roster
                     .lookup_failures
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
                         |remaining| remaining.checked_sub(1),
@@ -912,6 +912,31 @@ async fn make_ready(fixture: &mut Fixture, stub: &StubEndpoint, context_messages
         page_calls(&fixture.ports, SIDE) >= 1
     })
     .await;
+}
+
+/// Waits until the harness has opened a new `messages.changed` stream since `opens` were counted,
+/// and that stream is open.
+///
+/// A rebind or a rename stops the harness and closes its stream. The replacement resubscribes
+/// only once its identity is current again, which can take up to its retry delay. An event sent
+/// before then finds the old stream closed. Wait for the new open rather than for `is_open`:
+/// the old stream can still be open when the triggering request returns. Count only
+/// `messages.changed` opens (see [`message_opens`]), because the Comment source subscribes
+/// through the same capability when Documents is enabled.
+async fn resubscribed(ports: &ScriptedCapability, opens: usize) {
+    wait_until("the harness to resubscribe", || {
+        message_opens(ports) > opens && ports.stream().is_open()
+    })
+    .await;
+}
+
+/// How many `messages.changed` streams the Package has opened on `ports`.
+fn message_opens(ports: &ScriptedCapability) -> usize {
+    ports
+        .recorded_opens()
+        .iter()
+        .filter(|open| open["port"] == "messages.changed")
+        .count()
 }
 
 /// Polls until `condition` holds or the deadline passes.
@@ -1362,9 +1387,11 @@ async fn replies_once_when_addressed_and_only_then() {
 
     // A rename changes the trigger word at once.
     *roster.agent_name.lock().unwrap() = "Pathfinder".into();
+    let opens = message_opens(ports);
     principals.stream().opened().await;
     assert!(principals.stream().send(roster.snapshot(2)).await);
     wait_agent_name(harness, "Pathfinder").await;
+    resubscribed(ports, opens).await;
     conversations.append(GENERAL, BOB_KEY, "@Scout still there?");
     settle_pass(ports).await;
     assert_eq!(conversations.posts().len(), 3);
@@ -1633,6 +1660,7 @@ async fn rebind_drains_a_held_completion_before_changing_actor() {
     stub.push(Behaviour::Hold(release.clone(), "old A completion".into()));
     say(&conversations, &fixture.ports, BOB_KEY, "@Scout held").await;
     wait_until("held A request", || stub.request_count() == 1).await;
+    let opens = message_opens(&fixture.ports);
     fixture
         .harness
         .request("agent.binding.set", json!({"principalId":OTHER_ID}))
@@ -1650,7 +1678,7 @@ async fn rebind_drains_a_held_completion_before_changing_actor() {
         conversations.posts().is_empty(),
         "A completion posted after binding B"
     );
-    fixture.ports.stream().opened().await;
+    resubscribed(&fixture.ports, opens).await;
     say(&conversations, &fixture.ports, BOB_KEY, "@Other fresh").await;
     wait_until("fresh B reply", || conversations.posts().len() == 1).await;
     assert_eq!(stub.request_count(), 2);
@@ -2334,8 +2362,10 @@ async fn reply_uses_tool_then_posts_exactly_once() {
     let conversations = FakeConversations::new();
     let mut fixture = start(data.path(), &roster, &conversations).await;
     make_ready(&mut fixture, &stub, 20).await;
+    let opens = message_opens(&fixture.ports);
     set_exhibits(&mut fixture.harness, true).await;
     let Fixture { harness, ports, .. } = &mut fixture;
+    resubscribed(ports, opens).await;
     wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
 
     stub.push(Behaviour::ToolCalls(vec![call(
@@ -2393,8 +2423,10 @@ async fn reply_never_offers_message_post() {
     let conversations = FakeConversations::new();
     let mut fixture = start(data.path(), &roster, &conversations).await;
     make_ready(&mut fixture, &stub, 20).await;
+    let opens = message_opens(&fixture.ports);
     set_exhibits(&mut fixture.harness, true).await;
     let Fixture { harness, ports, .. } = &mut fixture;
+    resubscribed(ports, opens).await;
     wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
 
     // The model tries to post by itself: refused locally, and the harness posts once.
@@ -2591,8 +2623,10 @@ async fn turn_limit_ends_reply_with_status_code_and_no_post() {
     let conversations = FakeConversations::new();
     let mut fixture = start(data.path(), &roster, &conversations).await;
     make_ready(&mut fixture, &stub, 20).await;
+    let opens = message_opens(&fixture.ports);
     set_exhibits(&mut fixture.harness, true).await;
     let Fixture { harness, ports, .. } = &mut fixture;
+    resubscribed(ports, opens).await;
     wait_until("the first pass", || page_calls(ports, GENERAL) >= 1).await;
 
     // One call more than the per-turn tool-call budget, in one answer.

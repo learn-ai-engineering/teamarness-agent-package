@@ -4,14 +4,31 @@ Runs a stewarded Workspace Agent against an OpenAI-compatible completion endpoin
 
 ## Build
 
-Requires Node/npm, Rust 1.96 and macOS arm64. SDK, protocol and admission-validator source are vendored; no Teamarness checkout is needed to build.
+Requires Node/npm and Rust 1.96 or later. SDK, protocol and admission-validator source are vendored; no Teamarness checkout is needed to build.
+
+Supported Backend targets:
+
+| Machine | Target |
+|---|---|
+| macOS on Apple Silicon | `aarch64-apple-darwin` |
+| Linux on x86_64 with glibc (qualified on Ubuntu 26.04) | `x86_64-unknown-linux-gnu` |
+
+On Linux, also install a C toolchain (`build-essential` on Ubuntu), which the `ring` TLS dependency needs to compile. The Backend reads the system CA certificates (`ca-certificates`) when it connects to an HTTPS model endpoint.
+
+The two Backends ship slightly different third-party Rust crates, all permissively licensed. The Linux Backend adds `linux-raw-sys` (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT), `openssl-probe` (MIT OR Apache-2.0) and `rustls-native-certs` (Apache-2.0 OR ISC OR MIT). The macOS Backend instead includes `core-foundation`, `core-foundation-sys`, `security-framework` and `security-framework-sys` (all MIT OR Apache-2.0). To see the full set for a target, run `cargo tree -p teamarness-agent-package -e normal --target <triple>`.
 
 ```sh
 npm ci
 npm run build
 ```
 
+The build is native only. It builds for the target that `rustc -vV` reports as its host, and the Package Directory declares only that target's Backend. `npm run build -- --target <triple>` confirms the target: it refuses any other target, or any other argument, with exit status 2 before it runs Cargo or changes `dist/`. Cargo always builds with that explicit `--target`, and the Package takes the Backend from `<triple>/release/` inside Cargo's target directory (`target/` unless `CARGO_TARGET_DIR` or `build.target-dir` says otherwise), so a Cargo `build.target` setting cannot leave a stale binary in its place. Cross-compilation is not supported, so build each target on its own machine.
+
 Output: `dist/dev.teamarness.agent/`. The build writes artifact sizes/digests and validates the final directory, including a Backend smoke launch. Do not edit built files. `npm run typecheck`, `npm run lint`, and `npm test` provide the complete project checks. Keep both lockfiles committed. `npm run check:vendor` verifies SDK provenance. `npm run check:catalog` verifies historical Provider fixtures; both run as part of `npm test`.
+
+## Run headless
+
+To run the Agent on a headless Teamarness Host, follow [Run the Agent on a headless Teamarness Host](docs/headless-onboarding.md). It covers building and copying the Package, then `agent-setup`: one answers file per Workspace installs the Package and configures the Agent, and is safe to rerun. Manual steps and updating are covered too.
 
 ## Register and configure
 
