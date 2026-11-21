@@ -6,23 +6,19 @@ This guide builds, installs and configures the Agent Package (`dev.teamarness.ag
 
 ## Prerequisite: a running headless Host
 
-You need a headless Teamarness Host that is installed, running, named and joined to a Workspace. Complete the Host's guide, "Install headless Teamarness on Linux" (`docs/headless/install-linux.md` in the Teamarness repository), through step 5, "Join the Workspace", first. Its step 3, "Define the shell helpers", defines the two helpers this guide uses:
-
-- `tm …` runs the Host's operator client against its data directory.
-- `tm_req WORKSPACE PACKAGE OPERATION` sends one Package request. It reads the JSON request on stdin and looks up the current contract digest for you.
-
-Define both helpers in every shell you use below.
+You need a headless Teamarness Host that is installed, running, named and joined to a Workspace. Complete the Host's guide, "Install headless Teamarness on Linux" (`docs/headless/install-linux.md` in the Teamarness repository), through step 5, "Join the Workspace", first.
 
 You also need:
 
+- Bash and Python 3.11 or later on the target machine;
 - an OpenAI-compatible model endpoint, a model ID and an API key, such as an OpenRouter key; and
 - the Teamarness desktop app on another machine, to create Workspace Invitations and to test the Agent.
 
 Run every command below as the account that runs the Host, with `umask 077`.
 
-## Machine tier: once per machine
+The short version: get the Package, copy it into place, then run `agent-setup` once per Workspace with an answers file. The [manual setup](#manual-setup-reference) at the end shows the same steps one request at a time.
 
-### 1. Get the Package
+## 1. Get the Package
 
 Release archives do not exist yet. When they do, this step becomes "download and unpack". Update this guide then.
 
@@ -34,13 +30,13 @@ npm ci
 npm run build
 ```
 
-`npm run build` builds only the machine's own target (`x86_64-unknown-linux-gnu` here), validates the result and smoke-launches the Backend. It produces `dist/dev.teamarness.agent/`. The Backend links against the build machine's glibc, so build on a machine whose glibc is no newer than the target's. If several heavy builds share the build machine, run each one under the same lock, for example `flock ~/src/.heavy-build.lock npm run build`.
+`npm run build` builds only the machine's own target (`x86_64-unknown-linux-gnu` here), validates the result and smoke-launches the Backend. It produces two things in `dist/`: the Package Directory `dev.teamarness.agent/`, and beside it the setup script `agent-setup`. The Backend links against the build machine's glibc, so build on a machine whose glibc is no newer than the target's. If several heavy builds share the build machine, run each one under the same lock, for example `flock ~/src/.heavy-build.lock npm run build`.
 
 To run the full gates first, run `npm run validate`, `npm run typecheck`, `npm run lint` and `npm test` before you build.
 
-### 2. Copy it into place
+## 2. Copy it into place
 
-The Package Directory is the permanent location that the Host trusts. Copy the complete directory and never symlink it, and do not edit any file after the copy. Nothing in it may point back into a source tree.
+The Package Directory is the permanent location that the Host trusts. Copy the complete directory and never symlink it, and do not edit any file after the copy. Nothing in it may point back into a source tree. Copy the setup script beside it:
 
 ```sh
 umask 077
@@ -48,9 +44,10 @@ mkdir -p ~/.local/lib/teamarness-packages
 chmod go-w ~/.local/lib/teamarness-packages
 rsync -a --delete /path/to/agent-package/dist/dev.teamarness.agent/ \
   ~/.local/lib/teamarness-packages/dev.teamarness.agent/
+rsync -a /path/to/agent-package/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
 ```
 
-From a separate build machine, use `target:.local/lib/teamarness-packages/dev.teamarness.agent/` as the destination instead. Every directory above the Package Directory must not be group- or other-writable. Step 1 of the Host's guide already removes that access from `~`, `~/.local` and `~/.local/lib`.
+From a separate build machine, use `target:.local/lib/teamarness-packages/…` as each destination instead. Every directory above the Package Directory must not be group- or other-writable. Step 1 of the Host's guide already removes that access from `~`, `~/.local` and `~/.local/lib`.
 
 To record what you installed, save the digests:
 
@@ -58,7 +55,69 @@ To record what you installed, save the digests:
 (cd ~/.local/lib/teamarness-packages/dev.teamarness.agent && find . -type f -exec sha256sum {} + | sort -k2)
 ```
 
-### 3. Inspect and install
+## 3. Set up a Workspace with `agent-setup`
+
+Configuration is per Workspace, by design. Each Workspace has its own Agent, settings, API key, binding and enabled Packages, and its own Package data. Run setup once for each Workspace, each with its own answers file. The Package itself installs once per machine; the first setup run installs it.
+
+1. Write the answers template. Setup refuses to overwrite an existing file:
+
+   ```sh
+   S=~/.local/lib/teamarness-packages/agent-setup
+   "$S" --print-template ~/agent-setup.toml
+   ```
+
+2. Fill it in. Set `workspace_id` to the ID from `workspace list`, choose `agent_name`, set `[model]`, and list the contracts the Agent may use under `[packages]`. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets.
+
+3. Put the API key in a private file. It holds only the key:
+
+   ```sh
+   (umask 077; IFS= read -rs KEY; printf '%s\n' "$KEY" > ~/agent-api-key; unset KEY)
+   ```
+
+   Setup checks that the file is a regular file, not a symlink, owned by you, with mode `0600`. It deletes the file once the key is saved. Instead of a file, you can set `key_file = "-"` and pipe the key on stdin.
+
+4. Apply it:
+
+   ```sh
+   "$S" --answers ~/agent-setup.toml
+   ```
+
+   Setup reads the current state first and changes only what differs. It prints one line per item and a summary:
+
+   ```text
+   unchanged: host ready, Workspace joined
+   changed: package installed from /home/you/.local/lib/teamarness-packages/dev.teamarness.agent (version 1.0.1)
+   changed: agent Factory created
+   changed: settings (endpointBaseUrl, model, systemPrompt)
+   changed: api key (key file /home/you/agent-api-key deleted)
+   changed: binding to Factory
+   changed: package dev.teamarness.conversations enabled at major 1
+   changed: package dev.teamarness.documents enabled at major 1
+   ready: agent Factory in Workspace aad43be122caa818738f763c373ba820
+   summary: 7 changed, 1 unchanged
+   ```
+
+5. Test it: from the desktop app in the same Workspace, mention the Agent in a Conversation, for example "@Factory, are you there?". Exactly one reply should arrive, authored by the Agent.
+
+Run setup again with the same answers at any time. It reports every item as `unchanged`. A missing key file is fine once the key is set. To change something, edit the answers and rerun. To rotate the key, write a new key file and rerun.
+
+Setup uses these rules:
+
+- An Agent with exactly `agent_name` is reused. Otherwise setup creates it.
+- Contracts not listed under `[packages]` are left as they are. Setup never disables one.
+- If a different Agent is already bound, setup stops and prints the unbind command. It does not rebind, because rebinding cancels the Agent's work.
+- If the Package is registered from a different directory, setup stops. It does not reinstall.
+- If a change's outcome is unknown, setup stops at once and prints `stopped: <step> outcome unknown — inspect with: <command>, then rerun setup`. It never retries. Run the inspect command, then rerun setup, which reads the state again and continues from there.
+- Exit codes match the Host client: `0` ok, `1` operational failure or unknown outcome, `2` invalid answers or input. Invalid answers change nothing.
+
+## Manual setup (reference)
+
+These are the steps that `agent-setup` performs, one request at a time. Use them to inspect state or when you can't run setup. They use the `tm` and `tm_req` helpers from step 3, "Define the shell helpers", of the Host's guide:
+
+- `tm …` runs the Host's operator client against its data directory.
+- `tm_req WORKSPACE PACKAGE OPERATION` sends one Package request. It reads the JSON request on stdin and looks up the current contract digest for you.
+
+### Inspect and install, once per machine
 
 Inspection reads the Package Directory and does not run the Backend:
 
@@ -76,13 +135,13 @@ printf '%s\n' '{"acceptedRisks":["filesystem","network","process"]}' |
 
 The result is `"kind":"personal_installed"`. A Personal Package installs once per machine and runs in every Workspace that the Installation joins.
 
-## Workspace tier: once per Workspace
+### Configure each Workspace
 
-Configuration is per Workspace, by design. Each Workspace has its own Agent, settings, API key, binding and enabled Packages, and its own Package data. Repeat steps 4–9 for each Workspace the Installation joins. You do not need to reinstall the Package.
+Repeat steps 4–9 for each Workspace.
 
 ### 4. Select the Workspace
 
-Join the Workspace with step 5 of the Host's guide, then set `W` to its ID:
+Set `W` to the Workspace ID:
 
 ```sh
 tm workspace list
@@ -180,10 +239,11 @@ Get the new version (step 1), then copy it over the same Package Directory and r
 ```sh
 rsync -a --delete /path/to/agent-package/dist/dev.teamarness.agent/ \
   ~/.local/lib/teamarness-packages/dev.teamarness.agent/
+rsync -a /path/to/agent-package/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
 tm packages reload --package dev.teamarness.agent
 ```
 
-The reload restarts the Backend in every Workspace. It keeps each Workspace's settings, API key, binding, enabled Packages and reply progress, and Messages that were already answered are not answered again. Afterwards, run step 9 in each Workspace. `tm_req` re-reads the contract digest, so a reload never leaves you with a stale one.
+The reload restarts the Backend in every Workspace. It keeps each Workspace's settings, API key, binding, enabled Packages and reply progress, and Messages that were already answered are not answered again. Afterwards, rerun `agent-setup` with each Workspace's answers file. It should report every item `unchanged` and end `ready`. Setup and `tm_req` both re-read the contract digest, so a reload never leaves you with a stale one.
 
 ## Errors and uncertain outcomes
 
@@ -203,42 +263,9 @@ Keep the client's stdout and stderr draining. Don't merge them into one pipe wit
 
 ## Change or remove the configuration
 
-- **Rotate the key:** repeat step 7. Clear it with `echo '{}' | tm_req "$W" dev.teamarness.agent agent.key.clear`.
+- **Rotate the key:** write a new key file and rerun `agent-setup`, or repeat step 7. Clear it with `echo '{}' | tm_req "$W" dev.teamarness.agent agent.key.clear`.
 - **Unbind:** `echo '{}' | tm_req "$W" dev.teamarness.agent agent.binding.clear`. This stops replies and cancels in-flight work.
 - **Remove the Package:** `tm packages remove --package dev.teamarness.agent`. This removes it from every Workspace. Its data, including settings, key and reply progress, is kept for a later reinstall.
-
-## Planned: answers-file setup
-
-A later workstream replaces steps 4–9 with an idempotent, non-interactive setup. There will be no wizard. `setup --print-template` writes a commented answers file. You fill it in, and `setup --answers <file>` applies it and reports what it did. Running it again with the same answers changes nothing. The Agent implements its own setup; Packages share no code.
-
-The template would hold:
-
-```toml
-# Agent setup answers. Secrets never go in this file.
-workspace = "aad43be122caa818738f763c373ba820"  # Workspace ID, never a name
-
-[agent]
-name = "Factory"                     # created if missing, then bound
-
-[model]
-endpoint_base_url = "https://openrouter.ai/api/v1"
-model = "z-ai/glm-5.3-flash"
-system_prompt = "You are a member of the team."
-context_messages = 20                # 0-64
-
-[key]
-file = "~/agent-api-key"             # 0600 file, deleted after success; or "-" for stdin
-
-[packages]
-enable = ["dev.teamarness.conversations", "dev.teamarness.documents"]  # majors taken from the Host's offer
-```
-
-Open questions for that workstream:
-
-- whether setup renames or refuses an existing Agent whose name differs;
-- whether contracts not listed under `enable` are disabled;
-- how setup reports and recovers from an uncertain outcome partway through; and
-- where setup runs, either as Host operator commands or through the Package's requests.
 
 ## Limits
 

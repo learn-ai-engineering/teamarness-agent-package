@@ -42,6 +42,8 @@ async function fixtureRoot({ backends = [placeholder(MAC), placeholder(LINUX)] }
   }));
   await writeFile(join(root, "ui-contract.json"), '{"schemaVersion":1,"$defs":{},"requests":{},"subscriptions":{}}');
   await writeFile(join(root, "ui/dist/index.js"), "export const mount = () => () => {};\n");
+  await mkdir(join(root, "headless"), { recursive: true });
+  await writeFile(join(root, "headless/agent-setup"), "#!/usr/bin/env bash\necho setup\n", { mode: 0o644 });
   return root;
 }
 
@@ -120,6 +122,11 @@ for (const target of [MAC, LINUX]) {
       for (const path of [manifest.ui.entrypoint.path, manifest.ui.contract.path, "teamarness.package.json"]) {
         assert.equal((await stat(join(output, path))).mode & 0o777, 0o600, path);
       }
+      // The setup script ships beside the Package Directory, never inside it.
+      const setup = join(root, "dist", "agent-setup");
+      assert.deepEqual(await readFile(setup), await readFile(join(root, "headless/agent-setup")));
+      assert.equal((await stat(setup)).mode & 0o777, 0o755);
+      assert.deepEqual((await readdir(output)).sort(), ["backend", "teamarness.package.json", "ui"]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""A fake `teamarness-headless` operator client for scripts/agent-setup.test.mjs.
+
+It keeps the Host and Agent state in the JSON file named by $FAKE_HOST_STATE and appends each
+argv (never stdin) to $FAKE_HOST_LOG. Output shapes follow the real client as observed on
+factory2 with Host 72cb5f2 on 2026-11-21:
+
+- results are JSON on stdout; a failure prints {"code","retryable","outcomeUncertain"} on stderr
+  and, for request failures, the same with "details" on stdout;
+- exits are 0 ok, 1 operational or uncertain, 2 invalid input;
+- `status` and `packages list` carry host.registrations and host.instances;
+- `package request` failures after validation are outcomeUncertain true.
+
+state["fail"] maps an operation name (or "agent add", "packages install") to "uncertain" or
+"busy" to inject a failure.
+"""
+import json
+import os
+import sys
+
+DIGEST = "1446dd2503b43e22a18e0f6bd79071267b6e10d02dc74f55e28b04a1201b442c"
+IDENTITY = "dev.teamarness.agent"
+
+state_path = os.environ["FAKE_HOST_STATE"]
+with open(state_path) as handle:
+    state = json.load(handle)
+with open(os.environ["FAKE_HOST_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\n")
+
+
+def save():
+    with open(state_path, "w") as handle:
+        json.dump(state, handle)
+
+
+def ok(result):
+    save()
+    print(json.dumps(result))
+    sys.exit(0)
+
+
+def error(code, exit_code, uncertain=False, package_error=None):
+    save()
+    outer = {"code": code, "retryable": False, "outcomeUncertain": uncertain}
+    if package_error:
+        print(json.dumps({**outer, "details": {"kind": "host", "envelope": {
+            "code": "backend_error", "packageError": {"code": package_error}}}}))
+    print(json.dumps(outer), file=sys.stderr)
+    sys.exit(exit_code)
+
+
+def injected(name):
+    mode = state.get("fail", {}).get(name)
+    if mode == "uncertain":
+        if name.startswith("agent."):
+            state.setdefault("applied", []).append(name)
+        error("host_failure", 1, uncertain=True, package_error="agent.storage_failed")
+    if mode == "busy":
+        error("busy", 1)
+
+
+def option(name):
+    return args[args.index(name) + 1]
+
+
+def host_view():
+    instances = []
+    if state["registrations"]:
+        instances = [{"key": {"packageIdentity": IDENTITY, "workspaceId": w}, "lifecycle": "active",
+                      "mountState": None, "processGeneration": 1} for w in state["workspaces"]]
+    return {"diagnostics": [], "instances": instances, "registrations": [
+        {"directory": r["directory"], "expectedIdentity": IDENTITY, "override": False,
+         "status": {"kind": r.get("kind", "admitted")}, "tier": "personal"} for r in state["registrations"]],
+        "revision": 1, "state": "running"}
+
+
+def agent_status():
+    settings = state["settings"]
+    if not state["bound"]:
+        return {"state": "no_agent"}
+    agent = next(a for a in state["agents"] if a["id"] == state["bound"])
+    view = {"agent": {"name": agent["name"], "principalId": agent["id"]}}
+    if not settings or not settings["endpointBaseUrl"] or not settings["model"] or not state["hasKey"]:
+        return {**view, "state": "unconfigured"}
+    return {**view, "state": "ready"}
+
+
+def request(operation, payload):
+    if option("--contract-digest") != DIGEST:
+        error("contract_digest_mismatch", 1)
+    injected(operation)
+    if operation == "agent.status.get":
+        return agent_status()
+    if operation == "agent.settings.get":
+        return {"hasKey": state["hasKey"], "settings": state["settings"]}
+    if operation == "agent.settings.set":
+        state["settings"] = payload["settings"]
+        return {"hasKey": state["hasKey"], "settings": state["settings"]}
+    if operation == "agent.key.set":
+        state["key"] = payload["apiKey"]
+        state["hasKey"] = True
+        return {"hasKey": True}
+    if operation == "agent.binding.candidates":
+        return {"agents": [{"bound": a["id"] == state["bound"], "name": a["name"], "principalId": a["id"]}
+                           for a in state["agents"]]}
+    if operation == "agent.binding.set":
+        state["bound"] = payload["principalId"]
+        agent = next(a for a in state["agents"] if a["id"] == state["bound"])
+        return {"agent": {"name": agent["name"], "principalId": agent["id"]}}
+    if operation in ("agent.packages.get", "agent.packages.set"):
+        if not state["bound"]:
+            error("host_failure", 1, uncertain=True, package_error="agent.binding_required")
+        if operation == "agent.packages.set":
+            entry = next(p for p in state["packages"] if p["contract"] == payload["contract"])
+            entry["enabled"] = payload["enabled"]
+            entry["enabledMajor"] = payload.get("major")
+        return {"packages": state["packages"]}
+    error("unknown_operation", 2)
+
+
+args = sys.argv[1:]
+if args[:2] != ["--data-dir", state["dataDir"]]:
+    error("invalid_input", 2)
+command = args[2:]
+stdin = sys.stdin.read() if "--input" in command else ""
+
+if command == ["status"]:
+    ok({"host": host_view(), "installation": "0" * 64, "readiness": state["readiness"],
+        "terminalOperationFailures": 0})
+if command == ["packages", "list"]:
+    ok(host_view())
+if command == ["workspace", "list"]:
+    ok([{"id": w, "name": f"w{i}"} for i, w in enumerate(state["workspaces"])])
+if command[:2] == ["packages", "inspect"]:
+    ok({"directory": option("--directory"), "identity": IDENTITY, "kind": "install", "version": "1.0.1"})
+if command[:2] == ["packages", "install"]:
+    if json.loads(stdin) != {"acceptedRisks": ["filesystem", "network", "process"]}:
+        error("invalid_input", 2)
+    injected("packages install")
+    state["registrations"].append({"directory": option("--directory")})
+    ok({"kind": "personal_installed", "revision": 1})
+if command[:2] == ["agent", "list"]:
+    ok([{"id": a["id"], "kind": "agent", "name": a["name"], "role": "member", "steward": "b" * 64}
+        for a in state["agents"]])
+if command[:2] == ["agent", "add"]:
+    injected("agent add")
+    agent = {"id": f"{len(state['agents']) + 1:064x}", "name": option("--name")}
+    state["agents"].append(agent)
+    ok({**agent, "kind": "agent", "role": "member", "steward": "b" * 64})
+if command[:2] == ["package", "operations"]:
+    if not state["registrations"]:
+        error("package_not_found", 1)
+    ok({"contractDigest": DIGEST, "operations": []})
+if command[:2] == ["package", "request"]:
+    ok(request(option("--operation"), json.loads(stdin)))
+error("invalid_input", 2)

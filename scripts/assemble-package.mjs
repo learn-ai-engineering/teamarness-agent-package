@@ -16,6 +16,10 @@ const root = dirname(dirname(fileURLToPath(import.meta.url)));
  * manifest declares only the selected target's Backend, so it never claims an artifact it does
  * not ship. The Backend is read from Cargo's `--target <triple>` output, never from an untargeted
  * build that may be stale. Every refusal happens before the previous output is removed.
+ *
+ * It also copies `headless/agent-setup` to `dist/agent-setup` (0755), beside the Package
+ * Directory and outside it, so one copy of `dist/` carries both. Admission reads only
+ * `dist/<identity>/`, so the script is not part of the Package's declared bytes.
  */
 export async function assemblePackage({ projectRoot = root, env = process.env, target, native } = {}) {
   const selected = selectTarget({ requested: target, native: native ?? nativeTarget({ env, cwd: projectRoot }) });
@@ -40,6 +44,7 @@ export async function assemblePackage({ projectRoot = root, env = process.env, t
   const backend = await readFile(backendSource);
   const ui = await readFile(uiSource);
   const contract = await readFile(contractSource);
+  const setup = await readFile(join(projectRoot, "headless/agent-setup"));
   manifest.backends[0].size = backend.length;
   manifest.backends[0].sha256 = digest(backend);
   manifest.ui.entrypoint.size = ui.length;
@@ -54,6 +59,10 @@ export async function assemblePackage({ projectRoot = root, env = process.env, t
   await writeFile(join(destination, manifest.ui.entrypoint.path), ui, { mode: 0o600 });
   await writeFile(join(destination, manifest.ui.contract.path), contract, { mode: 0o600 });
   await writeFile(join(destination, "teamarness.package.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+  const setupDestination = join(projectRoot, "dist", "agent-setup");
+  await rm(setupDestination, { force: true });
+  await writeFile(setupDestination, setup, { mode: 0o755 });
+  await chmod(setupDestination, 0o755);
   return destination;
 }
 

@@ -12,6 +12,6 @@
     "validate:dist": "node scripts/validate-dist.mjs",
     "check:vendor": "node scripts/verify-vendor.mjs",
     "check:catalog": "node scripts/verify-catalog.mjs",
-    "test": "npm run validate && npm run check:vendor && npm run check:catalog && cargo test --workspace --locked && npm --workspace @teamarness/agent-package-ui test && node --test scripts/targets.test.mjs scripts/assemble-package.test.mjs scripts/build-package.test.mjs"
+    "test": "npm run validate && npm run check:vendor && npm run check:catalog && cargo test --workspace --locked && npm --workspace @teamarness/agent-package-ui test && node --test scripts/targets.test.mjs scripts/assemble-package.test.mjs scripts/build-package.test.mjs scripts/agent-setup.test.mjs"
   }
 }

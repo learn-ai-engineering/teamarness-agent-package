@@ -69,6 +69,8 @@ The Steward changes Host-owned selections in Configuration's Packages section. E
 | `scripts/assemble-package.mjs` | Assembles final Backend, UI, contract, and manifest bytes for one native target into `dist/`. Imported by `build-package.mjs` and `assemble-package.test.mjs`; it has no command line of its own. |
 | `scripts/validate-dist.mjs` | Applies Package Admission's rules to `dist/` for the native target and smoke-launches the Backend. |
 | `scripts/verify-vendor.mjs` | Fails when a vendored SDK file no longer matches recorded provenance. |
+| `headless/agent-setup` | The headless answers-file setup (Bash plus `python3 -I`). It drives only the Host operator CLI and this contract's requests. The build ships it as `dist/agent-setup`, beside the Package Directory. |
+| `scripts/agent-setup.test.mjs` and `scripts/fixtures/fake-teamarness-headless` | Exercise `agent-setup` against a fake Host client modeled on the real one's output. |
 | `scripts/verify-catalog.mjs` | Fails when a bundled catalog file no longer matches `backend/catalog/provenance.json` (`npm run check:catalog`). |
 | `scripts/refresh-catalog.mjs` | Copies Provider `ports.json` files from a Teamarness checkout and rewrites catalog provenance. |
 | `vendor/teamarness/` | Contains the generated copies of the Package Process Protocol and SDK source used by this project. |
@@ -168,7 +170,7 @@ Package source, trust, Workspace enablement, synchronization, sharing, networkin
 
 Do not edit `dist/` after assembly. Any byte change makes the manifest declaration stale.
 
-The foundation assembler copies one Backend executable, `ui/dist/index.js`, and `ui-contract.json`. The manifest declares no assets. Historical catalog fixtures and skills are compiled into the Backend, not shipped as files. Keep the UI inside the single ESM bundle unless the product needs a different artifact shape.
+The foundation assembler copies one Backend executable, `ui/dist/index.js`, and `ui-contract.json` into the Package Directory. It also copies `headless/agent-setup` to `dist/agent-setup`, outside the Package Directory, so it is not part of the declared bytes. The manifest declares no assets. Historical catalog fixtures and skills are compiled into the Backend, not shipped as files. Keep the UI inside the single ESM bundle unless the product needs a different artifact shape.
 
 If you add UI assets, another Backend, or another target platform, update all of the following together:
 
