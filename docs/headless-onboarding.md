@@ -69,15 +69,27 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    "$S" --print-template ~/agent-setup.toml
    ```
 
-2. Fill it in. Set `workspace_id` to the ID from `workspace list`, choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets.
+2. Fill it in. Set `workspace_id` to the ID from `workspace list`, choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets. Leave `key_file` as `~/agent-api-key`; you create that file in the next step.
 
-3. Put the API key in a private file. It holds only the key:
+3. Put the API key in a private file at `~/agent-api-key`. The file holds only the key. Use one of these options:
 
-   ```sh
-   (umask 077; IFS= read -rs KEY; printf '%s\n' "$KEY" > ~/agent-api-key; unset KEY)
-   ```
+   - **Paste it without echo.** Run this command, paste the key, then press Enter. Nothing appears while you paste:
 
-   Setup checks that the file is a regular file, not a symlink, owned by you, with mode `0600`. It deletes the file once the key is saved. Instead of a file, you can set `key_file = "-"` and pipe the key on stdin.
+     ```sh
+     (umask 077; IFS= read -rs KEY; printf '%s\n' "$KEY" > ~/agent-api-key; unset KEY)
+     ```
+
+     `read -rs KEY` waits for one line and reads it silently into the shell variable `KEY`. You don't set `KEY` beforehand. The command then writes the variable to the file with mode `0600` and clears it. The key never appears on screen or in your shell history.
+
+   - **You already created the file in an editor.** Make it private:
+
+     ```sh
+     chmod 600 ~/agent-api-key
+     ```
+
+     A trailing newline is fine; setup removes it. Make sure that the editor left no backup copy of the file, such as `~/agent-api-key~`.
+
+   Setup checks that the file is a regular file, not a symlink, owned by you, and gives group and others no access. It deletes the file once the key is saved. Instead of a file, you can set `key_file = "-"` and pipe the key on stdin.
 
 4. Apply it:
 
