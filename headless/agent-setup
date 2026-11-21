@@ -83,18 +83,19 @@ system_prompt = "You are a member of the team."
 context_messages = 20
 
 [packages]
-# Packages the Agent may use, enabled at the major the Host offers. The Agent
-# can use every tool in each Package it is enabled for.
-# These are every Package the Agent can currently be enabled for.
+# The Agent can use every tool in each Package listed here. Packages not
+# listed here are not available to this Agent: on every run, setup enables
+# exactly these, at the major the Host offers, and turns off any other
+# Package that is enabled for this Agent. Turning one off cancels the
+# Agent's work in it. This list is every Package the Agent can currently
+# be enabled for.
 # Remove the Packages this Agent should not access.
 #   Backlog        Epics and Tickets: list, read, create and change Tickets
 #   Conversations  the Agent replies to Messages that mention it
 #   Documents      the Agent replies to Comments that mention it, and can edit Documents
 #   Exhibits       the Agent can author Exhibits (static websites)
 # Every listed Package must be installed in this Workspace, or setup stops
-# before it enables any of them. Setup only enables; it never disables. A
-# Package not listed here keeps its current setting: off for a new Agent,
-# but still on if it was enabled before. To turn one off, see the guide.
+# before it changes any of them. An empty list turns every Package off.
 enable = [
   "dev.teamarness.backlog",
   "dev.teamarness.conversations",
@@ -546,8 +547,7 @@ def ensure_binding(host, agent_id, name, report):
 
 
 def ensure_packages(host, enable, report):
-    if not enable:
-        return
+    """Makes the enabled set exactly `enable`. Validates the whole list before any change."""
     offered = {p.get("contract"): p for p in host.get("agent.packages.get").get("packages") or []}
     missing = [c for c in enable if c not in offered]
     unavailable = [c for c in enable if c in offered and offered[c].get("available") is not True]
@@ -557,7 +557,7 @@ def ensure_packages(host, enable, report):
             problems.append(f"not installed in this Workspace: {', '.join(missing)}")
         if unavailable:
             problems.append(f"installed but not available now: {', '.join(unavailable)}")
-        raise Stop(f"stopped: packages ({'; '.join(problems)}). No Package was enabled. "
+        raise Stop(f"stopped: packages ({'; '.join(problems)}). No Package was changed. "
                    f"Remove them from [packages] enable, or install them, then rerun setup. "
                    f"Inspect with: {host.inspect_command('agent.packages.get')}")
     for contract in enable:
@@ -569,6 +569,11 @@ def ensure_packages(host, enable, report):
         host.post("agent.packages.set", {"contract": contract, "enabled": True, "major": major},
                   "agent.packages.get")
         report.line("changed", f"package {contract} enabled at major {major}")
+    for contract, entry in sorted(offered.items(), key=lambda item: str(item[0])):
+        if contract in enable or entry.get("enabled") is not True:
+            continue
+        host.post("agent.packages.set", {"contract": contract, "enabled": False}, "agent.packages.get")
+        report.line("changed", f"package {contract} turned off (not listed)")
 
 
 def print_template(path):

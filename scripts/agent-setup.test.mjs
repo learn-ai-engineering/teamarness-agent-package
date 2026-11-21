@@ -327,9 +327,43 @@ test("a listed Package that is missing or unavailable stops before any Package i
   });
   const result = run(f);
   assert.equal(result.code, 1, result.stdout);
-  assert.match(result.stdout, /^stopped: packages \(not installed in this Workspace: dev\.teamarness\.backlog; installed but not available now: dev\.teamarness\.exhibits\)\. No Package was enabled\. Remove them from \[packages\] enable, or install them, then rerun setup\. Inspect with: .*agent\.packages\.get/m);
+  assert.match(result.stdout, /^stopped: packages \(not installed in this Workspace: dev\.teamarness\.backlog; installed but not available now: dev\.teamarness\.exhibits\)\. No Package was changed\. Remove them from \[packages\] enable, or install them, then rerun setup\. Inspect with: .*agent\.packages\.get/m);
   assert.match(result.stdout, /^summary: \d+ changed, \d+ unchanged, stopped$/m);
   assert.doesNotMatch(result.stdout, /^ready:/m);
   assert.ok(!(await mutations(f)).includes("agent.packages.set"));
   assert.ok((await state(f)).packages.every((p) => p.enabled === false));
+});
+
+test("the enable list is authoritative: a removed Package is turned off, and a rerun changes nothing", async () => {
+  const all = `enable = ["dev.teamarness.backlog", "dev.teamarness.conversations", "dev.teamarness.documents", "dev.teamarness.exhibits"]`;
+  const f = await fixture({ answers: { packages: all } });
+  assert.equal(run(f).code, 0);
+  const answers = await readFile(f.answersFile, "utf8");
+  await writeFile(f.answersFile, answers.replace(all, `enable = ["dev.teamarness.conversations", "dev.teamarness.documents"]`));
+  const before = (await calls(f)).length;
+  const removed = run(f);
+  assert.equal(removed.code, 0, removed.stdout + removed.stderr);
+  assert.match(removed.stdout, /^changed: package dev\.teamarness\.backlog turned off \(not listed\)$/m);
+  assert.match(removed.stdout, /^changed: package dev\.teamarness\.exhibits turned off \(not listed\)$/m);
+  assert.match(removed.stdout, /^summary: 2 changed, \d+ unchanged$/m);
+  const sets = (await calls(f)).slice(before).filter((argv) => nameOf(argv) === "agent.packages.set");
+  assert.equal(sets.length, 2);
+  const enabled = (await state(f)).packages.filter((p) => p.enabled).map((p) => p.contract).sort();
+  assert.deepEqual(enabled, ["dev.teamarness.conversations", "dev.teamarness.documents"]);
+  const again = run(f);
+  assert.equal(again.code, 0);
+  assert.match(again.stdout, /^summary: 0 changed, \d+ unchanged$/m);
+  assert.doesNotMatch(again.stdout, /^changed:/m);
+});
+
+test("a Package enabled elsewhere is turned off, and a typo in the list changes nothing", async () => {
+  const packages = offered();
+  packages.find((p) => p.contract === "dev.teamarness.exhibits").enabled = true;
+  packages.find((p) => p.contract === "dev.teamarness.exhibits").enabledMajor = 1;
+  const f = await fixture({ state: { packages }, answers: { packages: `enable = ["dev.teamarness.conversation"]` } });
+  const typo = run(f);
+  assert.equal(typo.code, 1);
+  assert.match(typo.stdout, /not installed in this Workspace: dev\.teamarness\.conversation\)\. No Package was changed\./);
+  assert.ok(!(await mutations(f)).includes("agent.packages.set"));
+  assert.equal((await state(f)).packages.find((p) => p.contract === "dev.teamarness.exhibits").enabled, true);
 });

@@ -69,7 +69,7 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    "$S" --print-template ~/agent-setup.toml
    ```
 
-2. Fill it in. Set `workspace` to the Workspace name as shown in the desktop app (or its ID). Choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. The Agent can use every tool in each Package it is enabled for. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets. Leave `key_file` as `~/agent-api-key`; you create that file in the next step.
+2. Fill it in. Set `workspace` to the Workspace name as shown in the desktop app (or its ID). Choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. The Agent can use every tool in each Package listed here. Packages not listed here are not available to this Agent. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets. Leave `key_file` as `~/agent-api-key`; you create that file in the next step.
 
 3. Put the API key in a private file at `~/agent-api-key`. The file holds only the key. Use one of these options:
 
@@ -122,8 +122,8 @@ Setup uses these rules:
 
 - An Agent with exactly `agent_name` is reused. Otherwise setup creates it.
 - `workspace` matches a joined Workspace's ID first, then its exact name. If nothing matches, setup stops with exit 2 and lists the joined Workspaces. If several Workspaces have that name, it stops with exit 2 and lists their IDs; set `workspace` to one of them. The older `workspace_id` key still works and takes only an ID.
-- Setup only enables Packages; it never disables one. A Package not listed under `[packages]` keeps its current setting: off for a new Agent, but still on if it was enabled before. To turn one off, see [Change or remove the configuration](#change-or-remove-the-configuration).
-- Every Package listed under `[packages]` must be installed and available in the Workspace. Otherwise setup stops before it enables any of them and names each missing one. Remove it from the list, or install it, then rerun setup.
+- The `[packages]` list is authoritative. On every run, setup enables exactly the listed Packages and turns off any other Package that is enabled for this Agent, including one enabled from the desktop app. It prints `changed: package <contract> turned off (not listed)` for each. Turning a Package off cancels the Agent's work in it. An empty list turns every Package off.
+- Every Package listed under `[packages]` must be installed and available in the Workspace. Otherwise setup stops before it changes any Package and names each missing one, so a typo never turns a Package off. Remove it from the list, or install it, then rerun setup.
 - If a different Agent is already bound, setup stops and prints the unbind command. It does not rebind, because rebinding cancels the Agent's work.
 - If the Package is registered from a different directory, setup stops. It does not reinstall.
 - If a change's outcome is unknown, setup stops at once and prints `stopped: <step> outcome unknown — inspect with: <command>, then rerun setup`. It never retries. Run the inspect command, then rerun setup, which reads the state again and continues from there.
@@ -303,7 +303,7 @@ Keep the client's stdout and stderr draining. Don't merge them into one pipe wit
 ## Change or remove the configuration
 
 - **Rotate the key:** write a new key file and rerun `agent-setup`, or repeat step 7. Clear it with `echo '{}' | tm_req "$W" dev.teamarness.agent agent.key.clear`.
-- **Turn a Package off:** `printf '%s\n' '{"contract":"dev.teamarness.exhibits","enabled":false}' | tm_req "$W" dev.teamarness.agent agent.packages.set`. Disabling cancels the Agent's work in that Package. Removing a Package from the answers file does not turn it off.
+- **Turn a Package off:** remove it from `[packages]` and rerun `agent-setup`. Disabling cancels the Agent's work in that Package. Without setup, send `printf '%s\n' '{"contract":"dev.teamarness.exhibits","enabled":false}' | tm_req "$W" dev.teamarness.agent agent.packages.set`.
 - **Unbind:** `echo '{}' | tm_req "$W" dev.teamarness.agent agent.binding.clear`. This stops replies and cancels in-flight work.
 - **Remove the Package:** `tm packages remove --package dev.teamarness.agent`. This removes it from every Workspace. Its data, including settings, key and reply progress, is kept for a later reinstall.
 
