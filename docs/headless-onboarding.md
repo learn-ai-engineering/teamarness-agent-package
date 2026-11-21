@@ -1,6 +1,6 @@
 # Run the Agent on a headless Teamarness Host
 
-This guide builds, installs and configures the Agent Package (`dev.teamarness.agent`) on a headless Teamarness Installation. Once it is set up, the Agent replies to Conversations Messages and Documents Comments that mention it, as a bound Workspace Agent. Every step uses the Host's generic operator commands and this Package's own declared requests. Nothing writes Package or Core files directly.
+This guide installs and configures the Agent Package (`dev.teamarness.agent`) on a headless Teamarness Installation. Once it is set up, the Agent replies to Conversations Messages and Documents Comments that mention it, as a bound Workspace Agent. Every step uses the Host's generic operator commands and this Package's own declared requests. Nothing writes Package or Core files directly.
 
 > **Verified on** Ubuntu 26.04 x86_64 with Host 72cb5f2, on 2026-11-21. Other glibc-based x86_64 Linux distributions are expected to work but have not been tested. The Agent request names and JSON bodies come from this Package's contract (`ui-contract.json`) and are stable. The Host's headless commands are not final; if one differs, the Host's documentation wins.
 
@@ -20,34 +20,37 @@ The short version: get the Package, copy it into place, then run `agent-setup` o
 
 ## 1. Get the Package
 
-Release archives do not exist yet. When they do, this step becomes "download and unpack". Update this guide then.
+You need two things on the target machine, side by side in one directory:
 
-Until then, build the Package from a clean checkout of this repository on a Linux x86_64 build machine. The build machine can be the target machine. It needs rustup, Node.js and npm, git, and a C toolchain:
+- the Package Directory `dev.teamarness.agent/`; and
+- the setup script `agent-setup`.
 
-```sh
-cd /path/to/agent-package
-npm ci
-npm run build
+For example:
+
+```text
+~/release-staging/agent/
+├── agent-setup
+└── dev.teamarness.agent/
 ```
 
-`npm run build` builds only the machine's own target (`x86_64-unknown-linux-gnu` here), validates the result and smoke-launches the Backend. It produces two things in `dist/`: the Package Directory `dev.teamarness.agent/`, and beside it the setup script `agent-setup`. The Backend links against the build machine's glibc, so build on a machine whose glibc is no newer than the target's. If several heavy builds share the build machine, run each one under the same lock, for example `flock ~/src/.heavy-build.lock npm run build`.
+> **Note:** Release archives do not exist yet. Until they do, someone builds both on a Linux x86_64 build machine (see [Build the Package](#build-the-package)) and copies them to the target machine. When archives exist, this step becomes "download and unpack".
 
-To run the full gates first, run `npm run validate`, `npm run typecheck`, `npm run lint` and `npm test` before you build.
+The target machine does not need a build toolchain.
 
 ## 2. Copy it into place
 
-The Package Directory is the permanent location that the Host trusts. Copy the complete directory and never symlink it, and do not edit any file after the copy. Nothing in it may point back into a source tree. Copy the setup script beside it:
+The Package Directory is the permanent location that the Host trusts. Copy the complete directory and never symlink it, and do not edit any file after the copy. Copy the setup script beside it. In these commands, `/path/to/dist/` is the directory that holds the downloaded or copied distribution, for example `~/release-staging/agent/`:
 
 ```sh
 umask 077
 mkdir -p ~/.local/lib/teamarness-packages
 chmod go-w ~/.local/lib/teamarness-packages
-rsync -a --delete /path/to/agent-package/dist/dev.teamarness.agent/ \
+rsync -a --delete /path/to/dist/dev.teamarness.agent/ \
   ~/.local/lib/teamarness-packages/dev.teamarness.agent/
-rsync -a /path/to/agent-package/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
+rsync -a /path/to/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
 ```
 
-From a separate build machine, use `target:.local/lib/teamarness-packages/…` as each destination instead. Every directory above the Package Directory must not be group- or other-writable. The Host's setup already removes that access from the directories you own above its install location, including `~/.local/lib`.
+Every directory above the Package Directory must not be group- or other-writable. The Host's setup already removes that access from the directories you own above its install location, including `~/.local/lib`.
 
 To record what you installed, save the digests:
 
@@ -243,9 +246,9 @@ Then, from the desktop app in the same Workspace, mention the Agent in a Convers
 Get the new version (step 1), then copy it over the same Package Directory and reload:
 
 ```sh
-rsync -a --delete /path/to/agent-package/dist/dev.teamarness.agent/ \
+rsync -a --delete /path/to/dist/dev.teamarness.agent/ \
   ~/.local/lib/teamarness-packages/dev.teamarness.agent/
-rsync -a /path/to/agent-package/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
+rsync -a /path/to/dist/agent-setup ~/.local/lib/teamarness-packages/agent-setup
 tm packages reload --package dev.teamarness.agent
 ```
 
@@ -272,6 +275,32 @@ Keep the client's stdout and stderr draining. Don't merge them into one pipe wit
 - **Rotate the key:** write a new key file and rerun `agent-setup`, or repeat step 7. Clear it with `echo '{}' | tm_req "$W" dev.teamarness.agent agent.key.clear`.
 - **Unbind:** `echo '{}' | tm_req "$W" dev.teamarness.agent agent.binding.clear`. This stops replies and cancels in-flight work.
 - **Remove the Package:** `tm packages remove --package dev.teamarness.agent`. This removes it from every Workspace. Its data, including settings, key and reply progress, is kept for a later reinstall.
+
+## Build the Package
+
+This section is for whoever builds the distribution. The target machine does not need it.
+
+Build from a clean checkout of this repository on a Linux x86_64 build machine. The build machine needs rustup, Node.js and npm, git, and a C toolchain:
+
+```sh
+cd /path/to/agent-package
+npm ci
+npm run build
+```
+
+To run the full gates first, run `npm run validate`, `npm run typecheck`, `npm run lint` and `npm test` before you build.
+
+`npm run build` builds only the machine's own target (`x86_64-unknown-linux-gnu` here), validates the result and smoke-launches the Backend. It produces both parts of the distribution in `dist/`: the Package Directory `dev.teamarness.agent/`, and beside it `agent-setup`. Nothing in the Package Directory points back into the source tree.
+
+- The Backend links against the build machine's glibc. Build on a machine whose glibc is no newer than the target's.
+- If several heavy builds share the build machine, run each one under the same lock, for example `flock ~/src/.heavy-build.lock npm run build`.
+
+Copy both parts to the target machine, for example:
+
+```sh
+ssh target 'umask 077; mkdir -p release-staging/agent'
+rsync -a --delete dist/dev.teamarness.agent dist/agent-setup target:release-staging/agent/
+```
 
 ## Limits
 
