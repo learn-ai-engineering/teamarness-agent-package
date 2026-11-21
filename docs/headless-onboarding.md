@@ -2,7 +2,9 @@
 
 This guide configures the Agent Package on a headless Teamarness Installation, so that the Agent replies to Conversations Messages and Documents Comments as a bound Workspace Agent. Every step uses the headless application's generic operator interface and the Agent's own declared requests. Nothing writes Package or Core files directly.
 
-> **Provisional Host syntax.** The `teamarness-headless` commands below come from the headless application's documentation at Teamarness commit `8f3f25b` (`docs/headless/README.md`). That application is not final. Until its Host handoff is complete, treat every command line in this guide as a placeholder, and check it against the shipped headless documentation. The Agent request names and JSON bodies are this Package's contract (`ui-contract.json`) and are stable.
+> **Host version.** This guide was validated against Host 72cb5f2 on factory2 (Ubuntu 26.04 x86_64), 2026-11-21. The Host's headless application is not final, so check each `teamarness-headless` command against the shipped headless documentation. For a working per-Workspace sequence, see step 7, "Configure the Agent", in the Workspace tier of `docs/headless/install-linux.md` in the Teamarness repository. The Agent request names and JSON bodies are this Package's contract (`ui-contract.json`) and are stable.
+
+Configuration is per Workspace. Each Workspace has its own Agent, settings, API key, binding and enabled Packages. When the Installation joins another Workspace, repeat steps 1 and 3–7 for that Workspace. This is intended. Install the Package once per Installation; you don't need to reinstall it for each Workspace.
 
 ## Before you start
 
@@ -156,6 +158,17 @@ The headless client never retries a mutation. When `package request` fails after
 Send the request again only if the state shows it did not apply. A `busy` refusal is certain and did not run: another operator request holds this Package Instance, so try again once it finishes.
 
 The Agent's own error codes are stable and namespaced (`agent.*`). Its `retryable` flag says whether the same request may succeed later. It is not permission to replay a mutation whose outcome is uncertain.
+
+## Update the Package
+
+Build the new version natively, then copy its `dist/dev.teamarness.agent/` over the same Package Directory. Copy the files; never symlink them. Then reload:
+
+```sh
+rsync -a --delete /absolute/path/to/new/dist/dev.teamarness.agent/ "$PACKAGE_DIR/"
+"$APP" --data-dir "$DATA" packages reload --package "$PACKAGE"
+```
+
+The reload keeps the settings, API key, binding, enabled Packages and reply progress in every Workspace. Messages that were already answered are not answered again. After the reload, run step 7 to verify.
 
 ## Change or remove the configuration
 
