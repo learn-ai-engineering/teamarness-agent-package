@@ -130,7 +130,8 @@ if command == ["status"]:
 if command == ["packages", "list"]:
     ok(host_view())
 if command == ["workspace", "list"]:
-    ok([{"id": w, "name": f"w{i}"} for i, w in enumerate(state["workspaces"])])
+    names = state.get("workspaceNames") or [f"w{i}" for i in range(len(state["workspaces"]))]
+    ok([{"id": w, "name": n} for w, n in zip(state["workspaces"], names)])
 if command[:2] == ["packages", "inspect"]:
     ok({"directory": option("--directory"), "identity": IDENTITY, "kind": "install", "version": "1.0.1"})
 if command[:2] == ["packages", "install"]:

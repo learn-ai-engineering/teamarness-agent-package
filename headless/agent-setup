@@ -56,9 +56,12 @@ package_dir = "~/.local/lib/teamarness-packages/dev.teamarness.agent"
 # true to accept those risks. Setup never installs while it is false.
 accept_native_code_risks = false
 
-# The Workspace to configure: its 32-character ID from `workspace list`.
-# Names are not accepted. Run setup once per Workspace, each with its own file.
-workspace_id = ""
+# The Workspace to configure: its name as shown in the desktop app (or its
+# 32-character ID from `tm workspace list`, after
+# `source ~/.config/teamarness-headless/helpers.sh`). If several joined Workspaces
+# have this name, setup stops and lists their IDs; use one of those instead.
+# Run setup once per Workspace, each with its own answers file.
+workspace = ""
 
 # The Workspace Agent's name. People mention this name to get a reply. An
 # Agent with exactly this name is reused; otherwise setup creates it.
@@ -80,7 +83,8 @@ system_prompt = "You are a member of the team."
 context_messages = 20
 
 [packages]
-# Contracts the Agent may use, enabled at the major the Host offers.
+# Packages the Agent may use, enabled at the major the Host offers. The Agent
+# can use every tool in each Package it is enabled for.
 # These are every Package the Agent can currently be enabled for.
 # Remove the Packages this Agent should not access.
 #   Backlog        Epics and Tickets: list, read, create and change Tickets
@@ -88,7 +92,9 @@ context_messages = 20
 #   Documents      the Agent replies to Comments that mention it, and can edit Documents
 #   Exhibits       the Agent can author Exhibits (static websites)
 # Every listed Package must be installed in this Workspace, or setup stops
-# before it enables any of them. Contracts not listed here are left as they are.
+# before it enables any of them. Setup only enables; it never disables. A
+# Package not listed here keeps its current setting: off for a new Agent,
+# but still on if it was enabled before. To turn one off, see the guide.
 enable = [
   "dev.teamarness.backlog",
   "dev.teamarness.conversations",
@@ -98,7 +104,7 @@ enable = [
 """
 
 TOP_KEYS = {"host_app", "host_data_dir", "package_dir", "accept_native_code_risks",
-            "workspace_id", "agent_name", "key_file", "model", "packages"}
+            "workspace", "workspace_id", "agent_name", "key_file", "model", "packages"}
 MODEL_KEYS = {"endpoint_base_url", "model", "system_prompt", "context_messages"}
 PACKAGES_KEYS = {"enable"}
 
@@ -163,9 +169,17 @@ def load_answers(path):
     if not isinstance(consent, bool):
         fail_invalid("accept_native_code_risks must be true or false")
     answers["accept"] = consent
-    workspace = text(data, "workspace_id", "", max_length=32)
-    if not re.fullmatch(r"[0-9a-f]{32}", workspace):
-        fail_invalid("workspace_id must be the 32-character lowercase hex ID from `workspace list`")
+    if ("workspace" in data) == ("workspace_id" in data):
+        fail_invalid("set exactly one of workspace (a name or ID) and workspace_id")
+    if "workspace_id" in data:
+        workspace = text(data, "workspace_id", "", max_length=32)
+        if not re.fullmatch(r"[0-9a-f]{32}", workspace):
+            fail_invalid("workspace_id must be the 32-character lowercase hex ID from `tm workspace list`; "
+                         "use workspace for a name")
+    else:
+        workspace = text(data, "workspace", "", max_length=256)
+        if workspace.strip() == "":
+            fail_invalid("workspace must be a Workspace name or ID")
     answers["workspace"] = workspace
     name = text(data, "agent_name", "", max_length=256)
     if name.strip() == "":
@@ -357,9 +371,8 @@ def apply(answers, report):
     if status.get("readiness") != "ready":
         raise Stop(f"stopped: the Host is not ready (readiness {status.get('readiness')!r})")
     workspaces = host.read("workspace list", ["workspace", "list"])
-    if not any(isinstance(w, dict) and w.get("id") == host.workspace for w in workspaces or []):
-        raise Stop(f"stopped: this Installation has not joined Workspace {host.workspace}")
-    report.line("unchanged", "host ready, Workspace joined")
+    host.workspace, workspace_name = resolve_workspace(answers["workspace"], workspaces, host)
+    report.line("unchanged", f"host ready, Workspace {workspace_name} ({host.workspace}) joined")
 
     package_dir = answers["package_dir"]
     registration = next((r for r in status.get("host", {}).get("registrations", [])
@@ -410,6 +423,21 @@ def apply(answers, report):
         raise Stop(f"stopped: agent status is {state!r}{code}. "
                    f"Inspect with: {host.inspect_command('agent.status.get')}")
     print(f"ready: agent {final.get('agent', {}).get('name')} in Workspace {host.workspace}", flush=True)
+
+
+def resolve_workspace(wanted, workspaces, host):
+    """Matches an ID first, then an exact name. No match or several are invalid answers."""
+    joined = [w for w in workspaces or [] if isinstance(w, dict) and isinstance(w.get("id"), str)]
+    by_id = [w for w in joined if w["id"] == wanted]
+    matches = by_id or [w for w in joined if w.get("name") == wanted]
+    if len(matches) == 1:
+        return matches[0]["id"], matches[0].get("name")
+    listed = ", ".join(f"{w.get('name')!r} ({w['id']})" for w in (matches or joined)) or "none"
+    if not matches:
+        raise Stop(f"stopped: this Installation has not joined a Workspace named or with ID {wanted!r}. "
+                   f"Joined Workspaces: {listed}. Inspect with: {host.shown(['workspace', 'list'])}", 2)
+    raise Stop(f"stopped: {len(matches)} joined Workspaces are named {wanted!r}: {listed}. "
+               "Set workspace to one of these IDs, then rerun setup", 2)
 
 
 def wait_for_instance(host, timeout=30.0):

@@ -69,7 +69,7 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    "$S" --print-template ~/agent-setup.toml
    ```
 
-2. Fill it in. Set `workspace_id` to the ID from `workspace list`, choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets. Leave `key_file` as `~/agent-api-key`; you create that file in the next step.
+2. Fill it in. Set `workspace` to the Workspace name as shown in the desktop app (or its ID). Choose `agent_name` and set `[model]`. Under `[packages]`, the template lists every Package the Agent can be enabled for: Backlog, Conversations, Documents and Exhibits. The Agent can use every tool in each Package it is enabled for. Remove the Packages this Agent should not access. Read the native-code risks in the template, then set `accept_native_code_risks = true` so that setup may install the Package. The answers file holds no secrets. Leave `key_file` as `~/agent-api-key`; you create that file in the next step.
 
 3. Put the API key in a private file at `~/agent-api-key`. The file holds only the key. Use one of these options:
 
@@ -100,7 +100,7 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    Setup reads the current state first and changes only what differs. It prints one line per item and a summary:
 
    ```text
-   unchanged: host ready, Workspace joined
+   unchanged: host ready, Workspace headless (aad43be122caa818738f763c373ba820) joined
    changed: package installed from /home/you/.local/lib/teamarness-packages/dev.teamarness.agent (version 1.0.1)
    changed: agent Factory created
    changed: settings (endpointBaseUrl, model, systemPrompt)
@@ -114,19 +114,45 @@ Configuration is per Workspace, by design. Each Workspace has its own Agent, set
    summary: 9 changed, 1 unchanged
    ```
 
-5. Test it: from the desktop app in the same Workspace, mention the Agent in a Conversation, for example "@Factory, are you there?". Exactly one reply should arrive, authored by the Agent.
+5. Test it, as described in [Check the Agent](#check-the-agent).
 
 Run setup again with the same answers at any time. It reports every item as `unchanged`. A missing key file is fine once the key is set. To change something, edit the answers and rerun. To rotate the key, write a new key file and rerun.
 
 Setup uses these rules:
 
 - An Agent with exactly `agent_name` is reused. Otherwise setup creates it.
-- Contracts not listed under `[packages]` are left as they are. Setup never disables one.
+- `workspace` matches a joined Workspace's ID first, then its exact name. If nothing matches, setup stops with exit 2 and lists the joined Workspaces. If several Workspaces have that name, it stops with exit 2 and lists their IDs; set `workspace` to one of them. The older `workspace_id` key still works and takes only an ID.
+- Setup only enables Packages; it never disables one. A Package not listed under `[packages]` keeps its current setting: off for a new Agent, but still on if it was enabled before. To turn one off, see [Change or remove the configuration](#change-or-remove-the-configuration).
 - Every Package listed under `[packages]` must be installed and available in the Workspace. Otherwise setup stops before it enables any of them and names each missing one. Remove it from the list, or install it, then rerun setup.
 - If a different Agent is already bound, setup stops and prints the unbind command. It does not rebind, because rebinding cancels the Agent's work.
 - If the Package is registered from a different directory, setup stops. It does not reinstall.
 - If a change's outcome is unknown, setup stops at once and prints `stopped: <step> outcome unknown — inspect with: <command>, then rerun setup`. It never retries. Run the inspect command, then rerun setup, which reads the state again and continues from there.
 - Exit codes match the Host client: `0` ok, `1` operational failure or unknown outcome, `2` invalid answers or input. Invalid answers change nothing.
+
+## Check the Agent
+
+Load the operator helpers, and set `W` to the Workspace ID that setup printed on its `ready:` line:
+
+```sh
+source ~/.config/teamarness-headless/helpers.sh
+W=REPLACE_WITH_WORKSPACE_ID
+```
+
+| Check | Command | Expect |
+|---|---|---|
+| Agent status | `echo '{}' \| tm_req "$W" dev.teamarness.agent agent.status.get` | `"state":"ready"` and your Agent's `name` |
+| Model settings and key | `echo '{}' \| tm_req "$W" dev.teamarness.agent agent.settings.get` | your settings and `"hasKey":true` |
+| Enabled Packages | `echo '{}' \| tm_req "$W" dev.teamarness.agent agent.packages.get` | `"enabled":true` for each Package you listed |
+| Workspaces | `tm workspace list` | the Workspace, by name and ID |
+| Replies | In the desktop app, in the same Workspace, mention the Agent in a Conversation, for example "@Factory, are you there?" | exactly one reply, authored by the Agent |
+
+Other status states mean:
+
+- `unconfigured`: the endpoint, model or key is missing;
+- `no_agent`: nothing is bound;
+- `error`: `lastError.code` names the failure, for example `agent.endpoint_rejected`.
+
+Mentions that arrive while the Host is offline are answered when it comes back.
 
 ## Manual setup (reference)
 
@@ -243,18 +269,7 @@ To disable a contract, send `{"contract":"<contract>","enabled":false}`. Disabli
 
 ### 9. Verify
 
-```sh
-echo '{}' | tm_req "$W" dev.teamarness.agent agent.status.get
-echo '{}' | tm_req "$W" dev.teamarness.agent agent.settings.get
-```
-
-Expect `"state":"ready"` with your Agent's `name`, and `"hasKey":true`. Other states mean:
-
-- `unconfigured`: the endpoint, model or key is missing;
-- `no_agent`: nothing is bound;
-- `error`: `lastError.code` names the failure, for example `agent.endpoint_rejected`.
-
-Then, from the desktop app in the same Workspace, mention the Agent in a Conversation, for example "@Factory, are you there?". Exactly one reply should arrive, authored by the Agent. Mentions that arrive while the Host is offline are answered when it comes back.
+Run the checks in [Check the Agent](#check-the-agent).
 
 ## Update the Package
 
@@ -288,6 +303,7 @@ Keep the client's stdout and stderr draining. Don't merge them into one pipe wit
 ## Change or remove the configuration
 
 - **Rotate the key:** write a new key file and rerun `agent-setup`, or repeat step 7. Clear it with `echo '{}' | tm_req "$W" dev.teamarness.agent agent.key.clear`.
+- **Turn a Package off:** `printf '%s\n' '{"contract":"dev.teamarness.exhibits","enabled":false}' | tm_req "$W" dev.teamarness.agent agent.packages.set`. Disabling cancels the Agent's work in that Package. Removing a Package from the answers file does not turn it off.
 - **Unbind:** `echo '{}' | tm_req "$W" dev.teamarness.agent agent.binding.clear`. This stops replies and cancels in-flight work.
 - **Remove the Package:** `tm packages remove --package dev.teamarness.agent`. This removes it from every Workspace. Its data, including settings, key and reply progress, is kept for a later reinstall.
 
@@ -323,4 +339,5 @@ rsync -a --delete dist/dev.teamarness.agent dist/agent-setup target:release-stag
 - Configuration requests carry at most 256 KiB.
 - Replies, model calls and Port tools run in the background with no UI mounted. The Agent's turn budgets and post-once rules are the same as on the desktop.
 - After an outage, the Agent answers every mention it missed. Whether a long outage should produce a burst of late replies is an open follow-up.
+- Access is per Package: an enabled Package gives the Agent every tool it offers. Choosing individual tools within a Package is possible future work.
 - One Installation can run one Package with the identity `dev.teamarness.agent`. A second Agent Package needs a distinct Package Identity. This is an open follow-up.

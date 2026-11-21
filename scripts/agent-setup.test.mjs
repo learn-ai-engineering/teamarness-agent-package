@@ -147,7 +147,8 @@ test('key_file "-" reads the key from stdin only when no key is set', async () =
 
 for (const [name, answers, message] of [
   ["an unknown key", { extra: "colour = \"blue\"\n" }, /unknown answers key: colour/],
-  ["a workspace name", { workspace_id: "headless" }, /workspace_id must be/],
+  ["a workspace name in workspace_id", { workspace_id: "headless" }, /workspace_id must be/],
+  ["both workspace and workspace_id", { workspace: "headless" }, /set exactly one of workspace/],
   ["context_messages out of range", { model: `endpoint_base_url = "https://x"\nmodel = "m"\nsystem_prompt = ""\ncontext_messages = 65` }, /context_messages must be/],
   ["an unknown model key", { model: `endpoint_base_url = "https://x"\nmodel = "m"\nsystem_prompt = ""\ncontext_messages = 1\ntemperature = 1` }, /unknown answers key: model\.temperature/],
   ["an empty agent name", { agent_name: "" }, /agent_name must not be empty/],
@@ -231,11 +232,44 @@ test("a registration from another directory stops setup", async () => {
   assert.deepEqual(await mutations(f), []);
 });
 
-test("a Workspace the Installation has not joined stops setup", async () => {
+test("a Workspace the Installation has not joined stops setup with exit 2", async () => {
   const f = await fixture({ state: { workspaces: ["0".repeat(32)] } });
   const result = run(f);
-  assert.equal(result.code, 1);
-  assert.match(result.stdout, /^stopped: this Installation has not joined Workspace /m);
+  assert.equal(result.code, 2);
+  assert.match(result.stdout, /^stopped: this Installation has not joined a Workspace named or with ID '[0-9a-f]{32}'\. Joined Workspaces: 'w0' \(0{32}\)\./m);
+  assert.deepEqual(await mutations(f), []);
+});
+
+test("workspace accepts the Workspace name and resolves it to its ID", async () => {
+  const other = "1".repeat(32);
+  const f = await fixture({
+    state: { workspaces: [other, WORKSPACE], workspaceNames: ["numbertwo", "headless"] },
+    answers: { workspace_id: undefined, workspace: "headless" },
+  });
+  const result = run(f);
+  assert.equal(result.code, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, new RegExp(`^unchanged: host ready, Workspace headless \\(${WORKSPACE}\\) joined$`, "m"));
+  assert.match(result.stdout, new RegExp(`^ready: agent Factory in Workspace ${WORKSPACE}$`, "m"));
+  const requests = (await calls(f)).filter((argv) => argv.includes("--workspace"));
+  assert.ok(requests.length > 0);
+  assert.ok(requests.every((argv) => argv[argv.indexOf("--workspace") + 1] === WORKSPACE));
+});
+
+test("workspace also accepts an ID", async () => {
+  const f = await fixture({ answers: { workspace_id: undefined, workspace: WORKSPACE } });
+  assert.equal(run(f).code, 0);
+});
+
+test("a Workspace name shared by several Workspaces stops with exit 2 and lists their IDs", async () => {
+  const other = "1".repeat(32);
+  const f = await fixture({
+    state: { workspaces: [WORKSPACE, other], workspaceNames: ["team", "team"] },
+    answers: { workspace_id: undefined, workspace: "team" },
+  });
+  const result = run(f);
+  assert.equal(result.code, 2);
+  assert.match(result.stdout, new RegExp(`^stopped: 2 joined Workspaces are named 'team': 'team' \\(${WORKSPACE}\\), 'team' \\(${other}\\)\\. Set workspace to one of these IDs`, "m"));
+  assert.deepEqual(await mutations(f), []);
 });
 
 test("--print-template writes a valid, private template and never overwrites", async () => {
@@ -251,7 +285,7 @@ test("--print-template writes a valid, private template and never overwrites", a
   const parsed = spawnSync("python3", ["-I", "-c", "import sys,tomllib,json;print(json.dumps(tomllib.load(open(sys.argv[1],'rb'))))", path], { encoding: "utf8" });
   assert.equal(parsed.status, 0, parsed.stderr);
   assert.deepEqual(Object.keys(JSON.parse(parsed.stdout)).sort(), [
-    "accept_native_code_risks", "agent_name", "host_app", "host_data_dir", "key_file", "model", "package_dir", "packages", "workspace_id",
+    "accept_native_code_risks", "agent_name", "host_app", "host_data_dir", "key_file", "model", "package_dir", "packages", "workspace",
   ]);
   const again = spawnSync("bash", [setup, "--print-template", path], { encoding: "utf8" });
   assert.equal(again.status, 2);
